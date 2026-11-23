@@ -74676,6 +74676,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        vocab_load(&e->vocab, &e->model);
         if (!opt->inspect_only) {
             fprintf(stderr,
                     "ds4: Inkling 2 Mini GGUF validated, but its native decoder is not integrated yet\n");

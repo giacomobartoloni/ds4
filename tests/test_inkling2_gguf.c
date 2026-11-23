@@ -89,6 +89,37 @@ static void metadata_string_array(FILE *file, const char *key,
     for (uint64_t i = 0; i < count; i++) put_string(file, value);
 }
 
+static void metadata_inkling_tokens(FILE *file) {
+    static const struct {
+        uint32_t id;
+        const char *text;
+    } specials[] = {
+        {199999u, "<|endoftext|>"},
+        {200000u, "<|message_user|>"},
+        {200001u, "<|message_model|>"},
+        {200002u, "<|message_system|>"},
+        {200003u, "<|message_tool|>"},
+        {200004u, "<|content_text|>"},
+        {200006u, "<|content_model_end_sampling|>"},
+        {200008u, "<|content_thinking|>"},
+        {200010u, "<|end_message|>"},
+    };
+    put_metadata_key(file, "tokenizer.ggml.tokens", GGUF_VALUE_ARRAY);
+    put_u32(file, GGUF_VALUE_STRING);
+    put_u64(file, 200058u);
+    size_t next = 0;
+    for (uint32_t id = 0; id < 200058u; id++) {
+        const char *text = "x";
+        if (next < sizeof(specials) / sizeof(specials[0]) &&
+            id == specials[next].id) {
+            text = specials[next].text;
+            next++;
+        }
+        put_string(file, text);
+    }
+    assert(next == sizeof(specials) / sizeof(specials[0]));
+}
+
 static uint64_t tensor_bytes(uint32_t type, const uint64_t *dimensions,
                              uint32_t ndim) {
     uint64_t elements = 1;
@@ -188,7 +219,7 @@ static void write_model_metadata(FILE *file) {
     metadata_bool_array(file, key, sliding, 24);
     metadata_string(file, "tokenizer.ggml.pre", "inkling2");
     metadata_string(file, "tokenizer.ggml.model", "gpt2");
-    metadata_string_array(file, "tokenizer.ggml.tokens", 200058, "x");
+    metadata_inkling_tokens(file);
     metadata_string_array(file, "tokenizer.ggml.merges", 424413, "");
     metadata_bool(file, "tokenizer.ggml.add_bos_token", false);
     metadata_bool(file, "tokenizer.ggml.add_eos_token", false);
@@ -352,6 +383,16 @@ int main(void) {
     assert(engine->inkling_plan.cache_slot_count == 48);
     assert(engine->inkling_plan.visits[18].physical_layer == 6);
     assert(engine->inkling_plan.visits[18].cache_slot == 24);
+    ds4_tokens rendered = {0};
+    ds4_tokenize_rendered_chat(
+        engine,
+        "<|message_user|><|content_text|><|end_message|>",
+        &rendered);
+    assert(rendered.len == 3);
+    assert(rendered.v[0] == 200000);
+    assert(rendered.v[1] == 200004);
+    assert(rendered.v[2] == 200010);
+    ds4_tokens_free(&rendered);
     bool seen_cache[DS4_INKLING_CACHE_SLOTS] = {0};
     for (uint32_t i = 0; i < engine->inkling_plan.visit_count; i++) {
         const ds4_inkling_visit *visit = &engine->inkling_plan.visits[i];
