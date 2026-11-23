@@ -1383,6 +1383,20 @@ int ds4_gpu_inkling2_qk_prepare_tensor(
         float                   log_scale_floor,
         int                     apply_log_scale);
 
+/* Decode form supplies the position as a kernel constant, avoiding a host
+ * upload of the same scalar for every layer visit. */
+int ds4_gpu_inkling2_qk_prepare_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *learned_scale,
+        uint32_t                rows,
+        uint32_t                width,
+        float                   threshold,
+        float                   log_scale_alpha,
+        float                   log_scale_floor,
+        uint64_t                position,
+        int                     apply_log_scale);
+
 int ds4_gpu_inkling2_relative_bias_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *relative_states,

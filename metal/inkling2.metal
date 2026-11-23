@@ -60,8 +60,9 @@ struct ds4_metal_args_inkling2_qk {
     float log_scale_alpha;
     float log_scale_floor;
     uint32_t apply_log_scale;
+    uint32_t scalar_position_enabled;
     uint32_t pad0;
-    uint32_t pad1;
+    ulong scalar_position;
 };
 
 struct ds4_metal_args_inkling2_relative_bias {
@@ -498,7 +499,9 @@ kernel void kernel_inkling2_qk_prepare(
     const float clip = min(args.threshold / (norm + 1e-6f), 1.0f);
     float log_scale = 1.0f;
     if (args.apply_log_scale != 0u) {
-        const float ratio = max((float(positions[row]) + 1.0f) /
+        const ulong position = args.scalar_position_enabled != 0u
+            ? args.scalar_position : positions[row];
+        const float ratio = max((float(position) + 1.0f) /
                                 args.log_scale_floor, 1.0f);
         log_scale += args.log_scale_alpha * log(ratio);
     }
@@ -529,7 +532,7 @@ kernel void kernel_inkling2_relative_bias(
             ((uint64_t)row * args.heads + head) * args.relative_dim;
         for (uint dim = 0; dim < args.relative_dim; dim++) {
             sum += relative_states[state_offset + dim] *
-                   projection[(uint64_t)dim * args.relative_extent + (uint)distance];
+                   projection[(uint64_t)(uint)distance * args.relative_dim + dim];
         }
     }
     out[index] = sum;
@@ -660,7 +663,8 @@ kernel void kernel_inkling2_shortconv(
             if (lag != 0u) {
                 sample = lag <= history_count ? previous[3u - lag] : 0.0f;
             }
-            float tap = static_taps[(uint64_t)lag * width + channel];
+            float tap = static_taps[(uint64_t)channel * args.kernel_size +
+                                    (args.kernel_size - 1u - lag)];
             if (args.has_dynamic_taps != 0u) {
                 tap += dynamic_taps[((uint64_t)token * args.n_heads + head) *
                                     args.kernel_size + lag];

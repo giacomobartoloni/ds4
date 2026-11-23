@@ -23369,8 +23369,9 @@ typedef struct {
     float log_scale_alpha;
     float log_scale_floor;
     uint32_t apply_log_scale;
+    uint32_t scalar_position_enabled;
     uint32_t pad0;
-    uint32_t pad1;
+    uint64_t scalar_position;
 } ds4_gpu_inkling2_qk_args;
 
 typedef struct {
@@ -23981,7 +23982,7 @@ int ds4_gpu_inkling2_control_update_tensor(
     return 1;
 }
 
-int ds4_gpu_inkling2_qk_prepare_tensor(
+static int ds4_gpu_inkling2_qk_prepare_impl(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *learned_scale,
@@ -23991,10 +23992,13 @@ int ds4_gpu_inkling2_qk_prepare_tensor(
         float                   threshold,
         float                   log_scale_alpha,
         float                   log_scale_floor,
-        int                     apply_log_scale) {
+        int                     apply_log_scale,
+        int                     scalar_position_enabled,
+        uint64_t                scalar_position) {
     if ((!g_initialized && !ds4_gpu_init()) || rows == 0 || width == 0 ||
         !isfinite(threshold) || threshold <= 0.0f ||
         !isfinite(log_scale_alpha) ||
+        (!scalar_position_enabled && !positions) ||
         (apply_log_scale &&
          (!isfinite(log_scale_floor) || log_scale_floor <= 0.0f))) return 0;
     const uint64_t elements = (uint64_t)rows * width;
@@ -24003,9 +24007,9 @@ int ds4_gpu_inkling2_qk_prepare_tensor(
     if (!ds4_gpu_inkling2_tensor_fits(out, bytes, "QK output") ||
         !ds4_gpu_inkling2_tensor_fits(x, bytes, "QK input") ||
         !ds4_gpu_inkling2_tensor_fits(learned_scale, bytes, "QK learned scale") ||
-        !ds4_gpu_inkling2_tensor_fits(positions,
+        (positions && !ds4_gpu_inkling2_tensor_fits(positions,
                                       (uint64_t)rows * sizeof(uint64_t),
-                                      "QK positions")) return 0;
+                                      "QK positions"))) return 0;
 
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
@@ -24018,6 +24022,8 @@ int ds4_gpu_inkling2_qk_prepare_tensor(
             .log_scale_alpha = log_scale_alpha,
             .log_scale_floor = log_scale_floor,
             .apply_log_scale = apply_log_scale != 0,
+            .scalar_position_enabled = scalar_position_enabled != 0,
+            .scalar_position = scalar_position,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -24030,8 +24036,8 @@ int ds4_gpu_inkling2_qk_prepare_tensor(
                 offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:ds4_gpu_tensor_buffer(learned_scale)
                 offset:ds4_gpu_tensor_offset(learned_scale) atIndex:2];
-        [enc setBuffer:ds4_gpu_tensor_buffer(positions)
-                offset:ds4_gpu_tensor_offset(positions) atIndex:3];
+        [enc setBuffer:positions ? ds4_gpu_tensor_buffer(positions) : nil
+                offset:positions ? ds4_gpu_tensor_offset(positions) : 0 atIndex:3];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
@@ -24041,6 +24047,38 @@ int ds4_gpu_inkling2_qk_prepare_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 QK prepare")) return 0;
     }
     return 1;
+}
+
+int ds4_gpu_inkling2_qk_prepare_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *learned_scale,
+        const ds4_gpu_tensor *positions,
+        uint32_t                rows,
+        uint32_t                width,
+        float                   threshold,
+        float                   log_scale_alpha,
+        float                   log_scale_floor,
+        int                     apply_log_scale) {
+    return ds4_gpu_inkling2_qk_prepare_impl(
+        out, x, learned_scale, positions, rows, width, threshold,
+        log_scale_alpha, log_scale_floor, apply_log_scale, 0, 0);
+}
+
+int ds4_gpu_inkling2_qk_prepare_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *learned_scale,
+        uint32_t                rows,
+        uint32_t                width,
+        float                   threshold,
+        float                   log_scale_alpha,
+        float                   log_scale_floor,
+        uint64_t                position,
+        int                     apply_log_scale) {
+    return ds4_gpu_inkling2_qk_prepare_impl(
+        out, x, learned_scale, NULL, rows, width, threshold,
+        log_scale_alpha, log_scale_floor, apply_log_scale, 1, position);
 }
 
 int ds4_gpu_inkling2_relative_bias_tensor(

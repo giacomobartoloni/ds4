@@ -142,6 +142,11 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#if defined(__APPLE__)
+#include "ds4_inkling_gpu_state.h"
+#include "ds4_inkling_loop.h"
+#include "ds4_inkling_moe.h"
+#endif
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -7283,11 +7288,18 @@ static bool model_read_u32_array(
         uint32_t *values,
         uint64_t expected_len) {
     ds4_array_ref array;
-    if (!model_get_array(m, key, &array) || array.type != GGUF_VALUE_UINT32 ||
+    if (!model_get_array(m, key, &array) ||
+        (array.type != GGUF_VALUE_UINT32 && array.type != GGUF_VALUE_INT32) ||
         array.len != expected_len) return false;
     ds4_cursor cursor = cursor_at(m, array.data_pos);
     for (uint64_t i = 0; i < expected_len; i++) {
-        if (!cursor_u32(&cursor, &values[i])) return false;
+        if (array.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&cursor, &values[i])) return false;
+        } else {
+            int32_t value = 0;
+            if (!cursor_read(&cursor, &value, sizeof(value)) || value < 0) return false;
+            values[i] = (uint32_t)value;
+        }
     }
     return true;
 }
@@ -8326,8 +8338,9 @@ static void inkling_weights_bind(ds4_inkling_weights *weights,
                          INKLING_HIDDEN, 32, 0);
         }
         if (il != 0) {
-            BIND_INKLING(attn_res_query, "attn_res_query.weight", DS4_TENSOR_F32, 1,
-                         INKLING_HIDDEN, 0, 0);
+            BIND_INKLING(attn_res_query, "attn_res_query.weight", DS4_TENSOR_F32,
+                         sliding ? 1u : 2u,
+                         INKLING_HIDDEN, sliding ? 0u : 3u, 0);
         }
         BIND_INKLING(ffn_res_query, "ffn_res_query.weight", DS4_TENSOR_F32, 1,
                      INKLING_HIDDEN, 0, 0);
@@ -8365,6 +8378,58 @@ static void inkling_weights_bind(ds4_inkling_weights *weights,
 #undef BIND_INKLING
     }
 }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static bool inkling_gpu_stage_parameter(const ds4_model *model,
+                                        const ds4_tensor *source,
+                                        ds4_gpu_tensor *destination) {
+    return model && model->map && source && destination &&
+        source->type == DS4_TENSOR_F32 &&
+        source->bytes == ds4_gpu_tensor_bytes(destination) &&
+        source->abs_offset <= model->size &&
+        source->bytes <= model->size - source->abs_offset &&
+        ds4_gpu_tensor_write(destination, 0,
+            (const uint8_t *)model->map + source->abs_offset,
+            source->bytes) != 0;
+}
+
+/* Copy only small FP32 parameters consumed as Metal tensor inputs. Large
+ * quantized matrices remain mmap-backed and are read directly by DS4 kernels. */
+static bool inkling_gpu_stage_parameters(ds4_inkling_gpu_context *context,
+                                         const ds4_model *model,
+                                         const ds4_inkling_weights *weights) {
+    if (!context || !model || !weights ||
+        !inkling_gpu_stage_parameter(model, weights->output_res_query,
+                                     context->parameters.output_res_query))
+        return false;
+    for (uint32_t layer = 0; layer < DS4_INKLING_PHYSICAL_LAYERS; layer++) {
+        const ds4_inkling_layer_weights *src = &weights->layer[layer];
+        ds4_inkling_gpu_layer_parameters *dst = &context->parameters.layer[layer];
+#define STAGE(field) do { \
+        if (!inkling_gpu_stage_parameter(model, src->field, dst->field)) return false; \
+    } while (0)
+        STAGE(attn_q_clip);
+        STAGE(attn_rel_bias);
+        STAGE(attn_rel_clip);
+        STAGE(attn_k_conv);
+        STAGE(attn_v_conv);
+        STAGE(attn_post_conv);
+        STAGE(ffn_post_conv);
+        STAGE(ffn_res_query);
+        if (!inkling_gpu_stage_parameter(model, src->ffn_exp_probs_b,
+                                        dst->router_bias)) return false;
+        if (src->attn_res_query &&
+            !inkling_gpu_stage_parameter(model, src->attn_res_query,
+                                         dst->attn_res_query)) return false;
+        if (src->loop_msg_query &&
+            !inkling_gpu_stage_parameter(model, src->loop_msg_query,
+                                         dst->loop_msg_query)) return false;
+#undef STAGE
+    }
+    return true;
+}
+
+#endif
 
 typedef struct {
     uint64_t off;
@@ -44863,6 +44928,9 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_inkling_weights inkling_weights;
     ds4_inkling_plan inkling_plan;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    bool inkling_session_live;
+#endif
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
@@ -63776,6 +63844,10 @@ struct ds4_session {
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
 #ifndef DS4_NO_GPU
+#ifdef __APPLE__
+    ds4_inkling_gpu_context inkling_gpu;
+    bool inkling_gpu_ready;
+#endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
     bool ds41_graph_ready;
@@ -63883,6 +63955,535 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+enum {
+    INKLING_GPU_HIDDEN = 2304,
+    INKLING_GPU_QUERY_WIDTH = 24 * 128,
+    INKLING_GPU_KV_WIDTH = 8 * 128,
+    INKLING_GPU_RELATIVE_WIDTH = 24 * 16,
+    INKLING_GPU_QUERY_HEADS = 24,
+    INKLING_GPU_KV_HEADS = 8,
+    INKLING_GPU_HEAD_DIM = 128,
+    INKLING_GPU_RELATIVE_DIM = 16,
+    INKLING_GPU_EXPERTS = 128,
+    INKLING_GPU_EXPERT_DIM = 1152,
+    INKLING_GPU_EXPERTS_USED = 8,
+};
+
+#define INKLING_GPU_REQUIRE(condition, stage_name) do { \
+    if (!(condition)) { \
+        if (failed_stage) *failed_stage = (stage_name); \
+        return false; \
+    } \
+} while (0)
+
+/* Assemble the logical residual state list without reading any activation
+ * back to the CPU. The final row is always the current stream. */
+static bool inkling_gpu_mix(ds4_inkling_gpu_context *context,
+                            const ds4_gpu_tensor *current,
+                            uint32_t block_count,
+                            const ds4_gpu_tensor *queries,
+                            uint32_t query_count,
+                            ds4_gpu_tensor *out) {
+    if (!context || !current || !queries || !out || block_count > 4u ||
+        query_count == 0 || query_count > 4u) return false;
+    const uint64_t row_bytes = (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+    ds4_inkling_gpu_layer_workspace *layer = &context->layer;
+    for (uint32_t row = 0; row < block_count; row++) {
+        if (!ds4_gpu_tensor_copy(layer->mix_states,
+                (uint64_t)row * row_bytes, context->current_blocks,
+                (uint64_t)(block_count - row - 1u) * row_bytes,
+                row_bytes)) return false;
+    }
+    if (!ds4_gpu_tensor_copy(layer->mix_states,
+            (uint64_t)block_count * row_bytes, current, 0, row_bytes)) return false;
+    return ds4_inkling_mix_metal(out, layer->mix_states, queries,
+                                  block_count + 1u, INKLING_GPU_HIDDEN,
+                                  query_count, 1.0e-6f) != 0;
+}
+
+static bool inkling_gpu_control(
+        ds4_inkling_gpu_context *context,
+        const ds4_model *model,
+        const ds4_inkling_layer_weights *weights,
+        uint32_t controller,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        ds4_gpu_tensor *out) {
+    return context && model && weights && controller < DS4_INKLING_CTRL_COUNT &&
+        ds4_inkling_control_metal_with_workspace(
+            out, current, message, model->map, model->size,
+            weights->loop_ctrl_down[controller]->abs_offset,
+            weights->loop_ctrl_gain[controller]->abs_offset,
+            weights->loop_ctrl_forget[controller]->abs_offset,
+            INKLING_GPU_HIDDEN, 64u, 1.0e-6f,
+            &context->control) != 0;
+}
+
+static bool inkling_gpu_decoder_layer(
+        ds4_session *session,
+        const ds4_inkling_visit *visit,
+        uint32_t logical_layer,
+        uint32_t block_count,
+        const ds4_gpu_tensor *current,
+        ds4_gpu_tensor **out_current,
+        const char **failed_stage) {
+    ds4_engine *engine = session->engine;
+    const ds4_model *model = &engine->model;
+    const ds4_inkling_layer_weights *weights =
+        &engine->inkling_weights.layer[visit->physical_layer];
+    ds4_inkling_gpu_context *context = &session->inkling_gpu;
+    ds4_inkling_gpu_layer_workspace *workspace = &context->layer;
+    ds4_inkling_gpu_layer_parameters *parameters =
+        &context->parameters.layer[visit->physical_layer];
+    ds4_inkling_gpu_slot *slot = &context->slots[visit->cache_slot];
+    const uint64_t position = context->position;
+    const uint64_t hidden_bytes = (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+    const uint64_t kv_row_bytes = (uint64_t)INKLING_GPU_KV_WIDTH * sizeof(uint16_t);
+    const uint32_t history_capacity = DS4_INKLING_CONV_HISTORY;
+    const bool sliding = visit->is_sliding_window != 0;
+    const bool has_messages = visit->phase == DS4_INKLING_PHASE_CORE &&
+                              visit->pass > 0;
+    const ds4_gpu_tensor *raw_inputs[3] = { current, current, current };
+    const ds4_gpu_tensor *norm_inputs[3] = { NULL, NULL, NULL };
+    const ds4_gpu_tensor *attention_input = current;
+    const ds4_gpu_tensor *query_vectors = NULL;
+    uint32_t query_count = 0;
+    ds4_gpu_tensor *attention_result = workspace->attention_context;
+    ds4_gpu_tensor *layer_output = current == context->activation ?
+        workspace->next : context->activation;
+    uint32_t new_kv_count = 0;
+    uint32_t key_history_count = slot->conv_length[DS4_INKLING_CONV_KEY];
+    uint32_t value_history_count = slot->conv_length[DS4_INKLING_CONV_VALUE];
+    uint32_t attn_history_count = slot->conv_length[DS4_INKLING_CONV_ATTENTION_OUT];
+    uint32_t ffn_history_count = slot->conv_length[DS4_INKLING_CONV_FFN_OUT];
+
+    if (failed_stage) *failed_stage = "layer state validation";
+    if (!session || !visit || !current || !out_current ||
+        visit->physical_layer >= DS4_INKLING_PHYSICAL_LAYERS ||
+        visit->cache_slot >= DS4_INKLING_CACHE_SLOTS ||
+        logical_layer != visit->physical_layer ||
+        slot->next_position != position || slot->length > slot->capacity ||
+        block_count > 4u || position >= (uint64_t)session->ctx_size) return false;
+
+    if (has_messages) {
+        INKLING_GPU_REQUIRE(parameters->loop_msg_query != NULL,
+                            "loop message query");
+        INKLING_GPU_REQUIRE(ds4_inkling_mix_metal(
+                workspace->messages, workspace->previous_loop_states,
+                parameters->loop_msg_query, 2u, INKLING_GPU_HIDDEN,
+                4u, 1.0e-6f),
+                "loop message mix");
+    }
+
+    if (weights->attn_res_query) {
+        query_count = sliding ? 1u : 3u;
+        query_vectors = parameters->attn_res_query;
+        INKLING_GPU_REQUIRE(inkling_gpu_mix(context, current, block_count,
+                query_vectors, query_count, workspace->mix_outputs),
+                "attention residual mix");
+        for (uint32_t i = 0; i < 3u; i++)
+            raw_inputs[i] = workspace->mix_output_rows[sliding ? 0u : i];
+    }
+
+    if (has_messages) {
+        for (uint32_t i = 0; i < 3u; i++) {
+            INKLING_GPU_REQUIRE(inkling_gpu_control(context, model, weights, i,
+                    raw_inputs[i], workspace->message_rows[i],
+                    workspace->controlled_input_rows[i]),
+                    "attention cross-pass controller");
+            raw_inputs[i] = workspace->controlled_input_rows[i];
+        }
+    }
+
+    if (sliding) {
+        ds4_gpu_tensor *norm_out = raw_inputs[0] == workspace->controlled_input_rows[0]
+            ? workspace->mix_output_rows[0] : workspace->controlled_input_rows[0];
+        INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_weight_tensor(
+                norm_out, raw_inputs[0], model->map, model->size,
+                weights->attn_norm->abs_offset, INKLING_GPU_HIDDEN,
+                g_ds4_inkling_model_config.rms_epsilon),
+                "sliding attention input norm");
+        norm_inputs[0] = norm_out;
+        if (has_messages) {
+            for (uint32_t i = 1; i < 3u; i++) {
+                ds4_gpu_tensor *out = raw_inputs[i] == workspace->controlled_input_rows[i]
+                    ? workspace->mix_output_rows[i] : workspace->controlled_input_rows[i];
+                INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_weight_tensor(
+                        out, raw_inputs[i], model->map, model->size,
+                        weights->attn_norm->abs_offset, INKLING_GPU_HIDDEN,
+                        g_ds4_inkling_model_config.rms_epsilon),
+                        "controlled sliding attention input norm");
+                norm_inputs[i] = out;
+            }
+        } else {
+            norm_inputs[1] = norm_inputs[2] = norm_inputs[0];
+        }
+    } else {
+        ds4_tensor *norm_weights[3] = {
+            weights->attn_q_inp_norm,
+            weights->attn_k_inp_norm,
+            weights->attn_v_inp_norm,
+        };
+        for (uint32_t i = 0; i < 3u; i++) {
+            ds4_gpu_tensor *norm_out = raw_inputs[i] == workspace->controlled_input_rows[i]
+                ? workspace->mix_output_rows[i] : workspace->controlled_input_rows[i];
+            INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_weight_tensor(
+                    norm_out, raw_inputs[i], model->map, model->size,
+                    norm_weights[i]->abs_offset, INKLING_GPU_HIDDEN,
+                    g_ds4_inkling_model_config.rms_epsilon),
+                    "full attention input norm");
+            norm_inputs[i] = norm_out;
+        }
+    }
+    attention_input = norm_inputs[0];
+
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->query,
+            model->map, model->size, weights->attn_q->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_QUERY_WIDTH, norm_inputs[0], 1u),
+            "query projection");
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->key,
+            model->map, model->size, weights->attn_k->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_KV_WIDTH, norm_inputs[1], 1u),
+            "key projection");
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->value,
+            model->map, model->size, weights->attn_v->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_KV_WIDTH, norm_inputs[2], 1u),
+            "value projection");
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->relative,
+            model->map, model->size, weights->attn_rel->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_RELATIVE_WIDTH, norm_inputs[0], 1u),
+            "relative-state projection");
+
+    if (!sliding) {
+        INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->dynamic_k,
+                model->map, model->size, weights->attn_k_conv_proj->abs_offset,
+                INKLING_GPU_HIDDEN, 32u, norm_inputs[1], 1u),
+                "dynamic key convolution projection");
+        INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->dynamic_v,
+                model->map, model->size, weights->attn_v_conv_proj->abs_offset,
+                INKLING_GPU_HIDDEN, 32u, norm_inputs[2], 1u),
+                "dynamic value convolution projection");
+    }
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+            workspace->prepared_key, slot->conv[DS4_INKLING_CONV_KEY],
+            workspace->key, parameters->attn_k_conv,
+            sliding ? NULL : workspace->dynamic_k,
+            1u, INKLING_GPU_KV_WIDTH, INKLING_GPU_KV_HEADS,
+            DS4_INKLING_CONV_KERNEL, key_history_count),
+            "key short convolution");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+            workspace->prepared_value, slot->conv[DS4_INKLING_CONV_VALUE],
+            workspace->value, parameters->attn_v_conv,
+            sliding ? NULL : workspace->dynamic_v,
+            1u, INKLING_GPU_KV_WIDTH, INKLING_GPU_KV_HEADS,
+            DS4_INKLING_CONV_KERNEL, value_history_count),
+            "value short convolution");
+
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_qk_prepare_decode_tensor(
+            workspace->prepared_query, workspace->query,
+            parameters->attn_q_clip, INKLING_GPU_QUERY_HEADS,
+            INKLING_GPU_HEAD_DIM, g_ds4_inkling_model_config.qk_clip,
+            g_ds4_inkling_model_config.log_scale_alpha,
+            (float)g_ds4_inkling_model_config.log_scale_floor,
+            position, !sliding), "query clipping and position scale");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_clip_l2_rows_tensor(
+            workspace->key, workspace->prepared_key,
+            INKLING_GPU_HEAD_DIM, INKLING_GPU_KV_HEADS,
+            g_ds4_inkling_model_config.qk_clip), "key clipping");
+    INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_plain_rows_tensor(
+            workspace->value, workspace->prepared_value,
+            INKLING_GPU_HEAD_DIM, INKLING_GPU_KV_HEADS,
+            g_ds4_inkling_model_config.rms_epsilon), "value normalization");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_qk_prepare_decode_tensor(
+            workspace->prepared_relative, workspace->relative,
+            parameters->attn_rel_clip, INKLING_GPU_QUERY_HEADS,
+            INKLING_GPU_RELATIVE_DIM,
+            g_ds4_inkling_model_config.relative_clip,
+            g_ds4_inkling_model_config.log_scale_alpha,
+            (float)g_ds4_inkling_model_config.log_scale_floor,
+            position, !sliding), "relative-state clipping and position scale");
+
+    if (failed_stage) *failed_stage = "KV cache store";
+    if (slot->length < slot->capacity) new_kv_count = slot->length + 1u;
+    else new_kv_count = slot->capacity;
+    INKLING_GPU_REQUIRE(slot->capacity != 0 && new_kv_count != 0,
+                        "KV cache capacity");
+    const uint32_t ring_index = (uint32_t)(position % slot->capacity);
+    const uint64_t cache_offset = (uint64_t)ring_index * kv_row_bytes;
+    INKLING_GPU_REQUIRE(ds4_gpu_tensor_copy_f32_to_f16(
+            slot->key, cache_offset, workspace->key, 0,
+            INKLING_GPU_KV_WIDTH), "key cache store");
+    INKLING_GPU_REQUIRE(ds4_gpu_tensor_copy_f32_to_f16(
+            slot->value, cache_offset, workspace->value, 0,
+            INKLING_GPU_KV_WIDTH), "value cache store");
+
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->sink_logits,
+            model->map, model->size, weights->attn_sink_proj->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_QUERY_HEADS,
+            attention_input, 1u), "attention sink projection");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_relative_bias_tensor(
+            workspace->relative_bias, workspace->prepared_relative,
+            parameters->attn_rel_bias, workspace->relative_distances,
+            1u, INKLING_GPU_QUERY_HEADS, INKLING_GPU_RELATIVE_DIM,
+            g_ds4_inkling_model_config.relative_extent,
+            g_ds4_inkling_model_config.relative_extent),
+            "relative-position bias");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_attention_decode_tensor(
+            workspace->attention_context, workspace->prepared_query,
+            slot->key, slot->value, workspace->relative_bias,
+            workspace->sink_logits, INKLING_GPU_QUERY_HEADS,
+            INKLING_GPU_KV_HEADS, INKLING_GPU_HEAD_DIM, slot->capacity,
+            new_kv_count, position + 1u - new_kv_count, position,
+            sliding ? DS4_INKLING_SLIDING_WINDOW : 0u,
+            g_ds4_inkling_model_config.relative_extent),
+            "grouped-query attention");
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->attention_gate,
+            model->map, model->size, weights->attn_gate->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_QUERY_WIDTH,
+            attention_input, 1u), "attention output-gate projection");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_attention_output_gate_tensor(
+            workspace->attention_gated, workspace->attention_context,
+            workspace->attention_gate, INKLING_GPU_QUERY_WIDTH),
+            "attention output gate");
+    INKLING_GPU_REQUIRE(ds4_gpu_matmul_q8_0_tensor(workspace->attention_output,
+            model->map, model->size, weights->attn_output->abs_offset,
+            INKLING_GPU_QUERY_WIDTH, INKLING_GPU_HIDDEN,
+            workspace->attention_gated, 1u), "attention output projection");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+            attention_result, slot->conv[DS4_INKLING_CONV_ATTENTION_OUT],
+            workspace->attention_output, parameters->attn_post_conv, NULL,
+            1u, INKLING_GPU_HIDDEN, 1u, DS4_INKLING_CONV_KERNEL,
+            attn_history_count), "post-attention convolution");
+
+    if (logical_layer % DS4_INKLING_RESIDUAL_BLOCK == 0u) {
+        const uint32_t block = logical_layer / DS4_INKLING_RESIDUAL_BLOCK;
+        INKLING_GPU_REQUIRE(block < 4u &&
+                ds4_gpu_tensor_copy(context->current_blocks,
+                    (uint64_t)block * hidden_bytes, current, 0, hidden_bytes),
+                "residual block capture");
+        block_count++;
+        *out_current = attention_result;
+    } else {
+        INKLING_GPU_REQUIRE(ds4_gpu_add_tensor(workspace->attention_output,
+                current, attention_result, INKLING_GPU_HIDDEN),
+                "attention residual add");
+        *out_current = workspace->attention_output;
+    }
+    INKLING_GPU_REQUIRE(ds4_gpu_tensor_copy(workspace->ffn_input, 0,
+            *out_current, 0, hidden_bytes), "FFN residual input capture");
+    INKLING_GPU_REQUIRE(inkling_gpu_mix(context, *out_current, block_count,
+            parameters->ffn_res_query, 1u, workspace->ffn_mixed),
+            "FFN residual mix");
+    const ds4_gpu_tensor *ffn_input = workspace->ffn_mixed;
+    if (has_messages) {
+        INKLING_GPU_REQUIRE(inkling_gpu_control(context, model, weights,
+                DS4_INKLING_CTRL_FFN, ffn_input,
+                workspace->message_rows[DS4_INKLING_CTRL_FFN],
+                workspace->attention_output), "FFN cross-pass controller");
+        ffn_input = workspace->attention_output;
+    }
+    INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_weight_tensor(workspace->query,
+            ffn_input, model->map, model->size, weights->ffn_norm->abs_offset,
+            INKLING_GPU_HIDDEN, g_ds4_inkling_model_config.rms_epsilon),
+            "FFN input norm");
+    INKLING_GPU_REQUIRE(ds4_inkling_moe_situ_metal_with_workspace(
+            workspace->next, workspace->query, parameters->router_bias,
+            model->map, model->size,
+            weights->ffn_gate_inp->abs_offset,
+            weights->ffn_gate_up_exps->abs_offset,
+            weights->ffn_down_exps->abs_offset,
+            INKLING_GPU_HIDDEN, INKLING_GPU_EXPERT_DIM,
+            INKLING_GPU_EXPERTS, INKLING_GPU_EXPERTS_USED,
+            weights->ffn_gate_up_exps->type == DS4_TENSOR_IQ4_NL ?
+                DS4_INKLING_GGML_TYPE_IQ4_NL : DS4_INKLING_GGML_TYPE_Q8_0,
+            g_ds4_inkling_model_config.expert_weight_scale,
+            g_ds4_inkling_model_config.situ_beta,
+            g_ds4_inkling_model_config.situ_linear_beta,
+            &context->moe), "SITU top-8 MoE");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+            workspace->attention_output, slot->conv[DS4_INKLING_CONV_FFN_OUT],
+            workspace->next, parameters->ffn_post_conv, NULL,
+            1u, INKLING_GPU_HIDDEN, 1u, DS4_INKLING_CONV_KERNEL,
+            ffn_history_count), "post-FFN convolution");
+    INKLING_GPU_REQUIRE(ds4_gpu_add_tensor(layer_output,
+            workspace->ffn_input, workspace->attention_output,
+            INKLING_GPU_HIDDEN), "FFN residual add");
+
+    slot->length = new_kv_count;
+    slot->next_position = position + 1u;
+    slot->conv_length[DS4_INKLING_CONV_KEY] =
+        key_history_count < history_capacity ? key_history_count + 1u : history_capacity;
+    slot->conv_length[DS4_INKLING_CONV_VALUE] =
+        value_history_count < history_capacity ? value_history_count + 1u : history_capacity;
+    slot->conv_length[DS4_INKLING_CONV_ATTENTION_OUT] =
+        attn_history_count < history_capacity ? attn_history_count + 1u : history_capacity;
+    slot->conv_length[DS4_INKLING_CONV_FFN_OUT] =
+        ffn_history_count < history_capacity ? ffn_history_count + 1u : history_capacity;
+    *out_current = layer_output;
+    return true;
+}
+
+static bool inkling_gpu_eval_token(ds4_session *session, uint32_t token,
+                                   char *error, size_t error_capacity) {
+    ds4_engine *engine = session ? session->engine : NULL;
+    ds4_inkling_gpu_context *context = session ? &session->inkling_gpu : NULL;
+    const char *failed_stage = "input validation";
+    if (!session || !engine || !context || !session->inkling_gpu_ready ||
+        token >= g_ds4_inkling_model_config.vocab_unpadded ||
+        context->position != (uint32_t)session->checkpoint.len ||
+        context->position >= (uint32_t)session->ctx_size) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity,
+                     "Inkling 2 Mini position, token, or session state is invalid");
+        return false;
+    }
+    for (uint32_t i = 0; i < DS4_INKLING_CACHE_SLOTS; i++) {
+        if (context->slots[i].next_position != context->position) {
+            if (error && error_capacity)
+                snprintf(error, error_capacity,
+                         "Inkling 2 Mini cache slot %u is not at position %u",
+                         i, context->position);
+            return false;
+        }
+    }
+
+    const bool commands_started = ds4_gpu_begin_commands() != 0;
+    bool ok = commands_started;
+    if (ok) ok = ds4_gpu_embed_token_q8_0_tensor(
+            context->embedding, engine->model.map, engine->model.size,
+            engine->inkling_weights.token_embd->abs_offset,
+            (uint32_t)engine->inkling_weights.token_embd->dim[1], token,
+            INKLING_GPU_HIDDEN) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(
+            context->activation, context->embedding, engine->model.map,
+            engine->model.size,
+            engine->inkling_weights.token_embd_norm->abs_offset,
+            INKLING_GPU_HIDDEN, g_ds4_inkling_model_config.rms_epsilon) != 0;
+    if (!ok) failed_stage = "token embedding";
+
+    ds4_gpu_tensor *current = context->activation;
+    ds4_gpu_tensor *next = NULL;
+    uint32_t block_count = 0;
+    uint32_t visit_index = 0;
+    for (uint32_t physical = 0; ok && physical < DS4_INKLING_LOOP_START;
+         physical++, visit_index++) {
+        const ds4_inkling_visit *visit = &context->plan.visits[visit_index];
+        ok = inkling_gpu_decoder_layer(session, visit, physical, block_count,
+                                      current, &next, &failed_stage);
+        if (ok) {
+            current = next;
+            if (physical % DS4_INKLING_RESIDUAL_BLOCK == 0u) block_count++;
+        }
+    }
+    if (ok) {
+        const uint64_t hidden_bytes = (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+        ok = block_count == 1u && ds4_gpu_tensor_copy(
+                context->prelude_output, 0, current, 0, hidden_bytes);
+        if (!ok) failed_stage = "prelude checkpoint";
+    }
+
+    for (uint32_t pass = 0; ok && pass < DS4_INKLING_LOOP_PASSES; pass++) {
+        if (pass != 0u) {
+            current = context->prelude_output;
+            block_count = 1u;
+        }
+        for (uint32_t offset = 0; ok && offset < DS4_INKLING_CORE_LAYERS;
+             offset++, visit_index++) {
+            const uint32_t logical_layer = DS4_INKLING_LOOP_START + offset;
+            const ds4_inkling_visit *visit = &context->plan.visits[visit_index];
+            if (visit->pass != pass || visit->physical_layer != logical_layer) {
+                failed_stage = "loop visit plan";
+                ok = false;
+                break;
+            }
+            ok = inkling_gpu_decoder_layer(session, visit, logical_layer,
+                    block_count, current, &next, &failed_stage);
+            if (ok) {
+                current = next;
+                if (logical_layer % DS4_INKLING_RESIDUAL_BLOCK == 0u)
+                    block_count++;
+            }
+        }
+        if (ok && pass + 1u < DS4_INKLING_LOOP_PASSES) {
+            const uint64_t hidden_bytes = (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+            ok = block_count == 3u &&
+                ds4_gpu_tensor_copy(context->layer.previous_loop_states, 0,
+                    context->current_blocks, 2u * hidden_bytes, hidden_bytes) &&
+                ds4_gpu_tensor_copy(context->layer.previous_loop_states,
+                    hidden_bytes, current, 0, hidden_bytes);
+            if (!ok) failed_stage = "cross-pass bank snapshot";
+        }
+    }
+
+    for (uint32_t physical = DS4_INKLING_LOOP_END;
+         ok && physical < DS4_INKLING_PHYSICAL_LAYERS;
+         physical++, visit_index++) {
+        const ds4_inkling_visit *visit = &context->plan.visits[visit_index];
+        ok = inkling_gpu_decoder_layer(session, visit, physical, block_count,
+                                      current, &next, &failed_stage);
+        if (ok) {
+            current = next;
+            if (physical % DS4_INKLING_RESIDUAL_BLOCK == 0u) block_count++;
+        }
+    }
+
+    const uint64_t hidden_bytes = (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+    if (ok) {
+        ok = visit_index == DS4_INKLING_VISITS && block_count == 4u &&
+            inkling_gpu_mix(context, current, block_count,
+                context->parameters.output_res_query, 1u,
+                context->layer.mix_output_rows[0]);
+        if (!ok) failed_stage = "final residual mix";
+    }
+    if (ok) failed_stage = "output normalization";
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(
+            context->layer.next, context->layer.mix_output_rows[0],
+            engine->model.map, engine->model.size,
+            engine->inkling_weights.output_norm->abs_offset,
+            INKLING_GPU_HIDDEN, g_ds4_inkling_model_config.rms_epsilon);
+    if (ok) failed_stage = "output projection";
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+            context->logits, engine->model.map, engine->model.size,
+            engine->inkling_weights.output->abs_offset,
+            INKLING_GPU_HIDDEN,
+            (uint32_t)engine->inkling_weights.output->dim[1],
+            context->layer.next, 1u);
+    if (ok) failed_stage = "logit softcap";
+    if (ok) ok = ds4_gpu_inkling2_logit_softcap_tensor(
+            context->logits, context->logits,
+            (uint32_t)engine->inkling_weights.output->dim[1],
+            g_ds4_inkling_model_config.final_logit_softcap);
+    const bool commands_ok = commands_started && ds4_gpu_end_commands() != 0;
+    if (!commands_ok && ok) {
+        ok = false;
+        failed_stage = "Metal command completion";
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(context->logits, 0, session->logits,
+            (uint64_t)g_ds4_inkling_model_config.vocab_unpadded * sizeof(float)) != 0;
+        if (!ok) failed_stage = "logit readback";
+        if (ok) {
+            for (uint32_t i = g_ds4_inkling_model_config.vocab_unpadded;
+                 i < g_ds4_inkling_model_config.vocab_padded; i++) {
+                session->logits[i] = DS4_NEG_INF;
+            }
+        }
+    }
+    if (!ok) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity,
+                     "Inkling 2 Mini Metal evaluation failed at %s",
+                     failed_stage ? failed_stage : "unknown stage");
+        return false;
+    }
+    context->position++;
+    (void)hidden_bytes;
+    return true;
+}
+#undef INKLING_GPU_REQUIRE
+#endif
 
 static bool ds4_session_tp_leader(const ds4_session *s);
 
@@ -68273,6 +68874,12 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
     snprintf(err, errlen, "GPU support is not compiled in");
     return -1;
 #else
+#ifdef __APPLE__
+    if (s->inkling_gpu_ready) {
+        if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
+#endif
     ds4_engine *e = s->engine;
     int top = -1;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
@@ -68748,18 +69355,19 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier || ds4_model_is_inkling2() ||
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
             if (ds4_session_create(&s, e, ctx_size) != 0) {
-                fprintf(stderr, "ds4: failed to create multi-tier graph session\n");
+                fprintf(stderr, "ds4: failed to create graph session\n");
                 return 1;
             }
             ds4_session_set_progress(s, progress, progress_ud);
             if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
                 ds4_session_set_progress(s, NULL, NULL);
-                fprintf(stderr, "ds4: multi-tier prefill failed: %s\n", err);
+                fprintf(stderr, "ds4: graph session prefill failed: %s\n", err);
                 ds4_session_free(s);
                 return 1;
             }
@@ -68773,7 +69381,7 @@ int ds4_engine_generate_argmax(
             int token = ds4_session_argmax(s);
             for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
                 if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier argmax failed\n");
+                    fprintf(stderr, "ds4: graph session argmax failed\n");
                     rc = 1;
                     break;
                 }
@@ -68789,7 +69397,7 @@ int ds4_engine_generate_argmax(
                     token = -1;
                 }
                 if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier decode failed: %s\n", err);
+                    fprintf(stderr, "ds4: graph session decode failed: %s\n", err);
                     rc = 1;
                     break;
                 }
@@ -74678,11 +75286,43 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         vocab_load(&e->vocab, &e->model);
         if (!opt->inspect_only) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            const bool unsupported_options =
+                opt->tp.role != DS4_TP_NONE ||
+                opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+                opt->cuda_tensor_parallel ||
+                opt->ssd_streaming || opt->load_slice || opt->quality ||
+                opt->glm_mtp || opt->dspark || opt->mtp_path ||
+                (gpu_cfg && gpu_cfg->n_gpus > 1) ||
+                (opt->vision_path && opt->vision_path[0]) ||
+                (opt->directional_steering_file &&
+                 opt->directional_steering_file[0]) ||
+                opt->directional_steering_attn != 0.0f ||
+                opt->directional_steering_ffn != 0.0f;
+            if (e->backend != DS4_BACKEND_METAL || unsupported_options) {
+                fprintf(stderr,
+                        "ds4: Inkling 2 Mini currently requires single-session Metal without TP, distributed, streaming, or sidecar options\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            ds4_gpu_set_model_untracked_default(0);
+            if (!ds4_gpu_init() ||
+                !ds4_gpu_set_model_map(e->model.map, e->model.size)) {
+                fprintf(stderr,
+                        "ds4: failed to initialize the native Inkling Metal model map\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            e->metal_ready = true;
+#else
             fprintf(stderr,
-                    "ds4: Inkling 2 Mini GGUF validated, but its native decoder is not integrated yet\n");
+                    "ds4: Inkling 2 Mini inference requires the native Apple Metal build\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+#endif
         }
         *out = e;
         return 0;
@@ -77105,6 +77745,72 @@ static int ds4_session_tp_register(ds4_session *s) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+    if (ds4_model_is_inkling2()) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        const uint64_t reserve_bytes = UINT64_C(2) << 30;
+        uint64_t state_bytes = 0;
+        const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+        if (e->backend != DS4_BACKEND_METAL || !e->metal_ready ||
+            ctx_size > (int)DS4_INKLING_CONTEXT || e->tp.active ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr,
+                    "ds4: Inkling 2 Mini requires a local ready Metal engine, no tensor/distributed parallelism, and context <= %u\n",
+                    DS4_INKLING_CONTEXT);
+            return 1;
+        }
+        if (e->inkling_session_live) {
+            fprintf(stderr,
+                    "ds4: Inkling 2 Mini currently supports one live session\n");
+            return 1;
+        }
+        if (!recommended ||
+            !ds4_inkling_gpu_context_required_bytes(&e->inkling_plan,
+                                                    (uint32_t)ctx_size,
+                                                    &state_bytes) ||
+            e->model.size > UINT64_MAX - reserve_bytes ||
+            e->model.size + reserve_bytes > UINT64_MAX - state_bytes ||
+            e->model.size + reserve_bytes + state_bytes > recommended) {
+            fprintf(stderr,
+                    "ds4: Inkling 2 Mini model and session state exceed the Metal working-set budget\n");
+            return 1;
+        }
+
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        s->prefill_cap = (uint32_t)ctx_size;
+        if (!ds4_inkling_gpu_context_init(&s->inkling_gpu,
+                                          &e->inkling_plan,
+                                          (uint32_t)ctx_size)) {
+            fprintf(stderr, "ds4: failed to allocate Inkling 2 Mini GPU state\n");
+            free(s);
+            return 1;
+        }
+        s->inkling_gpu_ready = true;
+        if (!inkling_gpu_stage_parameters(&s->inkling_gpu, &e->model,
+                                         &e->inkling_weights)) {
+            fprintf(stderr,
+                    "ds4: failed to stage Inkling 2 Mini FP32 Metal parameters\n");
+            ds4_session_free(s);
+            return 1;
+        }
+        s->logits = xmalloc((size_t)g_ds4_inkling_model_config.vocab_padded *
+                            sizeof(float));
+        s->sample_probs = xmalloc(
+            (size_t)g_ds4_inkling_model_config.vocab_unpadded * sizeof(float));
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        e->inkling_session_live = true;
+        *out = s;
+        return 0;
+#else
+        fprintf(stderr,
+                "ds4: Inkling 2 Mini inference requires the native Apple Metal build\n");
+        return 1;
+#endif
+    }
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
@@ -77624,6 +78330,12 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
+#if defined(__APPLE__)
+        if (s->inkling_gpu_ready) {
+            ds4_inkling_gpu_context_free(&s->inkling_gpu);
+            if (s->engine) s->engine->inkling_session_live = false;
+        } else
+#endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
@@ -77818,6 +78530,12 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         return 1;
     }
     ds4_session_invalidate(s);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->inkling_gpu_ready) {
+        ds4_inkling_gpu_context_reset(&s->inkling_gpu);
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
         return 0;
@@ -79635,6 +80353,49 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->inkling_gpu_ready) {
+        ds4_inkling_gpu_context *context = &s->inkling_gpu;
+        for (int i = 0; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 ||
+                (uint32_t)prompt->v[i] >=
+                    g_ds4_inkling_model_config.vocab_unpadded) {
+                snprintf(err, errlen,
+                         "token id %d at position %d is outside the Inkling vocabulary",
+                         prompt->v[i], i);
+                return 1;
+            }
+        }
+        int start = 0;
+        if (s->checkpoint_valid && context->position ==
+                (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            ds4_inkling_gpu_context_reset(context);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (ds4_session_eval_internal(s, prompt->v[i], false,
+                                          err, errlen) != 0) {
+                return 1;
+            }
+            if (s->progress)
+                s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                            prompt->len);
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
@@ -80892,20 +81653,31 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+static uint32_t ds4_session_vocab_count(const ds4_session *s) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s && s->inkling_gpu_ready)
+        return g_ds4_inkling_model_config.vocab_unpadded;
+#else
+    (void)s;
+#endif
+    return DS4_N_VOCAB;
+}
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_argmax(s->logits, DS4_N_VOCAB);
+    return sample_argmax(s->logits, ds4_session_vocab_count(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    const uint32_t vocab = ds4_session_vocab_count(s);
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
-                s->logits, DS4_N_VOCAB, excluded_id);
+                s->logits, vocab, excluded_id);
     }
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < vocab; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (best < 0 || v > best_logit) {
@@ -80919,9 +81691,10 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    const uint32_t vocab = ds4_session_vocab_count(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < vocab; i++) {
         if (ds4_token_is_stop_for_think_mode(s->engine, (int)i,
                                              think_mode)) {
             continue;
@@ -80948,13 +81721,15 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+    const uint32_t vocab = ds4_session_vocab_count(s);
+    return sample_top_p_min_p(s->logits, vocab, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
-    if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
+    const uint32_t vocab = ds4_session_vocab_count(s);
+    if (k > (int)vocab) k = (int)vocab;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
         out[i].logit = DS4_NEG_INF;
@@ -80962,7 +81737,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     }
 
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < vocab; i++) {
         const float v = s->logits[i];
         if (!isfinite(v)) continue;
         if (v > max_logit) max_logit = v;
@@ -80978,7 +81753,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
@@ -80990,17 +81765,19 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!s || !out || token < 0 ||
+        token >= (int)ds4_session_vocab_count(s)) return 0;
+    const uint32_t vocab = ds4_session_vocab_count(s);
 
     float max_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v) && v > max_logit) max_logit = v;
     }
     if (!isfinite(max_logit)) return 0;
 
     double sum = 0.0;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < vocab; i++) {
         const float v = s->logits[i];
         if (isfinite(v)) sum += exp((double)v - (double)max_logit);
     }
@@ -81012,14 +81789,20 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
-    memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
-    return (int)DS4_N_VOCAB;
+    if (!s || !out) return 0;
+    const uint32_t vocab = ds4_session_vocab_count(s);
+    if (cap < (int)vocab) return 0;
+    memcpy(out, s->logits, (size_t)vocab * sizeof(out[0]));
+    return (int)vocab;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
-    memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    if (!s || !logits) return 1;
+    const uint32_t vocab = ds4_session_vocab_count(s);
+    if (n != (int)vocab) return 1;
+    memcpy(s->logits, logits, (size_t)vocab * sizeof(s->logits[0]));
+    for (uint32_t i = vocab; i < DS4_N_VOCAB; i++)
+        s->logits[i] = DS4_NEG_INF;
     return 0;
 }
 
@@ -81906,6 +82689,26 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      err,
                                      errlen);
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->inkling_gpu_ready) {
+        if (s->inkling_gpu.position != (uint32_t)s->checkpoint.len ||
+            token < 0 || token >= (int)g_ds4_inkling_model_config.vocab_unpadded ||
+            s->checkpoint.len >= s->ctx_size) {
+            if (errlen) snprintf(err, errlen,
+                    "Inkling 2 Mini decode position, token, or context is invalid");
+            return 1;
+        }
+        if (!inkling_gpu_eval_token(s, (uint32_t)token, err, errlen)) {
+            ds4_session_invalidate(s);
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
@@ -90268,6 +91071,9 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->inkling_gpu_ready) ds4_inkling_gpu_context_reset(&s->inkling_gpu);
+#endif
     free(s->checkpoint_images);
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;

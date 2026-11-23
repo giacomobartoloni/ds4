@@ -413,7 +413,10 @@ bool ds4_inkling_state_shortconv(
             for (uint32_t lag = 0; lag < kernel_size; lag++) {
                 const float sample = lag == 0 ? current[channel] :
                     history_value(slot, group, lag, channel);
-                float tap = static_taps[(uint64_t)lag * width + channel];
+                /* GGUF stores static taps oldest-to-current, while the causal
+                 * loop below visits samples current-to-oldest. */
+                float tap = static_taps[(uint64_t)channel * kernel_size +
+                                        (kernel_size - 1u - lag)];
                 if (dynamic_taps) {
                     tap += dynamic_taps[((uint64_t)token * heads + head) *
                                         kernel_size + lag];
@@ -493,9 +496,11 @@ bool ds4_inkling_relative_bias(
                 float sum = 0.0f;
                 if (distance >= 0 && (uint64_t)distance < relative_extent) {
                     for (uint32_t dim = 0; dim < relative_dim; dim++) {
+                        /* GGUF tensor shape is {relative_dim, extent}, so
+                         * the distance/profile row is contiguous. */
                         sum += state[dim] *
-                            projection[(uint64_t)dim * relative_extent +
-                                       (uint32_t)distance];
+                            projection[(uint64_t)(uint32_t)distance * relative_dim +
+                                       dim];
                     }
                 }
                 output[((uint64_t)row * heads + head) * keys + key] = sum;

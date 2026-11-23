@@ -230,13 +230,20 @@ static void test_prepare_qk_and_relative_bias(void) {
     assert(near(prepared[3], -1.0f * factor1 * tau1, 1e-6f));
 
     const float projected[] = { 1.0f, 2.0f, -1.0f, 0.5f };
+    /* GGUF shape {relative_dim=2, extent=3}: one contiguous row per distance. */
     const float table[] = { 1.0f, 2.0f, 3.0f, -2.0f, 1.0f, 0.0f };
-    const int64_t distances[] = { 0, 2, 3, -1 };
+    const int64_t distances[] = { 0, 2 };
     float bias[4];
     assert(ds4_inkling_relative_bias(bias, projected, table, distances,
                                     1, 2, 2, 3, 2));
-    assert(bias[0] == -3.0f && bias[1] == 3.0f);
-    assert(bias[2] == -2.0f && bias[3] == -3.0f);
+    assert(bias[0] == 5.0f && bias[1] == 1.0f);
+    assert(bias[2] == 0.0f && bias[3] == -1.0f);
+
+    const int64_t out_of_range_distances[] = { 3, -1 };
+    float out_of_range_bias[2];
+    assert(ds4_inkling_relative_bias(out_of_range_bias, projected, table,
+                                    out_of_range_distances, 1, 1, 2, 3, 2));
+    assert(out_of_range_bias[0] == 0.0f && out_of_range_bias[1] == 0.0f);
 }
 
 static void test_sliding_and_global_attention(void) {

@@ -26,7 +26,7 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o ds4_inkling_state.o ds4_inkling_moe.o ds4_inkling_loop.o ds4_inkling_gpu_state.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
@@ -173,7 +173,7 @@ tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h ds4_inkling_loop.h ds4_inkling_moe.h ds4_inkling_state.h
+tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h ds4_inkling_loop.h ds4_inkling_moe.h ds4_inkling_state.h ds4_inkling_gpu_state.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
 ds4_inkling_moe.o: ds4_inkling_moe.c ds4_inkling_moe.h ds4_gpu.h
@@ -182,12 +182,25 @@ ds4_inkling_moe.o: ds4_inkling_moe.c ds4_inkling_moe.h ds4_gpu.h
 ds4_inkling_loop.o: ds4_inkling_loop.c ds4_inkling_loop.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
-tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o ds4_inkling_state.o ds4_inkling_moe.o ds4_inkling_loop.o
+ds4_inkling_gpu_state.o: ds4_inkling_gpu_state.c ds4_inkling_gpu_state.h ds4_inkling_state.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o ds4_inkling_state.o ds4_inkling_moe.o ds4_inkling_loop.o ds4_inkling_gpu_state.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-inkling2-metal
 test-inkling2-metal: tests/test_inkling2_metal
 	./tests/test_inkling2_metal
+
+tests/test_inkling2_session.o: tests/test_inkling2_session.c ds4.c ds4.h ds4_inkling_gpu_state.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_inkling2_session: tests/test_inkling2_session.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-inkling2-session
+test-inkling2-session: tests/test_inkling2_session
+	./tests/test_inkling2_session
 
 speed-bench/inkling2_metal_quant_bench.o: speed-bench/inkling2_metal_quant_bench.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
@@ -1579,12 +1592,14 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 clean:
 	rm -f tests/test_inkling2_mapping
 	rm -f tests/test_inkling2_metal
+	rm -f tests/test_inkling2_session
 	rm -f tests/test_inkling2_state
 	rm -f tests/test_inkling2_model
 	rm -f tests/test_inkling2_gguf
 	rm -f tests/test_inkling2_tokenizer
 	rm -f ds4_inkling_moe.o
 	rm -f ds4_inkling_loop.o
+	rm -f ds4_inkling_gpu_state.o
 	rm -f speed-bench/inkling2_metal_quant_bench
 	rm -f speed-bench/inkling2_metal_m4_bench
 	rm -f speed-bench/inkling2_metal_moe_bench

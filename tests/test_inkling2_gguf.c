@@ -65,12 +65,14 @@ static void metadata_bool(FILE *file, const char *key, bool value) {
     assert(fwrite(&encoded, sizeof(encoded), 1, file) == 1);
 }
 
-static void metadata_u32_array(FILE *file, const char *key,
-                               const uint32_t *values, uint64_t count) {
+static void metadata_i32_array(FILE *file, const char *key,
+                               const int32_t *values, uint64_t count) {
     put_metadata_key(file, key, GGUF_VALUE_ARRAY);
-    put_u32(file, GGUF_VALUE_UINT32);
+    put_u32(file, GGUF_VALUE_INT32);
     put_u64(file, count);
-    for (uint64_t i = 0; i < count; i++) put_u32(file, values[i]);
+    for (uint64_t i = 0; i < count; i++) {
+        assert(fwrite(&values[i], sizeof(values[i]), 1, file) == 1);
+    }
 }
 
 static void metadata_bool_array(FILE *file, const char *key,
@@ -204,7 +206,7 @@ static void write_model_metadata(FILE *file) {
     META_U32("attention.value_length_swa", 128);
     META_U32("feed_forward_length", 1152);
     META_U32("rope.dimension_count", 0);
-    uint32_t heads[24], kv_heads[24];
+    int32_t heads[24], kv_heads[24];
     uint8_t sliding[24];
     for (uint32_t i = 0; i < 24; i++) {
         heads[i] = 24;
@@ -212,9 +214,9 @@ static void write_model_metadata(FILE *file) {
         sliding[i] = (uint8_t)(i % 6u != 5u);
     }
     snprintf(key, sizeof(key), "%sattention.head_count", p);
-    metadata_u32_array(file, key, heads, 24);
+    metadata_i32_array(file, key, heads, 24);
     snprintf(key, sizeof(key), "%sattention.head_count_kv", p);
-    metadata_u32_array(file, key, kv_heads, 24);
+    metadata_i32_array(file, key, kv_heads, 24);
     snprintf(key, sizeof(key), "%sattention.sliding_window_pattern", p);
     metadata_bool_array(file, key, sliding, 24);
     metadata_string(file, "tokenizer.ggml.pre", "inkling2");
@@ -270,7 +272,9 @@ static void write_tensor_directory(FILE *file) {
             layer_tensor(file, il, "attn_v_conv_proj.weight", DS4_TENSOR_Q8_0, 2, 2304, 32, 0);
         }
         if (il != 0)
-            layer_tensor(file, il, "attn_res_query.weight", DS4_TENSOR_F32, 1, 2304, 0, 0);
+            layer_tensor(file, il, "attn_res_query.weight", DS4_TENSOR_F32,
+                         sliding ? 1u : 2u,
+                         2304, sliding ? 0u : 3u, 0);
         layer_tensor(file, il, "ffn_res_query.weight", DS4_TENSOR_F32, 1, 2304, 0, 0);
         layer_tensor(file, il, "ffn_norm.weight", DS4_TENSOR_F32, 1, 2304, 0, 0);
         layer_tensor(file, il, "ffn_gate_inp.weight", DS4_TENSOR_F32, 2, 2304, 128, 0);

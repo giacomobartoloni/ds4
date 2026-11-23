@@ -1,4 +1,5 @@
 #include "ds4_inkling_loop.h"
+#include "ds4_inkling_gpu_state.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -138,6 +139,66 @@ int ds4_inkling_mix_metal(
                                        hidden_dim, query_count, epsilon);
 }
 
+int ds4_inkling_control_metal_with_workspace(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ctrl_down_offset,
+        uint64_t              ctrl_gain_offset,
+        uint64_t              ctrl_forget_offset,
+        uint32_t              hidden_dim,
+        uint32_t              rank,
+        float                 epsilon,
+        const ds4_inkling_gpu_control_workspace *workspace) {
+    if (!out || !current || !message || !model_map || hidden_dim == 0 ||
+        hidden_dim > DS4_INKLING_MAX_HIDDEN || rank == 0 ||
+        rank > DS4_INKLING_MAX_CTRL_RANK ||
+        !ds4_inkling_valid_epsilon(epsilon) || !workspace ||
+        !workspace->normalized || !workspace->bottleneck ||
+        !workspace->gain || !workspace->forget) return 0;
+
+    const uint64_t hidden_bytes = (uint64_t)hidden_dim * sizeof(float);
+    int ok = ds4_gpu_tensor_bytes(workspace->normalized) >= 2u * hidden_bytes &&
+             ds4_gpu_tensor_bytes(workspace->bottleneck) >=
+                 (uint64_t)rank * sizeof(float) &&
+             ds4_gpu_tensor_bytes(workspace->gain) >= hidden_bytes &&
+             ds4_gpu_tensor_bytes(workspace->forget) >= hidden_bytes;
+    const char *failed_stage = ok ? NULL : "scratch allocation";
+    if (ok && !ds4_gpu_inkling2_control_prepare_tensor(
+                  workspace->normalized, current, message, hidden_dim, epsilon)) {
+        ok = 0;
+        failed_stage = "input normalization";
+    }
+    if (ok && !ds4_gpu_matmul_f32_tensor(
+                  workspace->bottleneck, model_map, model_size, ctrl_down_offset,
+                  2u * hidden_dim, rank, workspace->normalized, 1u)) {
+        ok = 0;
+        failed_stage = "controller down projection";
+    }
+    if (ok && !ds4_gpu_matmul_f32_tensor(
+                  workspace->gain, model_map, model_size, ctrl_gain_offset,
+                  rank, hidden_dim, workspace->bottleneck, 1u)) {
+        ok = 0;
+        failed_stage = "controller gain projection";
+    }
+    if (ok && !ds4_gpu_matmul_f32_tensor(
+                  workspace->forget, model_map, model_size, ctrl_forget_offset,
+                  rank, hidden_dim, workspace->bottleneck, 1u)) {
+        ok = 0;
+        failed_stage = "controller forget projection";
+    }
+    if (ok && !ds4_gpu_inkling2_control_update_tensor(
+                  out, current, message, workspace->gain,
+                  workspace->forget, hidden_dim)) {
+        ok = 0;
+        failed_stage = "controller gated update";
+    }
+    if (!ok) fprintf(stderr, "ds4: Inkling2 loop controller failed at %s\n", failed_stage);
+    return ok;
+}
+
 int ds4_inkling_control_metal(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *current,
@@ -150,50 +211,21 @@ int ds4_inkling_control_metal(
         uint32_t              hidden_dim,
         uint32_t              rank,
         float                 epsilon) {
-    if (!out || !current || !message || !model_map || hidden_dim == 0 ||
-        hidden_dim > DS4_INKLING_MAX_HIDDEN || rank == 0 ||
-        rank > DS4_INKLING_MAX_CTRL_RANK ||
-        !ds4_inkling_valid_epsilon(epsilon)) return 0;
-
-    ds4_gpu_tensor *normalized = ds4_gpu_tensor_alloc(
+    ds4_inkling_gpu_control_workspace workspace = {0};
+    workspace.normalized = ds4_gpu_tensor_alloc(
         (uint64_t)2u * hidden_dim * sizeof(float));
-    ds4_gpu_tensor *bottleneck = ds4_gpu_tensor_alloc((uint64_t)rank * sizeof(float));
-    ds4_gpu_tensor *gain = ds4_gpu_tensor_alloc((uint64_t)hidden_dim * sizeof(float));
-    ds4_gpu_tensor *forget = ds4_gpu_tensor_alloc((uint64_t)hidden_dim * sizeof(float));
-    int ok = normalized && bottleneck && gain && forget;
-    const char *failed_stage = ok ? NULL : "scratch allocation";
-    if (ok && !ds4_gpu_inkling2_control_prepare_tensor(
-                  normalized, current, message, hidden_dim, epsilon)) {
-        ok = 0;
-        failed_stage = "input normalization";
-    }
-    if (ok && !ds4_gpu_matmul_f32_tensor(
-                  bottleneck, model_map, model_size, ctrl_down_offset,
-                  2u * hidden_dim, rank, normalized, 1u)) {
-        ok = 0;
-        failed_stage = "controller down projection";
-    }
-    if (ok && !ds4_gpu_matmul_f32_tensor(
-                  gain, model_map, model_size, ctrl_gain_offset,
-                  rank, hidden_dim, bottleneck, 1u)) {
-        ok = 0;
-        failed_stage = "controller gain projection";
-    }
-    if (ok && !ds4_gpu_matmul_f32_tensor(
-                  forget, model_map, model_size, ctrl_forget_offset,
-                  rank, hidden_dim, bottleneck, 1u)) {
-        ok = 0;
-        failed_stage = "controller forget projection";
-    }
-    if (ok && !ds4_gpu_inkling2_control_update_tensor(
-                  out, current, message, gain, forget, hidden_dim)) {
-        ok = 0;
-        failed_stage = "controller gated update";
-    }
-    if (!ok) fprintf(stderr, "ds4: Inkling2 loop controller failed at %s\n", failed_stage);
-    ds4_gpu_tensor_free(normalized);
-    ds4_gpu_tensor_free(bottleneck);
-    ds4_gpu_tensor_free(gain);
-    ds4_gpu_tensor_free(forget);
+    workspace.bottleneck = ds4_gpu_tensor_alloc((uint64_t)rank * sizeof(float));
+    workspace.gain = ds4_gpu_tensor_alloc((uint64_t)hidden_dim * sizeof(float));
+    workspace.forget = ds4_gpu_tensor_alloc((uint64_t)hidden_dim * sizeof(float));
+    const int ok = workspace.normalized && workspace.bottleneck &&
+        workspace.gain && workspace.forget &&
+        ds4_inkling_control_metal_with_workspace(
+            out, current, message, model_map, model_size,
+            ctrl_down_offset, ctrl_gain_offset, ctrl_forget_offset,
+            hidden_dim, rank, epsilon, &workspace);
+    ds4_gpu_tensor_free(workspace.normalized);
+    ds4_gpu_tensor_free(workspace.bottleneck);
+    ds4_gpu_tensor_free(workspace.gain);
+    ds4_gpu_tensor_free(workspace.forget);
     return ok;
 }
