@@ -1617,3 +1617,7 @@ gguf-tools/quality-testing/score_official_verify.o: gguf-tools/quality-testing/s
 
 gguf-tools/quality-testing/score_official_verify: gguf-tools/quality-testing/score_official_verify.o ds4_verify_test_hooks.o $(filter-out ds4.o,$(CORE_OBJS)) rax.o ds4_gpu_args.o
 	$(if $(filter Darwin,$(UNAME_S)),$(CC) $(CFLAGS),$(DS4_LINK)) -o $@ $^ $(if $(filter Darwin,$(UNAME_S)),$(METAL_LDLIBS),$(DS4_LINK_LIBS))
+
+.PHONY: test-inkling2-inspect
+test-inkling2-inspect:
+	python3 -m unittest discover -s gguf-tools/tests -p 'test_inkling2_inspect.py' -v

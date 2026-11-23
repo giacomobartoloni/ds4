@@ -7,7 +7,7 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | Milestone | Status | Evidence |
 | --- | --- | --- |
 | M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
-| M1: GGUF inspector and 48-visit mapping | In progress | Real model file is not present; synthetic format and planner tests are being added. |
+| M1: GGUF inspector and 48-visit mapping | In progress | Read-only inspector and 18 synthetic tests are complete; the native visit planner and loader type-size correction are next. |
 | M2+: native operators, generation, numeric parity, and performance | Not started | Model-dependent validation requires the GGUF to be available locally. |
 
 ## M0 baseline
@@ -37,3 +37,9 @@ These source revisions were inspected as format and semantic references; DS4 doe
 - The pinned model's 24-entry sliding-window pattern identifies physical full-attention layers 5, 11, 17, and 23. Across the 48 visits this yields 8 full-attention and 40 sliding-window cache slots.
 - Initial inference scope: one text-only session, batch size 1, context 8192, IQ4_NL expert matrices, Q8_0 other matrices, F32 loop controller tensors, and FP16 KV. Unsupported model metadata must be rejected rather than silently assumed.
 - A benchmark or numerical-parity claim requires the model file to be present and the exact tested file, prompt, context, and run count to be recorded.
+
+## GGUF inspector
+
+`gguf-tools/inkling2_inspect.py` reads GGUF v3 metadata and tensor descriptors. It validates tensor shapes, canonical byte sizes for the supported F32/F16/Q8_0/IQ4_NL tensor types, alignment, overlap, and file bounds without reading tensor payloads. Use `--summary`, `--tensors`, `--json`, or `--validate-inkling2`; all modes report that payload bytes were not read. The Inkling validator checks the loop metadata, 24-entry attention schedule, 48 logical visits, 156 F32 loop-controller tensors, and the IQ4_NL/Q8_0 expert tensor assignments.
+
+Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descriptors, primitive/array metadata, truncation and size limits, duplicate keys and names, invalid shapes and types, offset alignment/overlap/bounds, quant block sizes, the expected Inkling layout, and payload-free inspection. The live GGUF is absent, so `--validate-inkling2` has not yet been run against model bytes.
