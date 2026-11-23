@@ -673,6 +673,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_INKLING,
 } server_model_syntax;
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
@@ -738,6 +739,7 @@ typedef struct {
     /* Distinguish the Responses hosted tool from a normal function that
      * happens to be named "tool_search". */
     bool responses_tool_search;
+    bool responses_custom_tool;
     char **prop;
     char **prop_schema;
     int len;
@@ -752,11 +754,12 @@ typedef struct {
 
 typedef struct {
     size_t begin, end;
-    char *id, *content;
+    char *id, *name, *content;
 } tool_result_span;
 
 typedef struct {
     char *role;
+    char *name;
     char *content;
     server_image_inputs images;
     char *reasoning;
@@ -774,6 +777,9 @@ typedef struct {
     int len;
     int cap;
 } chat_msgs;
+
+static void inkling_enrich_tool_names(server *s, api_style api,
+                                     chat_msgs *msgs);
 
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
@@ -896,6 +902,7 @@ static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
 
 static void chat_msg_free(chat_msg *m) {
     free(m->role);
+    free(m->name);
     free(m->content);
     server_image_inputs_free(&m->images);
     free(m->reasoning);
@@ -905,6 +912,7 @@ static void chat_msg_free(chat_msg *m) {
     tool_calls_free(&m->calls);
     for (int i = 0; i < m->tool_results_len; i++) {
         free(m->tool_results[i].id);
+        free(m->tool_results[i].name);
         free(m->tool_results[i].content);
     }
     free(m->tool_results);
@@ -1221,6 +1229,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_inkling2(engine)) return SERVER_MODEL_SYNTAX_INKLING;
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
@@ -1228,6 +1237,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_inkling2(engine)) return "inkling-2-mini";
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
@@ -1238,7 +1248,8 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
+           (!strcmp(id, "inkling-2-mini") ||
+            !strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
             !strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
@@ -1624,9 +1635,64 @@ done:
     return out;
 }
 
+static char *responses_flatten_namespace_tool_name(const char *namespace,
+                                                   const char *name) {
+    buf flattened = {0};
+    buf_puts(&flattened, namespace ? namespace : "");
+    if (namespace && namespace[0]) {
+        size_t len = strlen(namespace);
+        char last = namespace[len - 1];
+        if (last != '.' && last != '_') buf_putc(&flattened, '.');
+    }
+    buf_puts(&flattened, name ? name : "");
+    return buf_take(&flattened);
+}
+
+static void responses_append_custom_format_description(buf *description,
+                                                       const char *raw) {
+    if (!raw) return;
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return;
+    p++;
+    char *type = NULL;
+    char *syntax = NULL;
+    char *definition = NULL;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) break;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            break;
+        }
+        p++;
+        char **dst = !strcmp(key, "type") ? &type :
+                     !strcmp(key, "syntax") ? &syntax :
+                     !strcmp(key, "definition") ? &definition : NULL;
+        bool ok = dst ? json_string_replace(&p, dst) : json_skip_value(&p);
+        free(key);
+        if (!ok) break;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (type && !strcmp(type, "grammar") && syntax && definition) {
+        buf_puts(description, "\nInput syntax (");
+        buf_puts(description, syntax);
+        buf_puts(description, "):\n");
+        buf_puts(description, definition);
+    }
+    free(type);
+    free(syntax);
+    free(definition);
+}
+
 static char *responses_namespace_function_schema_from_tool(const char *raw,
                                                            const char *namespace,
-                                                           char **wire_name) {
+                                                           char **wire_name,
+                                                           bool *custom_tool) {
     const char *p = raw;
     json_ws(&p);
     if (*p != '{') return NULL;
@@ -1636,6 +1702,7 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
     char *name = NULL;
     char *description = NULL;
     char *parameters = NULL;
+    char *format = NULL;
     char *out = NULL;
 
     json_ws(&p);
@@ -1668,6 +1735,11 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
                 free(key);
                 goto done;
             }
+        } else if (!strcmp(key, "format")) {
+            if (!json_raw_value_replace(&p, &format)) {
+                free(key);
+                goto done;
+            }
         } else if (!json_skip_value(&p)) {
             free(key);
             goto done;
@@ -1678,23 +1750,38 @@ static char *responses_namespace_function_schema_from_tool(const char *raw,
         json_ws(&p);
     }
 
-    if ((!type || !strcmp(type, "function")) && namespace && name && name[0]) {
-        buf prompt_name = {0};
-        buf_puts(&prompt_name, namespace);
-        buf_puts(&prompt_name, name);
+    bool is_custom = type && !strcmp(type, "custom");
+    if ((!type || !strcmp(type, "function") || is_custom) &&
+        namespace && name && name[0]) {
+        char *prompt_name = responses_flatten_namespace_tool_name(namespace, name);
+        buf custom_description = {0};
+        const char *schema_description = description ? description : "";
+        const char *schema_parameters = parameters ? parameters :
+            "{\"type\":\"object\",\"properties\":{}}";
+        if (is_custom) {
+            buf_puts(&custom_description, schema_description);
+            buf_puts(&custom_description,
+                     "\nPass the complete custom tool input as the string-valued `input` argument.");
+            responses_append_custom_format_description(&custom_description, format);
+            schema_description = custom_description.ptr ? custom_description.ptr : "";
+            schema_parameters =
+                "{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},"
+                "\"required\":[\"input\"],\"additionalProperties\":false}";
+        }
 
         buf b = {0};
         buf_puts(&b, "{\"name\":");
-        json_escape(&b, prompt_name.ptr ? prompt_name.ptr : name);
+        json_escape(&b, prompt_name ? prompt_name : name);
         buf_puts(&b, ",\"description\":");
-        json_escape(&b, description ? description : "");
+        json_escape(&b, schema_description);
         buf_puts(&b, ",\"parameters\":");
-        buf_puts(&b, parameters ? parameters :
-                 "{\"type\":\"object\",\"properties\":{}}");
+        buf_puts(&b, schema_parameters);
         buf_putc(&b, '}');
         out = buf_take(&b);
         if (wire_name) *wire_name = xstrdup(name);
-        buf_free(&prompt_name);
+        if (custom_tool) *custom_tool = is_custom;
+        free(prompt_name);
+        buf_free(&custom_description);
     }
 
 done:
@@ -1702,6 +1789,7 @@ done:
     free(name);
     free(description);
     free(parameters);
+    free(format);
     return out;
 }
 
@@ -1762,7 +1850,8 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
                                              const char *json,
                                              const char *namespace,
                                              const char *wire_name,
-                                             bool responses_tool_search) {
+                                             bool responses_tool_search,
+                                             bool responses_custom_tool) {
     if (!orders || !json) return;
     const char *p = json;
     json_ws(&p);
@@ -1805,6 +1894,7 @@ static void tool_schema_orders_add_json_wire(tool_schema_orders *orders,
         if (namespace && namespace[0]) order.namespace = xstrdup(namespace);
         if (wire_name && wire_name[0]) order.wire_name = xstrdup(wire_name);
         order.responses_tool_search = responses_tool_search;
+        order.responses_custom_tool = responses_custom_tool;
         tool_schema_orders_push(orders, order);
         memset(&order, 0, sizeof(order));
     }
@@ -1813,7 +1903,7 @@ done:
 }
 
 static void tool_schema_orders_add_json(tool_schema_orders *orders, const char *json) {
-    tool_schema_orders_add_json_wire(orders, json, NULL, NULL, false);
+    tool_schema_orders_add_json_wire(orders, json, NULL, NULL, false, false);
 }
 
 static bool append_responses_namespace_tool_schemas(buf *schemas,
@@ -1875,11 +1965,15 @@ static bool append_responses_namespace_tool_schemas(buf *schemas,
         char *tool_raw = NULL;
         if (!json_raw_value(&tp, &tool_raw)) goto done;
         char *wire_name = NULL;
+        bool custom_tool = false;
         char *schema =
-            responses_namespace_function_schema_from_tool(tool_raw, name, &wire_name);
+            responses_namespace_function_schema_from_tool(tool_raw, name,
+                                                         &wire_name,
+                                                         &custom_tool);
         if (schema) {
             append_raw_json_line(schemas, schema);
-            tool_schema_orders_add_json_wire(orders, schema, name, wire_name, false);
+            tool_schema_orders_add_json_wire(orders, schema, name, wire_name,
+                                             false, custom_tool);
             appended = true;
         }
         free(schema);
@@ -1926,7 +2020,7 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
             if (special) {
                 append_raw_json_line(&schemas, special);
                 tool_schema_orders_add_json_wire(orders, special,
-                                                 NULL, NULL, true);
+                                                 NULL, NULL, true, false);
             } else {
                 append_raw_json_line(&schemas, raw);
                 tool_schema_orders_add_json(orders, raw);
@@ -1946,6 +2040,31 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
 bad:
     buf_free(&schemas);
     return false;
+}
+
+static bool responses_append_tool_schemas(buf *loaded,
+                                          tool_schema_orders *orders,
+                                          const char *raw) {
+    if (!loaded || !orders || !raw) return false;
+    const char *p = raw;
+    char *schemas = NULL;
+    if (!parse_tools_value(&p, &schemas, orders)) return false;
+    json_ws(&p);
+    bool valid = *p == '\0';
+    if (valid && schemas && schemas[0]) {
+        if (loaded->len) buf_putc(loaded, '\n');
+        buf_puts(loaded, schemas);
+    }
+    free(schemas);
+    return valid;
+}
+
+static char *responses_custom_input_arguments(const char *input) {
+    buf arguments = {0};
+    buf_puts(&arguments, "{\"input\":");
+    json_escape(&arguments, input ? input : "");
+    buf_putc(&arguments, '}');
+    return buf_take(&arguments);
 }
 
 static bool parse_image_url_value(const char **p, char **url) {
@@ -2107,6 +2226,11 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
             (*p)++;
             if (!strcmp(key, "role")) {
                 if (!json_string_replace(p, &msg.role)) {
+                    free(key);
+                    goto fail;
+                }
+            } else if (!strcmp(key, "name")) {
+                if (!json_string_replace(p, &msg.name)) {
                     free(key);
                     goto fail;
                 }
@@ -2708,6 +2832,204 @@ bad:
     return true;
 }
 
+typedef struct {
+    char *key;
+    char *value;
+} inkling_json_member;
+
+static int inkling_json_member_compare(const void *a, const void *b) {
+    const inkling_json_member *left = a;
+    const inkling_json_member *right = b;
+    return strcmp(left->key, right->key);
+}
+
+/* The GGUF template serializes tool schemas with recursively sorted keys. */
+static bool inkling_append_sorted_json_value(buf *out, const char **p, int depth) {
+    if (depth >= JSON_MAX_NESTING) return false;
+    json_ws(p);
+    if (**p == '{') {
+        (*p)++;
+        json_ws(p);
+        inkling_json_member *members = NULL;
+        int len = 0, cap = 0;
+        while (**p && **p != '}') {
+            inkling_json_member member = {0};
+            if (!json_string(p, &member.key)) goto object_bad;
+            json_ws(p);
+            if (**p != ':') {
+                free(member.key);
+                goto object_bad;
+            }
+            (*p)++;
+            if (!json_raw_value(p, &member.value)) {
+                free(member.key);
+                goto object_bad;
+            }
+            if (len == cap) {
+                cap = cap ? cap * 2 : 8;
+                members = xrealloc(members, (size_t)cap * sizeof(members[0]));
+            }
+            members[len++] = member;
+            json_ws(p);
+            if (**p == ',') {
+                (*p)++;
+                json_ws(p);
+            } else if (**p != '}') {
+                goto object_bad;
+            }
+        }
+        if (**p != '}') goto object_bad;
+        (*p)++;
+        if (len > 1)
+            qsort(members, (size_t)len, sizeof(members[0]), inkling_json_member_compare);
+        buf_putc(out, '{');
+        for (int i = 0; i < len; i++) {
+            if (i) buf_putc(out, ',');
+            json_escape(out, members[i].key);
+            buf_putc(out, ':');
+            const char *value = members[i].value;
+            if (!inkling_append_sorted_json_value(out, &value, depth + 1)) {
+                for (int j = 0; j < len; j++) {
+                    free(members[j].key);
+                    free(members[j].value);
+                }
+                free(members);
+                return false;
+            }
+            json_ws(&value);
+            if (*value) {
+                for (int j = 0; j < len; j++) {
+                    free(members[j].key);
+                    free(members[j].value);
+                }
+                free(members);
+                return false;
+            }
+        }
+        buf_putc(out, '}');
+        for (int i = 0; i < len; i++) {
+            free(members[i].key);
+            free(members[i].value);
+        }
+        free(members);
+        return true;
+
+object_bad:
+        for (int i = 0; i < len; i++) {
+            free(members[i].key);
+            free(members[i].value);
+        }
+        free(members);
+        return false;
+    }
+    if (**p == '[') {
+        (*p)++;
+        json_ws(p);
+        buf_putc(out, '[');
+        bool wrote = false;
+        while (**p && **p != ']') {
+            if (wrote) buf_putc(out, ',');
+            if (!inkling_append_sorted_json_value(out, p, depth + 1)) return false;
+            wrote = true;
+            json_ws(p);
+            if (**p == ',') {
+                (*p)++;
+                json_ws(p);
+            } else if (**p != ']') {
+                return false;
+            }
+        }
+        if (**p != ']') return false;
+        (*p)++;
+        buf_putc(out, ']');
+        return true;
+    }
+    if (**p == '"') {
+        char *value = NULL;
+        if (!json_string(p, &value)) return false;
+        json_escape(out, value);
+        free(value);
+        return true;
+    }
+    char *raw = NULL;
+    if (!json_raw_value(p, &raw)) return false;
+    buf_puts(out, raw);
+    free(raw);
+    return true;
+}
+
+static const json_arg *inkling_find_schema_field(const json_args *fields,
+                                                 const char *key) {
+    for (int i = 0; fields && i < fields->len; i++)
+        if (!strcmp(fields->v[i].key, key)) return &fields->v[i];
+    return NULL;
+}
+
+static bool inkling_append_tool_spec(buf *out, const char *raw) {
+    json_args fields = {0};
+    if (!json_args_parse(raw, &fields)) return false;
+    const json_arg *name = inkling_find_schema_field(&fields, "name");
+    const json_arg *description = inkling_find_schema_field(&fields, "description");
+    const json_arg *parameters = inkling_find_schema_field(&fields, "parameters");
+    if (!parameters) parameters = inkling_find_schema_field(&fields, "input_schema");
+    const json_arg *type = inkling_find_schema_field(&fields, "type");
+    if (!name || !name->is_string || !name->value[0]) {
+        json_args_free(&fields);
+        return false;
+    }
+
+    buf_puts(out, "{\"description\":");
+    json_escape(out, description && description->is_string ? description->value : "");
+    buf_puts(out, ",\"name\":");
+    json_escape(out, name->value);
+    buf_puts(out, ",\"parameters\":");
+    if (parameters && !parameters->is_string) {
+        const char *p = parameters->value;
+        if (!inkling_append_sorted_json_value(out, &p, 0)) {
+            json_args_free(&fields);
+            return false;
+        }
+        json_ws(&p);
+        if (*p) {
+            json_args_free(&fields);
+            return false;
+        }
+    } else {
+        buf_puts(out, "{}");
+    }
+    buf_puts(out, ",\"type\":");
+    json_escape(out, type && type->is_string && type->value[0] ? type->value : "function");
+    buf_putc(out, '}');
+    json_args_free(&fields);
+    return true;
+}
+
+static void inkling_append_tool_declarations(buf *out, const char *tool_schemas) {
+    const char *p = tool_schemas ? tool_schemas : "";
+    buf specs = {0};
+    buf_putc(&specs, '[');
+    bool wrote = false;
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        buf spec = {0};
+        if (inkling_append_tool_spec(&spec, raw)) {
+            if (wrote) buf_putc(&specs, ',');
+            buf_append(&specs, spec.ptr, spec.len);
+            wrote = true;
+        }
+        buf_free(&spec);
+        free(raw);
+        json_ws(&p);
+    }
+    buf_putc(&specs, ']');
+    buf_puts(out, "<|message_system|>tool_declare<|content_xml|>");
+    buf_append(out, specs.ptr, specs.len);
+    buf_puts(out, "<|end_message|>");
+    buf_free(&specs);
+}
+
 static bool append_glm_tool_schema_json(buf *b, const char *json,
                                         bool *emitted) {
     json_args args = {0};
@@ -3076,6 +3398,50 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
     }
 }
 
+static int inkling_json_arg_ptr_compare(const void *a, const void *b) {
+    const json_arg *left = *(const json_arg *const *)a;
+    const json_arg *right = *(const json_arg *const *)b;
+    return strcmp(left->key, right->key);
+}
+
+static void inkling_append_tool_call_arguments(buf *out, const char *json) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) {
+        buf_puts(out, "{}");
+        return;
+    }
+    json_arg **sorted = args.len ? xmalloc((size_t)args.len * sizeof(sorted[0])) : NULL;
+    for (int i = 0; i < args.len; i++) sorted[i] = &args.v[i];
+    if (args.len > 1)
+        qsort(sorted, (size_t)args.len, sizeof(sorted[0]), inkling_json_arg_ptr_compare);
+    buf_putc(out, '{');
+    for (int i = 0; i < args.len; i++) {
+        if (i) buf_putc(out, ',');
+        append_json_arg_pair(out, sorted[i]);
+    }
+    buf_putc(out, '}');
+    free(sorted);
+    json_args_free(&args);
+}
+
+static void append_inkling_tool_calls_text(buf *out, const tool_calls *calls) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(out, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *call = &calls->v[i];
+        buf_puts(out, "<|message_model|>");
+        buf_puts(out, call->name ? call->name : "");
+        buf_puts(out, "<|content_invoke_tool_json|>{\"name\":");
+        json_escape(out, call->name ? call->name : "");
+        buf_puts(out, ",\"args\":");
+        inkling_append_tool_call_arguments(out, call->arguments);
+        buf_puts(out, "}<|end_message|>");
+    }
+}
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
@@ -3084,6 +3450,8 @@ static void append_tool_calls_text_for_syntax(buf *b,
         append_glm_tool_calls_text(b, calls, tool_orders);
     } else if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         append_qwen_tool_calls_text(b, calls, b->len > 0, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        append_inkling_tool_calls_text(b, calls);
     } else {
         append_dsml_tool_calls_text(b, calls, syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41);
     }
@@ -3637,6 +4005,180 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+static void inkling_append_reasoning_effort(buf *out, ds4_think_mode mode) {
+    const char *value = NULL;
+    switch (mode) {
+    case DS4_THINK_NONE: value = "0"; break;
+    case DS4_THINK_MINIMAL: value = "0.1"; break;
+    case DS4_THINK_LOW: value = "0.2"; break;
+    case DS4_THINK_MEDIUM: value = "0.7"; break;
+    case DS4_THINK_HIGH: value = "0.9"; break;
+    case DS4_THINK_XHIGH:
+    case DS4_THINK_MAX: value = "0.99"; break;
+    default: break;
+    }
+    char numeric[8];
+    if (!value) {
+        int level = ds4_think_mode_level(mode);
+        if (level < 0) level = 90;
+        if (level > 99) level = 99;
+        if (level == 0) {
+            value = "0";
+        } else {
+            snprintf(numeric, sizeof(numeric), "0.%02d", level);
+            size_t len = strlen(numeric);
+            while (len > 0 && numeric[len - 1] == '0') numeric[--len] = '\0';
+            value = numeric;
+        }
+    }
+    buf_puts(out, "<|message_system|><|content_text|>Thinking effort level: ");
+    buf_puts(out, value);
+    buf_puts(out, "<|end_message|>");
+}
+
+static const char *inkling_tool_name_for_id(const chat_msgs *msgs,
+                                            const char *tool_call_id) {
+    if (!tool_call_id || !tool_call_id[0]) return NULL;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *message = &msgs->v[i];
+        if (strcmp(message->role, "assistant")) continue;
+        for (int j = 0; j < message->calls.len; j++) {
+            const tool_call *call = &message->calls.v[j];
+            if (call->id && !strcmp(call->id, tool_call_id)) return call->name;
+        }
+    }
+    return NULL;
+}
+
+static const char *inkling_tool_message_name(const chat_msgs *msgs,
+                                             const chat_msg *message,
+                                             const char *name,
+                                             const char *tool_call_id) {
+    if (name && name[0]) return name;
+    if (message && message->name && message->name[0]) return message->name;
+    return inkling_tool_name_for_id(msgs, tool_call_id);
+}
+
+static void inkling_append_message(buf *out, const char *role_token,
+                                   const char *name, const char *content) {
+    buf_puts(out, role_token);
+    if (name && name[0]) buf_puts(out, name);
+    buf_puts(out, "<|content_text|>");
+    buf_puts(out, content ? content : "");
+    buf_puts(out, "<|end_message|>");
+}
+
+static void inkling_append_tool_result(buf *out, const chat_msgs *msgs,
+                                      const chat_msg *message,
+                                      const char *name, const char *id,
+                                      const char *content) {
+    inkling_append_message(out, "<|message_tool|>",
+                           inkling_tool_message_name(msgs, message, name, id),
+                           content);
+}
+
+static void inkling_append_user_with_tool_results(buf *out, const chat_msgs *msgs,
+                                                  const chat_msg *message) {
+    const char *content = message->content ? message->content : "";
+    size_t cursor = 0;
+    for (int i = 0; i < message->tool_results_len; i++) {
+        const tool_result_span *span = &message->tool_results[i];
+        if (span->begin < cursor || span->end < span->begin ||
+            span->end > strlen(content)) continue;
+        if (span->begin > cursor) {
+            char *text = xstrndup(content + cursor, span->begin - cursor);
+            inkling_append_message(out, "<|message_user|>", NULL, text);
+            free(text);
+        }
+        inkling_append_tool_result(out, msgs, message, span->name,
+                                   span->id, span->content);
+        cursor = span->end;
+    }
+    if (cursor < strlen(content)) {
+        inkling_append_message(out, "<|message_user|>", NULL, content + cursor);
+    }
+}
+
+static char *render_inkling_chat_prompt_text(const chat_msgs *msgs,
+                                             const char *tool_schemas,
+                                             ds4_think_mode think_mode) {
+    buf out = {0};
+    if (tool_schemas && tool_schemas[0])
+        inkling_append_tool_declarations(&out, tool_schemas);
+
+    bool effort_emitted = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *message = &msgs->v[i];
+        if (role_is_system(message->role)) {
+            inkling_append_message(&out, "<|message_system|>", NULL,
+                                   message->content);
+            continue;
+        }
+        if (!effort_emitted) {
+            inkling_append_reasoning_effort(&out, think_mode);
+            effort_emitted = true;
+        }
+
+        if (!strcmp(message->role, "user")) {
+            if (message->tool_results_len)
+                inkling_append_user_with_tool_results(&out, msgs, message);
+            else
+                inkling_append_message(&out, "<|message_user|>", NULL,
+                                       message->content);
+        } else if (!strcmp(message->role, "tool") ||
+                   !strcmp(message->role, "function")) {
+            const char *id = message->tool_call_id;
+            if (!id && message->tool_call_ids_len > 0)
+                id = message->tool_call_ids[0];
+            inkling_append_tool_result(&out, msgs, message, message->name, id,
+                                       message->content);
+        } else if (!strcmp(message->role, "assistant")) {
+            const char *name = message->name;
+            if (message->reasoning && message->reasoning[0]) {
+                buf_puts(&out, "<|message_model|>");
+                if (name && name[0]) buf_puts(&out, name);
+                buf_puts(&out, "<|content_thinking|>");
+                buf_puts(&out, message->reasoning);
+                buf_puts(&out, "<|end_message|>");
+            }
+            const bool has_content = message->content && message->content[0];
+            if (has_content || (!message->calls.len &&
+                                !(message->reasoning && message->reasoning[0])))
+                inkling_append_message(&out, "<|message_model|>", name,
+                                       message->content);
+            append_inkling_tool_calls_text(&out, &message->calls);
+            buf_puts(&out, "<|content_model_end_sampling|>");
+        }
+    }
+    if (!effort_emitted) inkling_append_reasoning_effort(&out, think_mode);
+    buf_puts(&out, "<|message_model|>");
+    return buf_take(&out);
+}
+
+static char *render_inkling_live_tool_tail(const chat_msgs *msgs, int start) {
+    buf out = {0};
+    buf_puts(&out, "<|content_model_end_sampling|>");
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *message = &msgs->v[i];
+        if (!strcmp(message->role, "tool") ||
+            !strcmp(message->role, "function")) {
+            const char *id = message->tool_call_id;
+            if (!id && message->tool_call_ids_len > 0)
+                id = message->tool_call_ids[0];
+            inkling_append_tool_result(&out, msgs, message, message->name, id,
+                                       message->content);
+        } else if (!strcmp(message->role, "user") &&
+                   message->tool_results_len) {
+            inkling_append_user_with_tool_results(&out, msgs, message);
+        } else if (!strcmp(message->role, "user")) {
+            inkling_append_message(&out, "<|message_user|>", NULL,
+                                   message->content);
+        }
+    }
+    buf_puts(&out, "<|message_model|>");
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3651,6 +4193,8 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING)
+        return render_inkling_chat_prompt_text(msgs, tool_schemas, think_mode);
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
 }
@@ -3880,6 +4424,8 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING)
+        return render_inkling_live_tool_tail(msgs, start);
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
 
@@ -3995,8 +4541,10 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
 static void responses_prepare_live_continuation(server *s, request *r,
-                                                const chat_msgs *msgs) {
+                                                chat_msgs *msgs) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING)
+        inkling_enrich_tool_names(s, API_RESPONSES, msgs);
 
     int tail_start = msgs->len;
     while (tail_start > 0) {
@@ -4096,8 +4644,10 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
 static void anthropic_prepare_live_continuation(server *s, request *r,
-                                                const chat_msgs *msgs) {
+                                                chat_msgs *msgs) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING)
+        inkling_enrich_tool_names(s, API_ANTHROPIC, msgs);
 
     int tail_end = msgs->len;
     while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
@@ -4723,7 +5273,7 @@ static bool parse_responses_content_array_multimodal(
 }
 
 /* Codex /v1/responses input items have a `type` discriminator (message,
- * function_call, function_call_output, reasoning, custom_tool_call,
+ * additional_tools, function_call, function_call_output, reasoning, custom_tool_call,
  * custom_tool_call_output, ...). We collapse them into chat_msgs the same way
  * the chat completion / Anthropic parsers do, so the rest of the engine sees a
  * single conversation history shape.
@@ -5006,7 +5556,8 @@ item_fail:
             !strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
             !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call");
         bool is_bookkeeping =
-            !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
+            !strcmp(t, "compaction") || !strcmp(t, "context_compaction") ||
+            !strcmp(t, "additional_tools");
         if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
             chat_msg flush_msg = {0};
             flush_msg.role = xstrdup("assistant");
@@ -5028,20 +5579,16 @@ item_fail:
         } else if (!strcmp(t, "function_call") || !strcmp(t, "custom_tool_call")) {
             tool_call tc = {0};
             tc.id = xstrdup(call_id ? call_id : item_id ? item_id : "");
-            /* function_call uses `arguments` (JSON string); custom_tool_call uses
-             * `input` (free text). Treat both as the same on-wire argument blob —
-             * append_dsml_arguments_from_json will fall back to a single text param
-             * if the value isn't a JSON object. */
-            const char *args_src = arguments ? arguments :
-                                   input_str ? input_str : "{}";
-            tc.arguments = xstrdup(args_src);
-            if (strcmp(t, "custom_tool_call") && namespace && namespace[0] &&
-                name && name[0])
-            {
-                buf qualified = {0};
-                buf_puts(&qualified, namespace);
-                buf_puts(&qualified, name);
-                tc.name = buf_take(&qualified);
+            /* function_call carries JSON `arguments`; custom_tool_call carries
+             * free-text `input`. Wrap the latter in the declared string field so
+             * the model prompt can replay it through the same tool schema. */
+            const char *args_src = !strcmp(t, "custom_tool_call")
+                ? (input_str ? input_str : "")
+                : (arguments ? arguments : input_str ? input_str : "{}");
+            tc.arguments = !strcmp(t, "custom_tool_call")
+                ? responses_custom_input_arguments(args_src) : xstrdup(args_src);
+            if (namespace && namespace[0] && name && name[0]) {
+                tc.name = responses_flatten_namespace_tool_name(namespace, name);
             } else {
                 tc.name = xstrdup(name ? name : "");
             }
@@ -5086,6 +5633,29 @@ item_fail:
             if (content && content[0]) {
                 if (pending_reasoning.len) buf_putc(&pending_reasoning, '\n');
                 buf_puts(&pending_reasoning, content);
+            }
+        } else if (!strcmp(t, "additional_tools")) {
+            if (!responses_append_tool_schemas(loaded_tool_schemas, orders,
+                                               tools_json)) {
+                free(type);
+                free(role);
+                free(content);
+                free(name);
+                free(namespace);
+                free(call_id);
+                free(item_id);
+                free(arguments);
+                free(output);
+                free(input_str);
+                free(summary);
+                free(action);
+                free(result);
+                free(tools_json);
+                free(status_str);
+                server_image_inputs_free(&content_images);
+                server_image_inputs_free(&output_images);
+                buf_free(&pending_reasoning);
+                return false;
             }
         } else if (!strcmp(t, "local_shell_call") || !strcmp(t, "web_search_call") ||
                    !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call"))
@@ -5310,6 +5880,20 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
     return true;
 }
 
+static bool responses_input_has_prior_context(const chat_msgs *msgs) {
+    int conversation_messages = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *message = &msgs->v[i];
+        if (!strcmp(message->role, "tool") ||
+            !strcmp(message->role, "function") ||
+            message->tool_results_len > 0 ||
+            (!strcmp(message->role, "assistant") && message->calls.len > 0))
+            return true;
+        if (!role_is_system(message->role)) conversation_messages++;
+    }
+    return conversation_messages >= 2;
+}
+
 static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -5318,6 +5902,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
+    bool has_external_conversation_id = false;
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
@@ -5468,28 +6053,13 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         } else if (!strcmp(key, "previous_response_id") ||
                    !strcmp(key, "conversation"))
         {
-            /* Official Responses state can be durable:
-             *   previous_response_id chains to a stored prior response, and
-             *   conversation points at a persistent Conversations object.
-             *
-             * DS4 does not yet implement that durable store.  The supported
-             * modes are either (a) a live in-memory continuation checked by
-             * visible transcript / tool call ids, or (b) stateless replay of
-             * the full input items.  Accepting a non-null durable reference
-             * without loading the referenced items would silently truncate the
-             * prompt, so reject it explicitly. */
             json_ws(&p);
             if (!json_lit(&p, "null")) {
-                snprintf(err, errlen,
-                         "%s is not supported; replay full input instead",
-                         key);
-                free(key);
-                chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
-                free(instructions);
-                free(tool_schemas);
-                request_free(r);
-                return false;
+                if (!json_skip_value(&p)) {
+                    free(key);
+                    goto bad;
+                }
+                has_external_conversation_id = true;
             }
         } else if (!json_skip_value(&p)) {
             free(key);
@@ -5503,6 +6073,21 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (*p != '}') goto bad;
     if (!got_input) {
         snprintf(err, errlen, "missing input");
+        chat_msgs_free(&msgs);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    /* DS4 does not persist Responses objects across requests or restarts.
+     * Accept the external ID only when this request also carries replayable
+     * history or a tool result whose call_id can bind it to a live checkpoint.
+     * A lone user message would silently drop the referenced conversation. */
+    if (has_external_conversation_id &&
+        !responses_input_has_prior_context(&msgs)) {
+        snprintf(err, errlen,
+                 "previous_response_id requires replayed history or a live tool output");
         chat_msgs_free(&msgs);
         buf_free(&loaded_tool_schemas);
         free(instructions);
@@ -5867,6 +6452,7 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 #define DS4_PARAM_END_SHORT "</" DS4_DSML_SHORT "parameter>"
 
 static const char *find_any_tool_start(const char *s) {
+    if (!s) return NULL;
     const char *best = NULL;
     const char *candidates[] = {
         strstr(s, DS41_TOOL_CALLS_START),
@@ -5882,6 +6468,7 @@ static const char *find_any_tool_start(const char *s) {
 }
 
 static const char *find_any_tool_end(const char *s) {
+    if (!s) return NULL;
     const char *best = NULL;
     const char *candidates[] = {
         strstr(s, DS41_TOOL_CALLS_END),
@@ -5894,6 +6481,21 @@ static const char *find_any_tool_end(const char *s) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
     }
     return best;
+}
+
+static const char *find_tool_start_for_syntax(server_model_syntax syntax,
+                                               const char *s) {
+    if (syntax != SERVER_MODEL_SYNTAX_INKLING) return find_any_tool_start(s);
+    if (!s) return NULL;
+    const char *message = strstr(s, "<|message_model|>");
+    const char *invoke = strstr(s, "<|content_invoke_tool_json|>");
+    return !message ? invoke : !invoke ? message : message < invoke ? message : invoke;
+}
+
+static const char *find_tool_end_for_syntax(server_model_syntax syntax,
+                                             const char *s) {
+    if (syntax != SERVER_MODEL_SYNTAX_INKLING) return find_any_tool_end(s);
+    return s ? strstr(s, "<|end_message|>") : NULL;
 }
 
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
@@ -6698,6 +7300,176 @@ static bool parse_qwen_generated_message_ex(const char *text,
     return true;
 }
 
+static bool inkling_append_json_block(buf *out, const char **cursor,
+                                      const char *end_marker) {
+    const char *end = strstr(*cursor, end_marker);
+    if (!end) return false;
+    buf_append(out, *cursor, (size_t)(end - *cursor));
+    *cursor = end + strlen(end_marker);
+    return true;
+}
+
+static bool inkling_parse_generated_tool_call(const char **cursor,
+                                              tool_calls *calls,
+                                              const char **raw_end) {
+    static const char message_role[] = "<|message_model|>";
+    static const char invoke[] = "<|content_invoke_tool_json|>";
+    static const char end_message[] = "<|end_message|>";
+    const char *header = *cursor + sizeof(message_role) - 1;
+    const char *invoke_at = strstr(header, invoke);
+    if (!invoke_at) return false;
+
+    const char *name_start = header;
+    const char *name_end = invoke_at;
+    trim_const_span(&name_start, &name_end);
+    if (name_end <= name_start) return false;
+    char *header_name = xstrndup(name_start, (size_t)(name_end - name_start));
+
+    const char *p = invoke_at + sizeof(invoke) - 1;
+    char *raw = NULL;
+    if (!json_raw_value(&p, &raw)) {
+        free(header_name);
+        return false;
+    }
+    json_ws(&p);
+    if (strncmp(p, end_message, sizeof(end_message) - 1)) {
+        free(header_name);
+        free(raw);
+        return false;
+    }
+    const char *call_end = p + sizeof(end_message) - 1;
+
+    json_args fields = {0};
+    if (!json_args_parse(raw, &fields)) {
+        free(header_name);
+        free(raw);
+        return false;
+    }
+    const json_arg *name = inkling_find_schema_field(&fields, "name");
+    const json_arg *args = inkling_find_schema_field(&fields, "args");
+    json_args parsed_args = {0};
+    bool args_valid = args && !args->is_string &&
+        args->value[0] == '{' && json_args_parse(args->value, &parsed_args);
+    if (args_valid) {
+        const char *args_end = args->value;
+        args_valid = json_skip_value(&args_end);
+        json_ws(&args_end);
+        args_valid = args_valid && *args_end == '\0';
+    }
+    if (!name || !name->is_string || strcmp(header_name, name->value) ||
+        !args_valid)
+    {
+        json_args_free(&parsed_args);
+        json_args_free(&fields);
+        free(header_name);
+        free(raw);
+        return false;
+    }
+
+    tool_call call = {0};
+    call.name = xstrdup(name->value);
+    call.arguments = xstrdup(args->value);
+    tool_calls_push(calls, call);
+    *cursor = call_end;
+    *raw_end = call_end;
+    json_args_free(&parsed_args);
+    json_args_free(&fields);
+    free(header_name);
+    free(raw);
+    return true;
+}
+
+static bool parse_inkling_generated_message_ex(const char *text,
+                                               char **content_out,
+                                               char **reasoning_out,
+                                               tool_calls *calls) {
+    static const char thinking[] = "<|content_thinking|>";
+    static const char content[] = "<|content_text|>";
+    static const char message_role[] = "<|message_model|>";
+    static const char invoke[] = "<|content_invoke_tool_json|>";
+    static const char end_message[] = "<|end_message|>";
+    static const char end_sampling[] = "<|content_model_end_sampling|>";
+
+    buf answer = {0}, reasoning = {0};
+    const char *p = text ? text : "";
+    const char *raw_start = NULL;
+    const char *raw_end = NULL;
+    while (*p) {
+        const char *next = NULL;
+        int kind = 0;
+        const char *candidate = strstr(p, thinking);
+        if (candidate) { next = candidate; kind = 1; }
+        candidate = strstr(p, content);
+        if (candidate && (!next || candidate < next)) { next = candidate; kind = 2; }
+        candidate = strstr(p, message_role);
+        if (candidate && (!next || candidate < next)) { next = candidate; kind = 3; }
+        candidate = strstr(p, end_sampling);
+        if (candidate && (!next || candidate < next)) { next = candidate; kind = 4; }
+
+        if (!next) {
+            buf_puts(&answer, p);
+            break;
+        }
+        if (next > p) buf_append(&answer, p, (size_t)(next - p));
+        if (kind == 1 || kind == 2) {
+            const char *body = next + (kind == 1 ? sizeof(thinking) - 1 : sizeof(content) - 1);
+            buf *dst = kind == 1 ? &reasoning : &answer;
+            p = body;
+            if (!inkling_append_json_block(dst, &p, end_message)) {
+                buf_puts(dst, p);
+                break;
+            }
+        } else if (kind == 3) {
+            const char *body = next + sizeof(message_role) - 1;
+            const char *invoke_at = strstr(body, invoke);
+            const char *thinking_at = strstr(body, thinking);
+            const char *content_at = strstr(body, content);
+            const char *marker = NULL;
+            int block_kind = 0;
+            if (invoke_at) { marker = invoke_at; block_kind = 3; }
+            if (thinking_at && (!marker || thinking_at < marker)) {
+                marker = thinking_at;
+                block_kind = 1;
+            }
+            if (content_at && (!marker || content_at < marker)) {
+                marker = content_at;
+                block_kind = 2;
+            }
+            if (!marker) goto bad;
+            if (block_kind == 3) {
+                p = next;
+                if (!inkling_parse_generated_tool_call(&p, calls, &raw_end)) goto bad;
+                if (!raw_start) raw_start = next;
+            } else {
+                p = marker + (block_kind == 1 ?
+                    sizeof(thinking) - 1 : sizeof(content) - 1);
+                buf *dst = block_kind == 1 ? &reasoning : &answer;
+                if (!inkling_append_json_block(dst, &p, end_message)) {
+                    buf_puts(dst, p);
+                    break;
+                }
+            }
+        } else {
+            p = next + sizeof(end_sampling) - 1;
+        }
+    }
+
+    if (raw_start && raw_end) {
+        free(calls->raw_tool_text);
+        calls->raw_tool_text = xstrndup(raw_start, (size_t)(raw_end - raw_start));
+    }
+    *content_out = buf_take(&answer);
+    *reasoning_out = reasoning.len ? buf_take(&reasoning) : NULL;
+    buf_free(&reasoning);
+    return true;
+
+bad:
+    buf_free(&answer);
+    buf_free(&reasoning);
+    tool_calls_free(calls);
+    return false;
+}
+
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
                                                   bool require_thinking_closed,
@@ -6713,6 +7485,9 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out, calls, NULL);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING)
+        return parse_inkling_generated_message_ex(text, content_out,
+                                                  reasoning_out, calls);
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
                                                calls);
@@ -6836,6 +7611,18 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                            reasoning_out,
                                                            calls);
     if (parsed_ok) return true;
+
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING &&
+        has_tools && saw_tool_start) {
+        free(*content_out);
+        free(*reasoning_out);
+        *content_out = NULL;
+        *reasoning_out = NULL;
+        tool_calls_free(calls);
+        if (finish_io) *finish_io = "error";
+        if (err && errlen) snprintf(err, errlen, "invalid Inkling tool call");
+        return false;
+    }
 
     free(*content_out);
     free(*reasoning_out);
@@ -7421,6 +8208,11 @@ static const dsml_syntax qwen_tool_syntax = {
     "<function=", "</function>", "<parameter=", "</parameter>",
 };
 
+static const dsml_syntax inkling_tool_syntax = {
+    "<|content_invoke_tool_json|>", "<|end_message|>",
+    "<|content_invoke_tool_json|>", "", "", "<|end_message|>",
+};
+
 typedef struct {
     dsml_track_mode mode;
     dsml_decode_state decode;
@@ -7437,6 +8229,8 @@ static size_t dsml_max_tool_start_len(void) {
         size_t n = strlen(dsml_syntaxes[i].tool_calls_start);
         if (n > max) max = n;
     }
+    const size_t inkling_len = strlen(inkling_tool_syntax.tool_calls_start);
+    if (inkling_len > max) max = inkling_len;
     return max;
 }
 
@@ -7628,7 +8422,22 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             size_t pos = 0;
             const dsml_syntax *syn = NULL;
             bool found;
-            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+                syn = &inkling_tool_syntax;
+                const char *start = find_lit_bounded(raw + dt->pos,
+                    raw_len - dt->pos, syn->tool_calls_start);
+                found = start != NULL;
+                if (found) {
+                    dt->pos = (size_t)(start - raw) +
+                              strlen(syn->tool_calls_start);
+                    dt->syn = syn;
+                    dt->mode = DSML_TRACK_JSON_PARAM;
+                    dt->json_in_string = false;
+                    dt->json_escaped = false;
+                    dt->decode = DSML_DECODE_JSON_STRUCTURAL;
+                    continue;
+                }
+            } else if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
                 dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
                 syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
                     &qwen_tool_syntax : &glm_tool_syntax;
@@ -7678,12 +8487,22 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             while (dt->pos < raw_len) {
                 if (!dt->json_in_string) {
                     if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                        if (dt->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+                            dt->pos += strlen(dt->syn->param_end);
+                            dt->mode = DSML_TRACK_DONE;
+                            dt->decode = DSML_DECODE_OUTSIDE;
+                            return;
+                        }
                         dt->pos += strlen(dt->syn->param_end);
                         dt->mode = DSML_TRACK_STRUCTURAL;
                         dt->decode = DSML_DECODE_STRUCTURAL;
                         goto structural;
                     }
                     if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                        if (dt->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+                            dt->decode = DSML_DECODE_STRUCTURAL;
+                            return;
+                        }
                         dt->decode = raw_len - dt->pos >= 2 ?
                             DSML_DECODE_STRUCTURAL : DSML_DECODE_JSON_STRUCTURAL;
                         return;
@@ -7785,7 +8604,8 @@ static void observe_tool_markers(const dsml_decode_tracker *tracker,
                                  bool *saw_end, bool *orphan_end) {
     if (tracker->syn) *saw_start = true;
     if (tracker->mode == DSML_TRACK_DONE) *saw_end = true;
-    else if (!*saw_start && scan && find_any_tool_end(scan) && orphan_end)
+    else if (!*saw_start && scan &&
+             find_tool_end_for_syntax(tracker->model_syntax, scan) && orphan_end)
         *orphan_end = true;
 }
 
@@ -8045,6 +8865,33 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                                      const char *raw, size_t raw_len,
                                      bool final) {
     if (!st->active || !raw) return true;
+
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        if (!final) return true;
+        char *content = NULL, *reasoning = NULL;
+        tool_calls parsed_calls = {0};
+        bool parsed = parse_inkling_generated_message_ex(
+            raw, &content, &reasoning, &parsed_calls);
+        bool ok = true;
+        if (parsed) {
+            if (reasoning && reasoning[0]) {
+                ok = sse_chat_delta_n(fd, r, id, "reasoning_content",
+                                      reasoning, strlen(reasoning));
+                if (ok) st->sent_reasoning = true;
+            }
+            if (ok && content && content[0]) {
+                ok = sse_chat_delta_n(fd, r, id, "content",
+                                      content, strlen(content));
+                if (ok) st->sent_content = true;
+            }
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&parsed_calls);
+        st->emit_pos = raw_len;
+        st->mode = OPENAI_STREAM_SUPPRESS;
+        return ok;
+    }
 
     if (st->mode == OPENAI_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
@@ -8523,15 +9370,26 @@ static bool responses_tool_call_is_tool_search(const tool_call *tc,
            (!order || order->responses_tool_search);
 }
 
-/* The internal tool_call doesn't track whether it came from a function_call or
- * a custom_tool_call (or what tool kind is registered). For round-trip
- * correctness with the rare custom_tool_call clients, we preserve any provided
- * call_id verbatim and pre-assign a stable fc_id; the discriminator currently
- * defaults to function_call because Codex CLI registers all its tools as
- * function tools. */
+static char *responses_custom_tool_input(const char *arguments_json) {
+    json_args arguments = {0};
+    char *input = xstrdup("");
+    if (json_args_parse(arguments_json ? arguments_json : "{}", &arguments)) {
+        const json_arg *field = inkling_find_schema_field(&arguments, "input");
+        if (field && field->is_string) {
+            free(input);
+            input = xstrdup(field->value);
+        }
+    }
+    json_args_free(&arguments);
+    return input;
+}
+
+/* The internal tool_call keeps the function arguments. The registered schema
+ * restores the Responses item kind, namespace, and client-facing name here. */
 static void responses_tool_items_build(responses_tool_item **out,
                                        const tool_calls *calls,
-                                       int starting_output_index) {
+                                       int starting_output_index,
+                                       const tool_schema_orders *orders) {
     *out = NULL;
     if (!calls || calls->len == 0) return;
     responses_tool_item *items = xmalloc((size_t)calls->len * sizeof(*items));
@@ -8543,7 +9401,9 @@ static void responses_tool_items_build(responses_tool_item **out,
         } else {
             responses_random_id(items[i].call_id, sizeof(items[i].call_id), "call_");
         }
-        items[i].is_custom = false;
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, calls->v[i].name);
+        items[i].is_custom = order && order->responses_custom_tool;
         items[i].output_index = starting_output_index + i;
     }
     *out = items;
@@ -8583,7 +9443,9 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
     if (!with_args) {
         buf_puts(b, "\"\"");
     } else if (item->is_custom) {
-        json_escape(b, tc->arguments ? tc->arguments : "");
+        char *input = responses_custom_tool_input(tc->arguments);
+        json_escape(b, input);
+        free(input);
     } else {
         append_json_object_string(b, tc->arguments);
     }
@@ -8598,9 +9460,8 @@ static bool responses_sse_function_call_event(int fd, responses_stream *st,
                                               bool done) {
     /* The added event marks a tool call as in_progress per the Responses
      * lifecycle; only output_item.done (and the terminal response output)
-     * carry the final completed / incomplete status. The added item ships with
-     * an empty arguments string so clients that accumulate via
-     * function_call_arguments.delta + .done don't end up with doubled JSON. */
+     * carry the final completed / incomplete status. It ships with an empty
+     * arguments/input string so the following delta events are not duplicated. */
     const char *item_status = done ? responses_item_status_for_finish(finish) : "in_progress";
     buf b = {0};
     buf_printf(&b,
@@ -8622,7 +9483,33 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
                                                        const responses_tool_item *item,
                                                        const tool_schema_orders *orders) {
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
-    if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
+    if (item->is_custom) {
+        char *input = responses_custom_tool_input(tc->arguments);
+        buf b = {0};
+        buf_printf(&b,
+            "{\"type\":\"response.custom_tool_call_input.delta\","
+            "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":",
+            item->fc_id, item->output_index);
+        json_escape(&b, input);
+        buf_putc(&b, '}');
+        bool ok = responses_sse_emit_event(fd, st, b.ptr);
+        buf_free(&b);
+        if (!ok) {
+            free(input);
+            return false;
+        }
+        buf_printf(&b,
+            "{\"type\":\"response.custom_tool_call_input.done\","
+            "\"item_id\":\"%s\",\"output_index\":%d,\"input\":",
+            item->fc_id, item->output_index);
+        json_escape(&b, input);
+        buf_putc(&b, '}');
+        ok = responses_sse_emit_event(fd, st, b.ptr);
+        buf_free(&b);
+        free(input);
+        return ok;
+    }
+    if (responses_tool_call_is_tool_search(tc, order)) return true;
     buf args = {0};
     append_json_object_string(&args, tc->arguments);
     buf b = {0};
@@ -8764,6 +9651,50 @@ static bool responses_sse_stream_update(int fd, const request *r,
                                         const char *raw, size_t raw_len,
                                         bool final) {
     if (!st->active || !raw) return true;
+
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        if (!final) return true;
+        char *content = NULL, *reasoning = NULL;
+        tool_calls parsed_calls = {0};
+        bool parsed = parse_inkling_generated_message_ex(
+            raw, &content, &reasoning, &parsed_calls);
+        bool ok = true;
+        if (parsed) {
+            if (r->reasoning_summary_emit && reasoning && reasoning[0]) {
+                st->reasoning_index = st->next_output_index++;
+                ok = responses_sse_reasoning_added(fd, st);
+                if (ok) st->reasoning_item_opened = true;
+                if (ok) ok = responses_sse_reasoning_summary_part_added(fd, st);
+                if (ok) st->reasoning_summary_started = true;
+                if (ok) ok = responses_sse_reasoning_delta(
+                    fd, st, reasoning, strlen(reasoning));
+                if (ok) {
+                    buf_append(&st->reasoning_text, reasoning, strlen(reasoning));
+                    st->reasoning_emitted_any = true;
+                    st->reasoning_closed_naturally = true;
+                }
+            }
+            if (ok && content && content[0]) {
+                st->message_index = st->next_output_index++;
+                ok = responses_sse_message_added(fd, st);
+                if (ok) st->message_item_opened = true;
+                if (ok) ok = responses_sse_message_text_part_added(fd, st);
+                if (ok) st->message_text_part_open = true;
+                if (ok) ok = responses_sse_output_text_delta(
+                    fd, st, content, strlen(content));
+                if (ok) {
+                    buf_append(&st->message_text, content, strlen(content));
+                    st->message_emitted_any = true;
+                }
+            }
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&parsed_calls);
+        st->emit_pos = raw_len;
+        st->mode = RESP_STREAM_SUPPRESS;
+        return ok;
+    }
 
     /* The client only sees reasoning if it explicitly opted in via
      * reasoning.summary. Otherwise we still need to walk past <think>...</think>
@@ -8931,7 +9862,8 @@ static bool responses_sse_finish_live(int fd, const request *r,
         st->message_item_closed = true;
     }
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, st->next_output_index);
+    responses_tool_items_build(&items, calls, st->next_output_index,
+                               &r->tool_orders);
     if (items && calls) st->next_output_index += calls->len;
     bool ok = true;
     if (items && calls) {
@@ -8963,7 +9895,7 @@ static bool responses_final_response(int fd, bool enable_cors,
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
     responses_tool_item *items = NULL;
-    responses_tool_items_build(&items, calls, 0);
+    responses_tool_items_build(&items, calls, 0, &r->tool_orders);
 
     long now = (long)time(NULL);
     const char *status = responses_status_for_finish(finish);
@@ -9673,6 +10605,40 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                                         bool final) {
     if (!st->active || !raw) return true;
 
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        if (!final) return true;
+        char *content = NULL, *reasoning = NULL;
+        tool_calls parsed_calls = {0};
+        bool parsed = parse_inkling_generated_message_ex(
+            raw, &content, &reasoning, &parsed_calls);
+        bool ok = true;
+        if (parsed && ds4_think_mode_enabled(r->think_mode) &&
+            reasoning && reasoning[0]) {
+            ok = anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING);
+            if (ok) ok = anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
+                                                  reasoning, strlen(reasoning));
+            if (ok) {
+                st->sent_thinking = true;
+                ok = anthropic_sse_close_block_live(fd, id, st);
+            }
+        }
+        if (parsed && ok && content && content[0]) {
+            ok = anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT);
+            if (ok) ok = anthropic_sse_delta_live(fd, st, ANTH_BLOCK_TEXT,
+                                                  content, strlen(content));
+            if (ok) {
+                st->sent_text = true;
+                ok = anthropic_sse_close_block_live(fd, id, st);
+            }
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&parsed_calls);
+        st->emit_pos = raw_len;
+        st->mode = ANTH_STREAM_SUPPRESS;
+        return ok;
+    }
+
     if (st->mode == ANTH_STREAM_THINKING) {
         if (!st->checked_think_prefix) {
             const char *open = "<think>";
@@ -10017,7 +10983,12 @@ typedef struct {
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
     stop_list call_ids;
+    char **call_names;
+    int call_names_len;
 } live_tool_state;
+
+static const char *live_tool_state_name(const live_tool_state *st,
+                                        const char *id);
 
 typedef struct {
     bool valid;
@@ -10205,6 +11176,47 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static char *inkling_live_tool_name_copy(server *s, api_style api,
+                                         const char *id) {
+    if (!s || !s->slots || !id || !id[0]) return NULL;
+    char *name = NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < s->slot_count && !name; i++) {
+        const live_tool_state *state = api == API_ANTHROPIC ?
+            &s->slots[i].anthropic_live : &s->slots[i].responses_live;
+        const char *found = live_tool_state_name(state, id);
+        if (found && found[0]) name = xstrdup(found);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return name;
+}
+
+static void inkling_enrich_tool_names(server *s, api_style api,
+                                      chat_msgs *msgs) {
+    if (!msgs) return;
+    for (int i = 0; i < msgs->len; i++) {
+        chat_msg *message = &msgs->v[i];
+        if (!strcmp(message->role, "tool") ||
+            !strcmp(message->role, "function")) {
+            const char *id = message->tool_call_id;
+            if (!id && message->tool_call_ids_len > 0)
+                id = message->tool_call_ids[0];
+            if (!message->name || !message->name[0]) {
+                const char *history_name = inkling_tool_name_for_id(msgs, id);
+                message->name = history_name && history_name[0] ?
+                    xstrdup(history_name) : inkling_live_tool_name_copy(s, api, id);
+            }
+        }
+        for (int j = 0; j < message->tool_results_len; j++) {
+            tool_result_span *span = &message->tool_results[j];
+            if (span->name && span->name[0]) continue;
+            const char *history_name = inkling_tool_name_for_id(msgs, span->id);
+            span->name = history_name && history_name[0] ?
+                xstrdup(history_name) : inkling_live_tool_name_copy(s, api, span->id);
+        }
+    }
+}
 
 static void server_inference_lock(server *s) {
     pthread_mutex_lock(&s->inference_mu);
@@ -10474,12 +11486,55 @@ static void tool_memory_free(tool_memory *m) {
 static void live_tool_state_clear_locked(live_tool_state *st) {
     if (!st) return;
     stop_list_clear(&st->call_ids);
+    for (int i = 0; i < st->call_names_len; i++) free(st->call_names[i]);
+    free(st->call_names);
+    st->call_names = NULL;
+    st->call_names_len = 0;
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
     memset(&st->images, 0, sizeof(st->images));
     st->valid = false;
     st->live_tokens = 0;
+}
+
+static void live_tool_state_remember_calls_locked(live_tool_state *st,
+                                                  const tool_calls *calls) {
+    for (int i = 0; st && calls && i < calls->len; i++) {
+        const tool_call *call = &calls->v[i];
+        if (!call->id || !call->id[0]) continue;
+        int index = -1;
+        for (int j = 0; j < st->call_ids.len; j++) {
+            if (!strcmp(st->call_ids.v[j], call->id)) {
+                index = j;
+                break;
+            }
+        }
+        if (index < 0) {
+            id_list_push_unique(&st->call_ids, call->id);
+            index = st->call_ids.len - 1;
+        }
+        if (st->call_names_len < st->call_ids.len) {
+            int old_len = st->call_names_len;
+            st->call_names = xrealloc(st->call_names,
+                (size_t)st->call_ids.len * sizeof(st->call_names[0]));
+            for (int j = old_len; j < st->call_ids.len; j++)
+                st->call_names[j] = NULL;
+            st->call_names_len = st->call_ids.len;
+        }
+        if (!st->call_names[index] && call->name && call->name[0])
+            st->call_names[index] = xstrdup(call->name);
+    }
+}
+
+static const char *live_tool_state_name(const live_tool_state *st,
+                                        const char *id) {
+    if (!st || !id || !id[0]) return NULL;
+    for (int i = 0; i < st->call_ids.len; i++) {
+        if (!strcmp(st->call_ids.v[i], id))
+            return i < st->call_names_len ? st->call_names[i] : NULL;
+    }
+    return NULL;
 }
 
 static void live_tool_state_free(live_tool_state *st) {
@@ -10539,11 +11594,7 @@ static void responses_live_remember(server *s, server_slot *slot,
     slot->responses_live.visible_text = key;
     slot->responses_live.visible_len = key ? strlen(key) : 0;
     slot->responses_live.images = images;
-    if (calls) {
-        for (int i = 0; i < calls->len; i++) {
-            id_list_push_unique(&slot->responses_live.call_ids, calls->v[i].id);
-        }
-    }
+    live_tool_state_remember_calls_locked(&slot->responses_live, calls);
     slot->responses_live.live_tokens = ds4_session_pos(slot->session);
     slot->responses_live.valid = key != NULL;
     pthread_mutex_unlock(&s->tool_mu);
@@ -10554,9 +11605,7 @@ static void anthropic_live_remember(server *s, server_slot *slot,
     if (!s || !slot || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->anthropic_live);
-    for (int i = 0; i < calls->len; i++) {
-        id_list_push_unique(&slot->anthropic_live.call_ids, calls->v[i].id);
-    }
+    live_tool_state_remember_calls_locked(&slot->anthropic_live, calls);
     slot->anthropic_live.live_tokens = ds4_session_pos(slot->session);
     slot->anthropic_live.valid = slot->anthropic_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
@@ -12242,14 +13291,14 @@ static bool complete_tool_call_inside_thinking(server_model_syntax syntax,
                                                size_t *scan_from) {
     if (!text || !scan_from) return false;
     if (*scan_from > len) *scan_from = len;
-    const char *start = find_any_tool_start(text + *scan_from);
+    const char *start = find_tool_start_for_syntax(syntax, text + *scan_from);
     if (!start) {
         const size_t hold = 80;
         *scan_from = len > hold ? len - hold : 0;
         return false;
     }
     *scan_from = (size_t)(start - text);
-    if (!find_any_tool_end(start)) return false;
+    if (!find_tool_end_for_syntax(syntax, start)) return false;
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
     bool complete = parse_generated_message_ex_for_syntax(syntax, start, false,
@@ -12827,6 +13876,32 @@ static char *build_qwen_assistant_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+static char *build_inkling_assistant_suffix(const char *content,
+                                            const char *reasoning,
+                                            bool include_reasoning,
+                                            const tool_calls *calls) {
+    buf suffix = {0};
+    const bool has_reasoning = include_reasoning && reasoning && reasoning[0];
+    const bool has_content = content && content[0];
+    bool wrote_block = false;
+    if (has_reasoning) {
+        buf_puts(&suffix, "<|content_thinking|>");
+        buf_puts(&suffix, reasoning);
+        buf_puts(&suffix, "<|end_message|>");
+        wrote_block = true;
+    }
+    if (has_content || (!has_reasoning && (!calls || calls->len == 0))) {
+        if (wrote_block) buf_puts(&suffix, "<|message_model|>");
+        buf_puts(&suffix, "<|content_text|>");
+        buf_puts(&suffix, content ? content : "");
+        buf_puts(&suffix, "<|end_message|>");
+    }
+    append_inkling_tool_calls_text(&suffix, calls);
+    buf_puts(&suffix, "<|content_model_end_sampling|>");
+    buf_puts(&suffix, "<|message_model|>");
+    return buf_take(&suffix);
+}
+
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     const server_model_syntax syntax =
@@ -12834,6 +13909,8 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_qwen_assistant_suffix(r, content, reasoning, true, calls);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING)
+        return build_inkling_assistant_suffix(content, reasoning, true, calls);
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
@@ -12858,6 +13935,11 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         return build_qwen_assistant_suffix(r, content, reasoning,
                                            r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
     }
+    if (syntax == SERVER_MODEL_SYNTAX_INKLING)
+        return build_inkling_assistant_suffix(
+            content, reasoning,
+            r && r->reasoning_summary_emit && calls && calls->len > 0,
+            calls);
     buf suffix = {0};
     /* This suffix mirrors what a Responses client can replay, not necessarily
      * every token in KV.  Hidden reasoning stays live in the session unless the
@@ -12901,6 +13983,20 @@ static char *build_thinking_visible_text(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_INKLING) {
+        const char *generation = "<|message_model|>";
+        const size_t generation_len = strlen(generation);
+        if (pt_len < generation_len ||
+            memcmp(r->prompt_text + pt_len - generation_len,
+                   generation, generation_len) != 0) return NULL;
+        buf visible = {0};
+        buf_append(&visible, r->prompt_text, pt_len);
+        buf_puts(&visible, "<|content_text|>");
+        buf_puts(&visible, content ? content : "");
+        buf_puts(&visible,
+                 "<|end_message|><|content_model_end_sampling|><|message_model|>");
+        return buf_take(&visible);
+    }
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         /* the next request renders this turn as an empty think block plus the
          * trimmed content, closed by <|im_end|> */
@@ -14333,7 +15429,8 @@ decode_again:
          * budget, after a tool error and prompt reminder. */
         bool completed_truncation = false;
         buf repaired = {0};
-        if (try_repair_dsml(text.ptr, text.len, &repaired)) {
+        if (j->req.model_syntax != SERVER_MODEL_SYNTAX_INKLING &&
+            try_repair_dsml(text.ptr, text.len, &repaired)) {
             /* Parse repaired text to verify it produces valid tool calls */
             tool_calls test_calls = {0};
             char *test_content = NULL;
@@ -14361,7 +15458,8 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted && completion < max_tokens) {
+            if (j->req.model_syntax != SERVER_MODEL_SYNTAX_INKLING &&
+                !j->req.stream && !dsml_recovery_attempted && completion < max_tokens) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -14503,7 +15601,8 @@ decode_again:
             if (!parsed_ok) {
                 /* Print raw DSML snippet for debugging */
                 size_t dsml_snippet_len = 0;
-                const char *dsml_start = find_any_tool_start(text.ptr ? text.ptr : "");
+                const char *dsml_start = find_tool_start_for_syntax(
+                    j->req.model_syntax, text.ptr ? text.ptr : "");
                 if (dsml_start) {
                     dsml_snippet_len = text.len - (dsml_start - text.ptr);
                     if (dsml_snippet_len > 500) dsml_snippet_len = 500;
@@ -15181,7 +16280,8 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
+    if (ds4_engine_is_inkling2(s->engine) ||
+        ds4_engine_is_deepseek41(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
@@ -16194,6 +17294,19 @@ static void test_server_bind_slot(server *s, server_slot *slot) {
     s->slot_count = 1;
 }
 
+static void test_responses_previous_response_id_requires_input_context(void) {
+    request r = {0};
+    char err[160] = {0};
+    bool ok = parse_responses_request(NULL, NULL,
+        "{\"model\":\"inkling-2-mini\","
+        "\"previous_response_id\":\"resp_old\","
+        "\"input\":\"new turn without replay or tool output\"}",
+        16, 128, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "requires replayed history or a live tool output") != NULL);
+    if (ok) request_free(&r);
+}
+
 static void test_batched_prefill_round_robin(void) {
     server s = {0};
     server_slot slots[4] = {0};
@@ -17060,6 +18173,109 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
     tool_schema_orders_free(&orders);
 }
 
+static char *read_socket_text(int fd);
+
+static void test_responses_input_additional_tools_loads_namespaced_tools(void) {
+    const char *input_json =
+        "[{\"type\":\"additional_tools\",\"role\":\"developer\","
+        "\"tools\":[{\"type\":\"namespace\",\"name\":\"functions\","
+        "\"tools\":[{\"type\":\"custom\",\"name\":\"exec\","
+        "\"description\":\"Execute code.\","
+        "\"format\":{\"type\":\"grammar\",\"syntax\":\"lark\","
+        "\"definition\":\"start: SOURCE\\nSOURCE: /[\\\\s\\\\S]+/\"}},"
+        "{\"type\":\"function\",\"name\":\"wait\","
+        "\"description\":\"Wait briefly.\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"seconds\":{\"type\":\"number\"}},"
+        "\"required\":[\"seconds\"]}}]}]},"
+        "{\"type\":\"custom_tool_call\",\"call_id\":\"call_exec\","
+        "\"name\":\"exec\",\"namespace\":\"functions\","
+        "\"input\":\"text(r.output)\"},"
+        "{\"type\":\"custom_tool_call_output\","
+        "\"call_id\":\"call_exec\",\"output\":\"TOOL_OK\"}]";
+    const char *p = input_json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "functions.exec"));
+    TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "functions.wait"));
+    TEST_ASSERT(loaded.ptr && strstr(loaded.ptr, "start: SOURCE"));
+    const tool_schema_order *exec_order =
+        tool_schema_orders_find(&orders, "functions.exec");
+    TEST_ASSERT(exec_order != NULL);
+    TEST_ASSERT(exec_order && exec_order->responses_custom_tool);
+    TEST_ASSERT(exec_order && exec_order->namespace &&
+                !strcmp(exec_order->namespace, "functions"));
+    TEST_ASSERT(exec_order && exec_order->wire_name &&
+                !strcmp(exec_order->wire_name, "exec"));
+    TEST_ASSERT(tool_schema_orders_find(&orders, "functions.wait") != NULL);
+    TEST_ASSERT(msgs.len > 0 && msgs.v[0].calls.len == 1);
+    TEST_ASSERT(msgs.len > 0 && msgs.v[0].calls.v[0].name &&
+                !strcmp(msgs.v[0].calls.v[0].name, "functions.exec"));
+    TEST_ASSERT(msgs.len > 0 &&
+                !strcmp(msgs.v[0].calls.v[0].arguments,
+                        "{\"input\":\"text(r.output)\"}"));
+    TEST_ASSERT(msgs.len > 1 && !strcmp(msgs.v[1].role, "tool"));
+    TEST_ASSERT(msgs.len > 1 && !strcmp(msgs.v[1].content, "TOOL_OK"));
+
+    tool_calls calls = {0};
+    tool_call call = {0};
+    call.id = xstrdup("call_exec");
+    call.name = xstrdup("functions.exec");
+    call.arguments = xstrdup("{\"input\":\"text(r.output)\"}");
+    tool_calls_push(&calls, call);
+    responses_tool_item *items = NULL;
+    responses_tool_items_build(&items, &calls, 0, &orders);
+    TEST_ASSERT(items && items[0].is_custom);
+    buf response_item = {0};
+    if (items) responses_append_function_call_item(&response_item, &calls.v[0],
+                                                   &items[0], "completed", true,
+                                                   &orders);
+    TEST_ASSERT(response_item.ptr && strstr(response_item.ptr,
+                                             "\"type\":\"custom_tool_call\""));
+    TEST_ASSERT(response_item.ptr && strstr(response_item.ptr,
+                                             "\"input\":\"text(r.output)\""));
+    TEST_ASSERT(response_item.ptr && strstr(response_item.ptr,
+                                             "\"namespace\":\"functions\""));
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        responses_stream stream = {0};
+        bool ok = responses_sse_function_call_event(sv[0], &stream, &calls.v[0],
+                                                    &items[0], &orders,
+                                                    "tool_calls", false);
+        if (ok) ok = responses_sse_function_call_arguments_done(
+            sv[0], &stream, &calls.v[0], &items[0], &orders);
+        if (ok) ok = responses_sse_function_call_event(sv[0], &stream, &calls.v[0],
+                                                      &items[0], &orders,
+                                                      "tool_calls", true);
+        TEST_ASSERT(ok);
+        shutdown(sv[0], SHUT_WR);
+        char *events = read_socket_text(sv[1]);
+        TEST_ASSERT(events && strstr(events,
+            "response.custom_tool_call_input.delta"));
+        TEST_ASSERT(events && strstr(events,
+            "response.custom_tool_call_input.done"));
+        TEST_ASSERT(events && strstr(events,
+            "\"type\":\"custom_tool_call\""));
+        TEST_ASSERT(events && strstr(events,
+            "\"input\":\"text(r.output)\""));
+        free(events);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    buf_free(&response_item);
+    free(items);
+    tool_calls_free(&calls);
+
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
 static void test_responses_output_sends_tool_search_call_item(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -17518,6 +18734,169 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     free(out);
     tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_inkling_stream_emits_structured_tool_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_INKLING;
+    r.stream = true;
+    r.has_tools = true;
+    free(r.model);
+    r.model = xstrdup("inkling-2-mini");
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_inkling", NULL, NULL));
+    openai_stream st;
+    openai_stream_start(&r, &st);
+
+    const char *raw =
+        "<|content_thinking|>Check the forecast.<|end_message|>"
+        "<|content_text|>Sunny.<|end_message|>"
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"weather\",\"args\":{\"city\":\"Rome\"}}"
+        "<|end_message|>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_inkling",
+                                         &st, raw, strlen(raw), false));
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_inkling_generated_message_ex(raw, &content,
+                                                    &reasoning, &calls));
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_inkling",
+                                       &st, raw, strlen(raw), &calls,
+                                       "tool_calls", 8, 20));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"Check the forecast.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"Sunny.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"tool_calls\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"weather\"") != NULL);
+    TEST_ASSERT(strstr(out, "<|content_") == NULL);
+    TEST_ASSERT(strstr(out, "<|message_model|>") == NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"tool_calls\"") != NULL);
+    TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+
+    free(out);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static const char *inkling_stream_tool_output(void) {
+    return "<|content_thinking|>Check the forecast.<|end_message|>"
+           "<|content_text|>Sunny.<|end_message|>"
+           "<|message_model|>weather<|content_invoke_tool_json|>"
+           "{\"name\":\"weather\",\"args\":{\"city\":\"Rome\"}}"
+           "<|end_message|>";
+}
+
+static void test_responses_inkling_stream_emits_function_call(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.model_syntax = SERVER_MODEL_SYNTAX_INKLING;
+    r.stream = true;
+    r.has_tools = true;
+    r.reasoning_summary_emit = true;
+    free(r.model);
+    r.model = xstrdup("inkling-2-mini");
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    st.active = true;
+    TEST_ASSERT(responses_sse_created(sv[0], &r, &st, 1234));
+    const char *raw = inkling_stream_tool_output();
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st, raw,
+                                             strlen(raw), false));
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_inkling_generated_message_ex(raw, &content,
+                                                    &reasoning, &calls));
+    TEST_ASSERT(responses_sse_finish_live(sv[0], &r, &st, raw, strlen(raw),
+                                          NULL, &calls, "tool_calls", 8, 20,
+                                          1234));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "response.reasoning_summary_text.delta") != NULL);
+    TEST_ASSERT(strstr(out, "Check the forecast.") != NULL);
+    TEST_ASSERT(strstr(out, "response.output_text.delta") != NULL);
+    TEST_ASSERT(strstr(out, "Sunny.") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"function_call\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"weather\"") != NULL);
+    TEST_ASSERT(strstr(out, "<|content_") == NULL);
+    TEST_ASSERT(strstr(out, "<|message_model|>") == NULL);
+    TEST_ASSERT(strstr(out, "response.completed") != NULL);
+
+    free(out);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    responses_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_anthropic_inkling_stream_emits_tool_use(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.model_syntax = SERVER_MODEL_SYNTAX_INKLING;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = true;
+    free(r.model);
+    r.model = xstrdup("inkling-2-mini");
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_inkling", 8, &st));
+
+    const char *raw = inkling_stream_tool_output();
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_inkling",
+                                             &st, raw, strlen(raw), false));
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_inkling_generated_message_ex(raw, &content,
+                                                    &reasoning, &calls));
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "msg_inkling", &st,
+                                          raw, strlen(raw), &calls,
+                                          "tool_calls", 20));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"thinking\":\"Check the forecast.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"Sunny.\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_use\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"weather\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"city\\\":\\\"Rome\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "<|content_") == NULL);
+    TEST_ASSERT(strstr(out, "<|message_model|>") == NULL);
+    TEST_ASSERT(strstr(out, "event: message_stop") != NULL);
+
+    free(out);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    anthropic_stream_free(&st);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -18280,6 +19659,7 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(server_model_alias_known("inkling-2-mini"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -18524,6 +19904,226 @@ static void test_render_qwen_chat_prompt_text(void) {
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_render_inkling_chat_prompt_text(void) {
+    const char *messages_json =
+        "[{\"role\":\"system\",\"content\":\"Be useful.\"},"
+        "{\"role\":\"user\",\"content\":\"Weather Rome?\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+        "{\"id\":\"c1\",\"type\":\"function\",\"function\":{"
+        "\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Rome\\\"}\"}}]},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"Sunny\"},"
+        "{\"role\":\"assistant\",\"content\":\"It is sunny.\"},"
+        "{\"role\":\"user\",\"content\":\"Again?\"}]";
+    const char *tools_json =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"weather\","
+        "\"description\":\"Lookup\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"}},"
+        "\"required\":[\"city\"]}}}]";
+    const char *messages_p = messages_json;
+    const char *tools_p = tools_json;
+    chat_msgs msgs = {0};
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_messages(&messages_p, &msgs));
+    TEST_ASSERT(parse_tools_value(&tools_p, &schemas, &orders));
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_INKLING, &msgs, schemas, &orders, DS4_THINK_HIGH);
+    const char *expected =
+        "<|message_system|>tool_declare<|content_xml|>"
+        "[{\"description\":\"Lookup\",\"name\":\"weather\","
+        "\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},"
+        "\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]"
+        "<|end_message|>"
+        "<|message_system|><|content_text|>Be useful.<|end_message|>"
+        "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>"
+        "<|message_user|><|content_text|>Weather Rome?<|end_message|>"
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"weather\",\"args\":{\"city\":\"Rome\"}}"
+        "<|end_message|><|content_model_end_sampling|>"
+        "<|message_tool|>weather<|content_text|>Sunny<|end_message|>"
+        "<|message_model|><|content_text|>It is sunny.<|end_message|>"
+        "<|content_model_end_sampling|>"
+        "<|message_user|><|content_text|>Again?<|end_message|>"
+        "<|message_model|>";
+    TEST_ASSERT(prompt && !strcmp(prompt, expected));
+
+    free(prompt);
+    free(schemas);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+}
+
+static void test_parse_inkling_tool_calls(void) {
+    const char *generated =
+        "<|content_thinking|>Find the forecast.<|end_message|>"
+        "<|content_text|>Checking now.<|end_message|>"
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"weather\",\"args\":{\"city\":\"Rome\","
+        "\"options\":{\"units\":\"C\"}}}<|end_message|>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_INKLING, generated, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "Checking now."));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "Find the forecast."));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "weather"));
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].arguments,
+        "{\"city\":\"Rome\",\"options\":{\"units\":\"C\"}}"));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    TEST_ASSERT(!parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_INKLING,
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"other\",\"args\":{}}<|end_message|>",
+        false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_parse_inkling_assistant_message_blocks(void) {
+    const char *generated =
+        "<|content_thinking|>Use the tool result.<|end_message|>"
+        "<|message_model|><|content_text|>It is sunny.<|end_message|>";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_inkling_generated_message_ex(generated, &content,
+                                                    &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "It is sunny."));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "Use the tool result."));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_invalid_inkling_tool_call_fails_closed(void) {
+    const char *generated =
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"weather\",\"args\":[]}<|end_message|>";
+    char err[128] = {0};
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    const char *finish = "tool_calls";
+    bool recovered = false;
+
+    TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_INKLING, generated, true, true, false,
+        &finish, err, sizeof(err), &content, &reasoning, &calls,
+        &recovered, NULL));
+    TEST_ASSERT(!recovered);
+    TEST_ASSERT(!strcmp(finish, "error"));
+    TEST_ASSERT(!strcmp(err, "invalid Inkling tool call"));
+    TEST_ASSERT(content == NULL);
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_inkling_tool_checkpoint_matches_chat_template(void) {
+    const char *schemas =
+        "{\"name\":\"weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"}}}}";
+    chat_msgs prompt_msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Weather Rome?");
+    chat_msgs_push(&prompt_msgs, user);
+    char *prompt = render_inkling_chat_prompt_text(&prompt_msgs, schemas,
+                                                   DS4_THINK_HIGH);
+
+    const char *generated =
+        "<|content_thinking|>Check the forecast.<|end_message|>"
+        "<|content_text|>Sunny.<|end_message|>"
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"weather\",\"args\":{\"city\":\"Rome\"}}"
+        "<|end_message|>";
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_inkling_generated_message_ex(generated, &content,
+                                                    &reasoning, &calls));
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.model_syntax = SERVER_MODEL_SYNTAX_INKLING;
+    r.think_mode = DS4_THINK_HIGH;
+    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
+    buf canonical = {0};
+    buf_puts(&canonical, prompt);
+    buf_puts(&canonical, suffix);
+
+    chat_msgs history = {0};
+    chat_msg history_user = {0};
+    history_user.role = xstrdup("user");
+    history_user.content = xstrdup("Weather Rome?");
+    chat_msgs_push(&history, history_user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup(content ? content : "");
+    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+    assistant.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    chat_msgs_push(&history, assistant);
+    char *future = render_inkling_chat_prompt_text(&history, schemas,
+                                                  DS4_THINK_HIGH);
+    TEST_ASSERT(canonical.ptr && future && !strcmp(canonical.ptr, future));
+
+    free(future);
+    buf_free(&canonical);
+    free(suffix);
+    free(prompt);
+    free(content);
+    free(reasoning);
+    request_free(&r);
+    chat_msgs_free(&history);
+    chat_msgs_free(&prompt_msgs);
+    tool_calls_free(&calls);
+}
+
+static void test_inkling_responses_live_tail_restores_tool_name(void) {
+    server s = {0};
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    id_list_push_unique(&slot.responses_live.call_ids, "call-inkling");
+    slot.responses_live.call_names = xmalloc(sizeof(char *));
+    slot.responses_live.call_names[0] = xstrdup("weather");
+    slot.responses_live.call_names_len = 1;
+
+    const char *input_json =
+        "[{\"type\":\"function_call_output\",\"call_id\":\"call-inkling\","
+        "\"output\":\"Sunny\"}]";
+    const char *input = input_json;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_responses_input(&input, &msgs, NULL, NULL));
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.api = API_RESPONSES;
+    r.model_syntax = SERVER_MODEL_SYNTAX_INKLING;
+    responses_prepare_live_continuation(&s, &r, &msgs);
+    TEST_ASSERT(r.responses_live_suffix_text && !strcmp(
+        r.responses_live_suffix_text,
+        "<|content_model_end_sampling|><|message_tool|>weather"
+        "<|content_text|>Sunny<|end_message|><|message_model|>"));
+
+    request_free(&r);
+    chat_msgs_free(&msgs);
+    live_tool_state_free(&slot.responses_live);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_qwen_reasoning_effort_levels(void) {
@@ -20772,6 +22372,34 @@ static void test_qwen_decode_tracker_markers(void) {
     }
     TEST_ASSERT(start && end);
     TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+}
+
+static void test_inkling_decode_tracker_tool_boundary(void) {
+    const char *prefix =
+        "<|content_text|>Checking.<|end_message|>"
+        "<|message_model|>weather<|content_invoke_tool_json|>"
+        "{\"name\":\"weather\",\"args\":{\"query\":"
+        "\"literal <|end_message|> in JSON\"";
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_INKLING;
+    dsml_decode_tracker_update(&tracker, prefix, strlen(prefix));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRUCTURAL);
+    TEST_ASSERT(tracker.syn != NULL);
+    TEST_ASSERT(find_any_tool_start(prefix) == NULL);
+    TEST_ASSERT(find_any_tool_end("<|end_message|>") == NULL);
+    TEST_ASSERT(find_tool_start_for_syntax(SERVER_MODEL_SYNTAX_INKLING,
+                                            prefix) == strstr(prefix, "<|message_model|>"));
+    TEST_ASSERT(find_tool_end_for_syntax(SERVER_MODEL_SYNTAX_INKLING,
+        "<|message_model|>weather<|content_invoke_tool_json|>{}\n<|end_message|>") != NULL);
+
+    buf complete = {0};
+    buf_puts(&complete, prefix);
+    buf_puts(&complete, "}}<|end_message|>");
+    dsml_decode_tracker_update(&tracker, complete.ptr, complete.len);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+    buf_free(&complete);
 }
 
 static void test_tool_body_escape_round_trip(void) {
@@ -23037,6 +24665,7 @@ static void test_deepseek41_live_result_order(void) {
 }
 
 static void ds4_server_unit_tests_run(void) {
+    test_responses_previous_response_id_requires_input_context();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
@@ -23068,10 +24697,17 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
+    test_render_inkling_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
+    test_inkling_decode_tracker_tool_boundary();
     test_parse_qwen_tool_call_message();
+    test_parse_inkling_tool_calls();
+    test_parse_inkling_assistant_message_blocks();
+    test_invalid_inkling_tool_call_fails_closed();
+    test_inkling_tool_checkpoint_matches_chat_template();
+    test_inkling_responses_live_tail_restores_tool_name();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
     test_qwen_tool_checkpoint_round_trip();
@@ -23093,6 +24729,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_loads_tools();
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
+    test_responses_input_additional_tools_loads_namespaced_tools();
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
@@ -23105,7 +24742,10 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_stream_reroutes_second_reasoning_pass();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
+    test_anthropic_inkling_stream_emits_tool_use();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_inkling_stream_emits_structured_tool_call();
+    test_responses_inkling_stream_emits_function_call();
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_qwen_stream_split_reasoning_close();

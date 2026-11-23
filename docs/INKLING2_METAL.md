@@ -15,7 +15,7 @@ The numbered sections preserve implementation snapshots from each milestone. Sta
 | M4: attention, convolution, and per-visit state | Complete for single-session token execution | The native 48-visit session path decodes and prefills incrementally with independent KV/convolution state. The real model's first-layer intermediates and multi-token cache continuation were checked. |
 | M5: loop core, output layer, and text generation | Operational for batch-1 text; validation partial | Normal engine/session generation emits real text. The first eight greedy token IDs match the pinned reference; long-context, EOS, and speculative rollback cases remain open. |
 | M6: full-model M4 performance | Not complete | An encoder timeline now identifies expert GEMV as the main decode cost, and the SIMD reduction candidate is numerically checked. The timeline serializes encoder passes and the synthetic GEMV benchmark is variable, so stable throughput and resident-memory peak remain unmeasured. |
-| M7: integration hardening and user workflow | Partial | Same-GGUF logits and cache continuation are verified for a short prompt. Longer prompts and full chat completion need broader validation. |
+| M7: integration hardening and user workflow | Partial | OpenAI Chat tool round-trip and streamed Responses tool continuation ran on the real GGUF. Long-context and model-backed Anthropic validation remain open. |
 | M8: post-release formats and optional features | Not started | NVFP4/MXFP8, low-precision KV, vision/audio, and speculative decoding remain out of scope for this IQ4_NL path. |
 
 ## Current model-backed checkpoint — 2026-11-23
@@ -33,6 +33,43 @@ The expert GEMV now uses an in-SIMD reduction followed by one threadgroup barrie
 The eight focused Inkling targets (`state`, `inspect`, `model`, `mapping`, `metal`, `gguf`, `session`, and `tokenizer`) pass on this M4 build; the focused Metal test also passes after the SIMD reduction. `make ds4 cpu ds4_test`, a forced native Metal `make -B ds4`, and `./ds4_test --server` pass. A non-Apple-macro syntax check of `ds4.c` passes after guarding the Metal-only session field. The latest `./ds4_test --metal-kernels` run exits non-zero with exactly the same 29 assertion records as the captured M0 baseline; the assertion lists compare equal. The context allocator reports 454,785,284 bytes (433.72 MiB) at context 8192. A 500 ms `footprint` sample during a 32-token run reported process `phys_footprint_peak=585,418,792` bytes (558.3 MiB); this is not a complete Metal/device working-set peak measurement. The CLI's generic `KV 0.06 GiB` estimate is a different model-family metric and does not include this Inkling session allocation. The repository's default `ds4flash.gguf` is absent, so the full existing-model and SSD-streaming regression paths were not run; no CUDA compiler/device is available on this Mac. Inkling explicitly rejects SSD streaming and non-Metal execution.
 
 The M4 reports a recommended Metal working set of 26,800.60 MB (24.96 GiB). The session allocator estimates 454,785,284 bytes (433.72 MiB) at context 8192, while DS4 reported 16,811.33 MiB mapped for the model. Those are allocation/mapping figures; peak resident memory was not measured. Prefill is still conservative and evaluates tokens incrementally. Long-context numerical parity, a stable TTFT/prompt-throughput benchmark, peak resident memory, real EOS completion, and speculative/interrupted rollback remain open.
+
+## Conversational API and function tools — 2026-11-23
+
+The native server recognizes the `inkling-2-mini` model ID and selects the
+Inkling GGUF chat template, parser, and SSE projection. OpenAI Chat Completions,
+Responses, and Anthropic share the normal DS4 server API; the server returns
+function calls for the client or harness to execute and does not execute tools
+itself. The Responses endpoint accepts `tool_choice: "auto"` and `"none"`; it
+rejects forced/required choices. Chat Completions accepts
+`tool_choice: "required"`.
+
+On the M4 with the GGUF above, an OpenAI Chat request with
+`tool_choice: "required"` generated `weather({"city":"Rome"})`. Replaying that
+assistant call with a harness-supplied tool result produced the plain final
+answer “The weather in Rome is sunny, with a temperature of 18°C.” The same
+cycle passed through streamed Responses: it emitted a `function_call`, then
+accepted a follow-up containing `previous_response_id` and only the matching
+`function_call_output`, and emitted the final text. Responses usage reported
+165 cached input tokens out of 189 on that continuation. The weather result was
+test input supplied by the caller, not a live weather lookup.
+
+Responses `additional_tools` namespaces and custom tool input now pass through
+the Inkling schema and SSE serializers. On the real GGUF, a streamed request
+with the Codex-style `functions.exec` custom tool returned a
+`custom_tool_call` with JavaScript input and the expected delta/done events. A
+full-history follow-up with the caller-supplied tool result returned `TOOL_OK`.
+The generated JavaScript was not executed by this test. Codex CLI 0.171.0 did
+not complete with its full agent/tool prompt at context 8192; use a harness whose
+prompt and tool definitions fit that context.
+
+Inkling remains text-only, batch size 1, context 8192, and one resident server
+session; do not use `--batched-session`. Responses IDs are not stored durably.
+Output-only tool continuation is bound by a `call_id` in the live server state;
+after a process restart, replay the complete input history instead. The
+OpenAI, Responses, and Anthropic Inkling SSE adapters and malformed-call
+fail-closed behavior pass `./ds4_test --server`. The Anthropic path has unit
+coverage but was not exercised against the real checkpoint in this run.
 
 ## M0 baseline
 

@@ -31,6 +31,10 @@ relative runtime files such as Metal kernels can be found.
 
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
+Inkling 2 Mini is exposed as `inkling-2-mini` when its IQ4_NL GGUF is loaded.
+On Apple Silicon it uses the native Metal backend, supports text and function
+tool calls, and currently runs one session at context 8192. Do not enable
+`--batched-session` for this model.
 
 `GET /v1/models` and `GET /v1/models/{id}` include `architecture.input_modalities` and `architecture.output_modalities`. Input modalities are `["text", "image"]` when the loaded engine has vision enabled, otherwise `["text"]`; output modalities are always `["text"]`. Compatibility aliases report the same loaded-engine capabilities.
 
@@ -44,6 +48,17 @@ Chat, Responses, and Anthropic support tools and SSE streaming. Reasoning is
 returned separately from visible text in each API's native form. Standard
 sampling and output-budget fields are supported; explicit request parameters
 take precedence over defaults.
+
+Tool calls are returned to the client; the client or harness executes the
+function and sends its result in the next request. Inkling supports these paths
+through the native chat template and parser, including namespaced
+`additional_tools` and custom tool calls used by Codex's Responses protocol.
+Responses accepts `tool_choice` `auto` and `none`; forced/required choices are
+rejected. A Responses
+`previous_response_id` can accompany a full replay, or an output-only tool
+continuation whose `call_id` belongs to a live server checkpoint. The server
+does not persist Responses objects across restarts, so replay full input history
+after restarting it.
 
 The default sampling settings are temperature 1, top-p 1, and min-p 0.05.
 For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
