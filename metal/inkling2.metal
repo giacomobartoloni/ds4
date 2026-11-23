@@ -16,6 +16,25 @@ struct ds4_metal_args_inkling2_iq4_nl {
     uint32_t pad;
 };
 
+struct ds4_metal_args_inkling2_expert_gemv {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_experts;
+    uint32_t n_used;
+    uint32_t weight_type;
+    uint32_t blocks_per_row;
+    uint32_t input_per_expert;
+    uint32_t pad0;
+    ulong expert_bytes;
+};
+
+struct ds4_metal_args_inkling2_situ {
+    uint32_t n_used;
+    uint32_t expert_dim;
+    float beta;
+    float linear_beta;
+};
+
 struct ds4_metal_args_inkling2_qk {
     uint32_t rows;
     uint32_t width;
@@ -215,6 +234,85 @@ kernel void kernel_inkling2_gemv_iq4_nl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0u) out[row] = partial[0];
+}
+
+/* Selected-expert GEMV keeps routing IDs on device and gathers rows from the
+ * shared physical expert tensor. Q8_0 and IQ4_NL use their native block bytes. */
+kernel void kernel_inkling2_expert_gemv(
+        constant ds4_metal_args_inkling2_expert_gemv &args [[buffer(0)]],
+        device const char *weights [[buffer(1)]],
+        device const int32_t *expert_ids [[buffer(2)]],
+        device const float *x [[buffer(3)]],
+        device float *out [[buffer(4)]],
+        threadgroup float *partial [[threadgroup(0)]],
+        uint group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    const uint slot = group / args.out_dim;
+    const uint row = group - slot * args.out_dim;
+    if (group >= args.out_dim * args.n_used || row >= args.out_dim || slot >= args.n_used) return;
+    const int32_t expert = expert_ids[slot];
+    if (expert < 0 || (uint32_t)expert >= args.n_experts) {
+        if (lane == 0u) out[(ulong)slot * args.out_dim + row] = NAN;
+        return;
+    }
+    const uint block_bytes = args.weight_type == 20u ? 18u : 34u;
+    const ulong row_bytes = (ulong)args.blocks_per_row * block_bytes;
+    device const char *row_weights = weights + (ulong)(uint32_t)expert * args.expert_bytes +
+        (ulong)row * row_bytes;
+    float sum = 0.0f;
+    for (uint i = lane; i < args.in_dim; i += lanes) {
+        const uint block_index = i >> 5u;
+        const uint within = i & 31u;
+        device const char *block = row_weights + (ulong)block_index * block_bytes;
+        const float scale = float(*(device const half *)block);
+        if (args.weight_type == 20u) {
+            device const uchar *packed = (device const uchar *)(block + 2);
+            const uchar byte = packed[within & 15u];
+            const uint code = within < 16u ? (uint)(byte & 0x0fu) : (uint)(byte >> 4u);
+            const ulong x_offset = args.input_per_expert != 0u ?
+                (ulong)slot * args.in_dim : 0u;
+            sum += scale * float(ds4_inkling2_iq4_nl_values[code]) * x[x_offset + i];
+        } else {
+            const int8_t quant = *(device const int8_t *)(block + 2 + within);
+            const ulong x_offset = args.input_per_expert != 0u ?
+                (ulong)slot * args.in_dim : 0u;
+            sum += scale * float(quant) * x[x_offset + i];
+        }
+    }
+    partial[lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) out[(ulong)slot * args.out_dim + row] = partial[0];
+}
+
+static inline float inkling2_tanh_saturating(float value) {
+    if (isinf(value)) return value >= 0.0f ? 1.0f : -1.0f;
+    if (value >= 10.0f) return 1.0f;
+    if (value <= -10.0f) return -1.0f;
+    return tanh(value);
+}
+
+kernel void kernel_inkling2_situ(
+        constant ds4_metal_args_inkling2_situ &args [[buffer(0)]],
+        device const float *gate_up [[buffer(1)]],
+        device float *out [[buffer(2)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint count = args.n_used * args.expert_dim;
+    if (index >= count) return;
+    const uint slot = index / args.expert_dim;
+    const uint row = index - slot * args.expert_dim;
+    const ulong base = (ulong)slot * 2u * args.expert_dim;
+    const float gate = gate_up[base + row];
+    const float up = gate_up[base + args.expert_dim + row];
+    const float gate_act = args.beta * inkling2_tanh_saturating(gate / args.beta) *
+        inkling2_sigmoid(gate);
+    const float up_act = args.linear_beta *
+        inkling2_tanh_saturating(up / args.linear_beta);
+    out[index] = gate_act * up_act;
 }
 
 /* Accumulate already-computed, selected expert vectors without expanding the

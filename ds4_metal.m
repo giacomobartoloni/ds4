@@ -23326,6 +23326,25 @@ typedef struct {
 } ds4_gpu_inkling2_iq4_nl_args;
 
 typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_experts;
+    uint32_t n_used;
+    uint32_t weight_type;
+    uint32_t blocks_per_row;
+    uint32_t input_per_expert;
+    uint32_t pad0;
+    uint64_t expert_bytes;
+} ds4_gpu_inkling2_expert_gemv_args;
+
+typedef struct {
+    uint32_t n_used;
+    uint32_t expert_dim;
+    float beta;
+    float linear_beta;
+} ds4_gpu_inkling2_situ_args;
+
+typedef struct {
     uint32_t rows;
     uint32_t width;
     float threshold;
@@ -23658,6 +23677,134 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned,
                                           "Inkling2 expert accumulation")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_expert_gemv_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x) {
+    if ((!g_initialized && !ds4_gpu_init()) || !model_map || !out || !expert_ids || !x ||
+        in_dim == 0 || (in_dim % 32u) != 0 || out_dim == 0 ||
+        n_experts == 0 || n_experts > 128u || n_used == 0 || n_used > 8u ||
+        n_used > n_experts || out_dim > UINT32_MAX / n_used ||
+        (input_per_expert != 0 && input_per_expert != 1) ||
+        (weight_type != 8u && weight_type != 20u)) return 0;
+    const uint32_t block_bytes = weight_type == 20u ? 18u : 34u;
+    const uint32_t blocks_per_row = in_dim / 32u;
+    const uint64_t row_bytes = (uint64_t)blocks_per_row * block_bytes;
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    const uint64_t expert_bytes = (uint64_t)out_dim * row_bytes;
+    if (n_experts > UINT64_MAX / expert_bytes) return 0;
+    const uint64_t weight_bytes = (uint64_t)n_experts * expert_bytes;
+    const uint64_t input_rows = input_per_expert ? n_used : 1u;
+    const uint64_t input_bytes = (uint64_t)in_dim * input_rows * sizeof(float);
+    const uint64_t output_elements = (uint64_t)n_used * out_dim;
+    if (output_elements > UINT64_MAX / sizeof(float) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        !ds4_gpu_inkling2_tensor_fits(out, output_elements * sizeof(float),
+                                      "selected expert GEMV output") ||
+        !ds4_gpu_inkling2_tensor_fits(expert_ids,
+                                      (uint64_t)n_used * sizeof(int32_t),
+                                      "selected expert IDs") ||
+        !ds4_gpu_inkling2_tensor_fits(x, input_bytes,
+                                      "selected expert activation")) return 0;
+
+    @autoreleasepool {
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> weight_buffer = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_expert_gemv");
+        if (!weight_buffer || !pipeline) return 0;
+        ds4_gpu_inkling2_expert_gemv_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_experts = n_experts,
+            .n_used = n_used,
+            .weight_type = weight_type,
+            .blocks_per_row = blocks_per_row,
+            .input_per_expert = input_per_expert != 0,
+            .expert_bytes = expert_bytes,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight_buffer offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(expert_ids)
+                offset:ds4_gpu_tensor_offset(expert_ids) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim * n_used, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                          "Inkling2 selected expert GEMV")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_situ_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate_up,
+        uint32_t              n_used,
+        uint32_t              expert_dim,
+        float                 beta,
+        float                 linear_beta) {
+    if ((!g_initialized && !ds4_gpu_init()) || !out || !gate_up ||
+        n_used == 0 || n_used > 8u || expert_dim == 0 ||
+        !isfinite(beta) || beta <= 0.0f ||
+        !isfinite(linear_beta) || linear_beta <= 0.0f) return 0;
+    const uint64_t count = (uint64_t)n_used * expert_dim;
+    if (count > UINT64_MAX / (2u * sizeof(float))) return 0;
+    const uint64_t out_bytes = count * sizeof(float);
+    const uint64_t gate_up_bytes = count * 2u * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, out_bytes, "SiTU output") ||
+        !ds4_gpu_inkling2_tensor_fits(gate_up, gate_up_bytes, "SiTU gate/up")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_situ");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_situ_args args = {
+            .n_used = n_used,
+            .expert_dim = expert_dim,
+            .beta = beta,
+            .linear_beta = linear_beta,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate_up)
+                offset:ds4_gpu_tensor_offset(gate_up) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:2];
+        const NSUInteger groups = (NSUInteger)(((uint64_t)n_used * expert_dim + 255u) / 256u);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 SiTU")) return 0;
     }
     return 1;
 }

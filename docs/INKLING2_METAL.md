@@ -9,9 +9,10 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
 | M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; live GGUF validation remains pending because weights are absent. |
 | M2: native Metal control operators | Complete for isolated no-weight tests | Focused scalar-oracle tests pass on Apple M4; model integration is not part of this milestone. |
-| M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. The expert FFN is not yet integrated. |
+| M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. |
 | M4: attention, convolution, and visit state | Partial, isolated operators | State, decode attention, Q/K preparation, relative bias, and shortconv pass synthetic state/oracle tests on Apple M4; prefill graph and model integration remain open. |
-| M5+: loop, generation, numerical parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
+| M5: routed expert FFN | Partial, isolated Metal operation | Router, top-8 IQ4_NL/Q8_0 expert projections, SiTU, down projection, and routed accumulation pass synthetic scalar-oracle tests; DS4 layer/model wiring remains open. |
+| M6+: loop, generation, numerical parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
 
 ## M0 baseline
 
@@ -74,7 +75,7 @@ These operators are not yet connected to a model execution path. The live Inklin
 
 The IQ4_NL Metal GEMV reads the canonical 18-byte block layout directly: a little-endian FP16 scale followed by 16 packed bytes for 32 values, using the GGML `kvalues_iq4nl` lookup table. Low nibbles address values 0–15 and high nibbles address values 16–31. The kernel decodes each selected weight inline, accumulates in FP32 across a cooperative threadgroup, and does not materialize a dequantized matrix. Rows are contiguous with `18 * (in_dim / 32)` bytes; partial blocks are rejected.
 
-`ds4_gpu_matmul_q8_0_tensor` is reused for Q8_0 rather than adding another copy of DS4's existing Metal GEMV. `ds4_gpu_inkling2_expert_accumulate_tensor` combines up to eight already-computed expert output vectors using routed weights; it does not dequantize or combine expert matrices. Full gate/up SiTU, down projection, and expert-layer orchestration remain unimplemented.
+`ds4_gpu_matmul_q8_0_tensor` is reused for Q8_0 rather than adding another copy of DS4's existing Metal GEMV. `ds4_gpu_inkling2_expert_accumulate_tensor` combines up to eight already-computed expert output vectors using routed weights; it does not dequantize or combine expert matrices. At the M3 checkpoint, gate/up SiTU, down projection, and expert-layer orchestration remained unimplemented; their isolated implementation is recorded under M5 below.
 
 The extended `make test-inkling2-metal` fixture checks 96-element inputs and five output rows, multiple block scales, low/high nibble order, non-four-byte row strides (54-byte IQ4_NL rows and 102-byte Q8_0 rows), and rejection of partial blocks. Its scalar C oracle passes on the Apple M4. No model bytes are used.
 
@@ -106,3 +107,15 @@ The synthetic `make inkling2-metal-m4-bench` benchmark was run before and after 
 The optimized kernel passed the same scalar-oracle test suite before the after-run benchmark. This result only characterizes the attention operator and does not predict end-to-end Inkling tokens per second.
 
 This milestone is still partial: DS4 does not yet schedule these operators as an Inkling decoder layer. Batched causal attention prefill, Q/K/V and gate/sink/relative projections, post-attention/post-FFN graph wiring, expert FFN, loop controller, tokenizer/template path, and same-GGUF parity remain open. No GGUF was present, so no real-model output or model throughput claim is made.
+
+## M5 isolated routed expert FFN
+
+`ds4_inkling_moe_situ_metal` composes a one-token routed FFN from DS4 Metal tensors and the existing F32 matvec path. Router logits and correction-biased top-8 selection stay on the GPU. Selected expert IDs index the shared physical matrices directly; gate/up projection, SiTU activation, per-expert down projection, and routed output accumulation never materialize a dense expert matrix or copy routing results to the CPU. IQ4_NL and Q8_0 are supported for expert tensors. The active DS4 Metal mapped views must cover the router and expert tensor ranges.
+
+The SiTU kernel implements `beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta)`. Metal's finite large-input `tanh` behavior on M4 produced NaNs, so its implementation saturates inputs at ±10, where the FP32 result is within rounding of ±1. Routing still uses the un-biased sigmoid scores for normalized route weights after correction bias determines the selected experts.
+
+`make test-inkling2-metal` now builds a synthetic 128-expert fixture with 8 selected experts and compares the full routed FFN against scalar references for both IQ4_NL and Q8_0, as well as checking routing, selected projections, SiTU, and down projection independently. It passes on Apple M4. This verifies the composed operator but does not bind it to DS4 model metadata or a decoder layer.
+
+`make inkling2-metal-moe-bench` was run on the M4 with 2304 hidden width, 1152 expert width, 8 of 128 experts, and 546.8 MiB of synthetic IQ4_NL expert weights. Two warmups were followed by three runs of three synchronous calls. The measured routed-FFN latency was 6.355, 4.398, and 4.564 ms/op. The first run includes additional cold-page and pipeline effects; the latter two are 4.398 and 4.564 ms/op. These measurements include router, dispatch, synchronization, projections, SiTU, and accumulation. They are synthetic operator timing, not model tokens/sec.
+
+M5 remains partial: native model loading/weight binding, attention and FFN residual wiring, 48-visit loop execution, prefill, tokenizer/template/EOS behavior, text generation, and same-GGUF numerical parity are open. The GGUF is absent, so real-model output and performance have not been measured.

@@ -1317,6 +1317,32 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         uint32_t                out_dim,
         uint32_t                n_used);
 
+/* Quantized expert GEMV selected by device-resident int32 expert IDs. `out`
+ * is [n_used][out_dim], weights are [expert][row][quantized input block].
+ * `weight_type` accepts GGML Q8_0 (8) or IQ4_NL (20). */
+int ds4_gpu_inkling2_expert_gemv_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x);
+
+/* SiTU over concatenated [gate, up] expert vectors in [expert][2*ffn] order. */
+int ds4_gpu_inkling2_situ_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate_up,
+        uint32_t              n_used,
+        uint32_t              expert_dim,
+        float                 beta,
+        float                 linear_beta);
+
 /* M4 decode operators. KV rows use interleaved FP16 [token][kv_head][dim]. */
 int ds4_gpu_inkling2_qk_prepare_tensor(
         ds4_gpu_tensor       *out,

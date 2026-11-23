@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../ds4_inkling_moe.h"
 #include "../ds4_inkling_state.h"
 
 bool ds4_log_is_tty(FILE *fp) {
@@ -20,6 +21,8 @@ bool ds4_log_is_tty(FILE *fp) {
 
 static void *g_synthetic_model_map;
 static uint64_t g_synthetic_model_size;
+static void *g_synthetic_moe_map;
+static uint64_t g_synthetic_moe_size;
 static float g_m4_qk_relative_max_error;
 static float g_m4_attention_max_error;
 static float g_m4_full_attention_max_error;
@@ -498,6 +501,350 @@ static int test_expert_accumulation(void) {
     return ok;
 }
 
+static void pack_synthetic_iq4_experts(uint8_t *dst, uint32_t n_experts,
+                                      uint32_t rows, uint32_t in_dim,
+                                      uint32_t seed) {
+    static const uint16_t scales[] = { 0x3800u, 0x3c00u, 0x4000u };
+    const uint32_t blocks_per_row = in_dim / 32u;
+    const uint32_t row_bytes = blocks_per_row * 18u;
+    const uint64_t expert_bytes = (uint64_t)rows * row_bytes;
+    for (uint32_t expert = 0; expert < n_experts; expert++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            for (uint32_t block = 0; block < blocks_per_row; block++) {
+                uint8_t *packed = dst + (uint64_t)expert * expert_bytes +
+                    (uint64_t)row * row_bytes + (uint64_t)block * 18u;
+                const uint16_t scale = scales[(expert + row + seed) % 3u];
+                memcpy(packed, &scale, sizeof(scale));
+                for (uint32_t i = 0; i < 16; i++) {
+                    const uint8_t lo = (uint8_t)((expert * 3u + row * 5u +
+                                                   block * 7u + i * 11u + seed) & 15u);
+                    const uint8_t hi = (uint8_t)((expert * 13u + row * 7u +
+                                                   block * 3u + i * 5u + seed + 1u) & 15u);
+                    packed[2u + i] = (uint8_t)(lo | (hi << 4u));
+                }
+            }
+        }
+    }
+}
+
+static void pack_synthetic_q8_experts(uint8_t *dst, uint32_t n_experts,
+                                      uint32_t rows, uint32_t in_dim,
+                                      uint32_t seed) {
+    static const uint16_t scales[] = { 0x3800u, 0x3c00u, 0x4000u };
+    const uint32_t blocks_per_row = in_dim / 32u;
+    const uint32_t row_bytes = blocks_per_row * 34u;
+    const uint64_t expert_bytes = (uint64_t)rows * row_bytes;
+    for (uint32_t expert = 0; expert < n_experts; expert++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            for (uint32_t block = 0; block < blocks_per_row; block++) {
+                uint8_t *packed = dst + (uint64_t)expert * expert_bytes +
+                    (uint64_t)row * row_bytes + (uint64_t)block * 34u;
+                const uint16_t scale = scales[(expert + row + seed) % 3u];
+                memcpy(packed, &scale, sizeof(scale));
+                for (uint32_t i = 0; i < 32; i++) {
+                    packed[2u + i] = (uint8_t)(int8_t)
+                        ((int32_t)((expert * 7u + row * 11u + block * 3u + i * 5u + seed) % 63u) - 31);
+                }
+            }
+        }
+    }
+}
+
+static float synthetic_iq4_expert_dot(const uint8_t *map, uint64_t tensor_offset,
+                                      uint32_t expert, uint32_t row,
+                                      uint32_t rows, uint32_t in_dim,
+                                      const float *x) {
+    static const int8_t values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113,
+    };
+    const uint32_t blocks_per_row = in_dim / 32u;
+    const uint32_t row_bytes = blocks_per_row * 18u;
+    const uint64_t expert_bytes = (uint64_t)rows * row_bytes;
+    const uint8_t *weight = map + tensor_offset + (uint64_t)expert * expert_bytes +
+        (uint64_t)row * row_bytes;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < in_dim; i++) {
+        const uint32_t block = i / 32u;
+        const uint32_t within = i % 32u;
+        const uint8_t *q = weight + (uint64_t)block * 18u;
+        uint16_t scale_bits;
+        memcpy(&scale_bits, q, sizeof(scale_bits));
+        const uint8_t packed = q[2u + (within & 15u)];
+        const uint32_t code = within < 16u ? packed & 15u : packed >> 4u;
+        sum += half_bits_to_float(scale_bits) * (float)values[code] * x[i];
+    }
+    return sum;
+}
+
+static float synthetic_q8_expert_dot(const uint8_t *map, uint64_t tensor_offset,
+                                     uint32_t expert, uint32_t row,
+                                     uint32_t rows, uint32_t in_dim,
+                                     const float *x) {
+    const uint32_t blocks_per_row = in_dim / 32u;
+    const uint32_t row_bytes = blocks_per_row * 34u;
+    const uint64_t expert_bytes = (uint64_t)rows * row_bytes;
+    const uint8_t *weight = map + tensor_offset + (uint64_t)expert * expert_bytes +
+        (uint64_t)row * row_bytes;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < in_dim; i++) {
+        const uint8_t *q = weight + (uint64_t)(i / 32u) * 34u;
+        uint16_t scale_bits;
+        memcpy(&scale_bits, q, sizeof(scale_bits));
+        const int8_t value = (int8_t)q[2u + i % 32u];
+        sum += half_bits_to_float(scale_bits) * (float)value * x[i];
+    }
+    return sum;
+}
+
+static int test_situ_moe_metal(void) {
+    enum { HIDDEN = 32, EXPERT_DIM = 32, EXPERTS = 128, USED = 8 };
+    const uint64_t router_offset = 64u;
+    const uint64_t router_bytes = (uint64_t)HIDDEN * EXPERTS * sizeof(float);
+    const uint64_t gate_up_offset = align_up_u64(router_offset + router_bytes, 64u);
+    const uint32_t iq4_row_bytes = HIDDEN / 32u * 18u;
+    const uint64_t gate_up_bytes = (uint64_t)EXPERTS * 2u * EXPERT_DIM * iq4_row_bytes;
+    const uint64_t down_offset = align_up_u64(gate_up_offset + gate_up_bytes, 64u);
+    const uint64_t down_bytes = (uint64_t)EXPERTS * HIDDEN * iq4_row_bytes;
+    const uint64_t q8_gate_up_offset = align_up_u64(down_offset + down_bytes, 64u);
+    const uint32_t q8_row_bytes = HIDDEN / 32u * 34u;
+    const uint64_t q8_gate_up_bytes = (uint64_t)EXPERTS * 2u * EXPERT_DIM * q8_row_bytes;
+    const uint64_t q8_down_offset = align_up_u64(q8_gate_up_offset + q8_gate_up_bytes, 64u);
+    const uint64_t q8_down_bytes = (uint64_t)EXPERTS * HIDDEN * q8_row_bytes;
+    const uint64_t model_size = q8_down_offset + q8_down_bytes + 64u;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || model_size > SIZE_MAX) {
+        fprintf(stderr, "Inkling2 SiTU MoE invalid synthetic map size\n");
+        return 0;
+    }
+    const uint64_t allocation = align_up_u64(model_size, (uint64_t)page);
+    if (posix_memalign(&g_synthetic_moe_map, (size_t)page,
+                       (size_t)allocation) != 0) {
+        fprintf(stderr, "Inkling2 SiTU MoE synthetic map allocation failed\n");
+        return 0;
+    }
+    g_synthetic_moe_size = model_size;
+    memset(g_synthetic_moe_map, 0, (size_t)allocation);
+
+    uint8_t *map = g_synthetic_moe_map;
+    float *router = (float *)(void *)(map + router_offset);
+    for (uint32_t expert = 0; expert < EXPERTS; expert++) {
+        router[(uint64_t)expert * HIDDEN] = ((int32_t)expert - 64) * 0.03f;
+    }
+    pack_synthetic_iq4_experts(map + gate_up_offset, EXPERTS,
+                               2u * EXPERT_DIM, HIDDEN, 1u);
+    pack_synthetic_iq4_experts(map + down_offset, EXPERTS,
+                               HIDDEN, EXPERT_DIM, 4u);
+    pack_synthetic_q8_experts(map + q8_gate_up_offset, EXPERTS,
+                              2u * EXPERT_DIM, HIDDEN, 2u);
+    pack_synthetic_q8_experts(map + q8_down_offset, EXPERTS,
+                              HIDDEN, EXPERT_DIM, 5u);
+    if (!ds4_gpu_set_model_map(g_synthetic_moe_map, g_synthetic_moe_size)) {
+        fprintf(stderr, "Inkling2 SiTU MoE model map registration failed\n");
+        return 0;
+    }
+
+    float input[HIDDEN], bias[EXPERTS], logits[EXPERTS];
+    for (uint32_t i = 0; i < HIDDEN; i++)
+        input[i] = i == 0 ? 1.0f : (float)((int32_t)(i % 9u) - 4) / 16.0f;
+    memset(bias, 0, sizeof(bias));
+    bias[0] = 4.0f;
+    for (uint32_t expert = 0; expert < EXPERTS; expert++)
+        logits[expert] = router[(uint64_t)expert * HIDDEN] * input[0];
+
+    int32_t selected[USED];
+    float route_weights[USED];
+    router_reference(logits, bias, 1u, EXPERTS, USED, 8.0f,
+                     selected, route_weights);
+    ds4_gpu_tensor *debug_logits = ds4_gpu_tensor_alloc(sizeof(logits));
+    ds4_gpu_tensor *debug_ids = ds4_gpu_tensor_alloc(sizeof(selected));
+    ds4_gpu_tensor *debug_weights = ds4_gpu_tensor_alloc(sizeof(route_weights));
+    ds4_gpu_tensor *debug_input = upload(input, sizeof(input));
+    ds4_gpu_tensor *debug_bias = upload(bias, sizeof(bias));
+    int route_ok = debug_logits && debug_ids && debug_weights && debug_input && debug_bias &&
+        ds4_gpu_matmul_f32_tensor(debug_logits, map, model_size, router_offset,
+                                  HIDDEN, EXPERTS, debug_input, 1u) &&
+        ds4_gpu_inkling2_router_topk_tensor(debug_ids, debug_weights, debug_logits,
+                                            debug_bias, 1u, EXPERTS, USED, 8.0f);
+    int32_t debug_selected[USED];
+    float debug_route_weights[USED];
+    if (route_ok) route_ok =
+        ds4_gpu_tensor_read(debug_ids, 0, debug_selected, sizeof(debug_selected)) &&
+        ds4_gpu_tensor_read(debug_weights, 0, debug_route_weights,
+                            sizeof(debug_route_weights));
+    for (uint32_t i = 0; route_ok && i < USED; i++) {
+        if (debug_selected[i] != selected[i] ||
+            !near(debug_route_weights[i], route_weights[i], 2e-6f)) {
+            fprintf(stderr, "Inkling2 SiTU MoE route mismatch i=%u id=%d expected=%d\n",
+                    i, debug_selected[i], selected[i]);
+            route_ok = 0;
+        }
+    }
+    if (!route_ok) fprintf(stderr, "Inkling2 SiTU MoE router fixture failed\n");
+    ds4_gpu_tensor_free(debug_logits);
+    ds4_gpu_tensor_free(debug_weights);
+    ds4_gpu_tensor_free(debug_bias);
+    if (!route_ok) {
+        ds4_gpu_tensor_free(debug_ids);
+        ds4_gpu_tensor_free(debug_input);
+        return 0;
+    }
+
+    const float beta = 1.25f;
+    const float linear_beta = 0.75f;
+    float expected[HIDDEN] = { 0 };
+    float gate_up[USED * 2u * EXPERT_DIM];
+    float activation[USED * EXPERT_DIM];
+    const uint8_t *quantized = map;
+    for (uint32_t slot = 0; slot < USED; slot++) {
+        for (uint32_t row = 0; row < 2u * EXPERT_DIM; row++) {
+            gate_up[(uint64_t)slot * 2u * EXPERT_DIM + row] =
+                synthetic_iq4_expert_dot(quantized, gate_up_offset,
+                    (uint32_t)selected[slot], row, 2u * EXPERT_DIM, HIDDEN, input);
+        }
+        for (uint32_t row = 0; row < EXPERT_DIM; row++) {
+            const float gate = gate_up[(uint64_t)slot * 2u * EXPERT_DIM + row];
+            const float up = gate_up[(uint64_t)slot * 2u * EXPERT_DIM + EXPERT_DIM + row];
+            activation[(uint64_t)slot * EXPERT_DIM + row] =
+                beta * tanhf(gate / beta) * sigmoid_ref(gate) *
+                linear_beta * tanhf(up / linear_beta);
+        }
+        for (uint32_t row = 0; row < HIDDEN; row++) {
+            expected[row] += route_weights[slot] * synthetic_iq4_expert_dot(
+                quantized, down_offset, (uint32_t)selected[slot], row,
+                HIDDEN, EXPERT_DIM, activation + (uint64_t)slot * EXPERT_DIM);
+        }
+    }
+
+    float actual_gate_up[USED * 2u * EXPERT_DIM];
+    ds4_gpu_tensor *debug_gate_up = ds4_gpu_tensor_alloc(sizeof(actual_gate_up));
+    int gate_up_ok = debug_gate_up && ds4_gpu_inkling2_expert_gemv_tensor(
+        debug_gate_up, g_synthetic_moe_map, g_synthetic_moe_size, gate_up_offset,
+        20u, HIDDEN, 2u * EXPERT_DIM, EXPERTS, USED, 0, debug_ids, debug_input) &&
+        ds4_gpu_tensor_read(debug_gate_up, 0, actual_gate_up, sizeof(actual_gate_up));
+    for (uint32_t i = 0; gate_up_ok && i < USED * 2u * EXPERT_DIM; i++) {
+        if (!near(actual_gate_up[i], gate_up[i], 3e-4f * fmaxf(1.0f, fabsf(gate_up[i])))) {
+            fprintf(stderr, "Inkling2 selected expert GEMV mismatch i=%u got=%g expected=%g\n",
+                    i, actual_gate_up[i], gate_up[i]);
+            gate_up_ok = 0;
+        }
+    }
+    float actual_activation[USED * EXPERT_DIM];
+    ds4_gpu_tensor *debug_activation = ds4_gpu_tensor_alloc(sizeof(actual_activation));
+    int activation_ok = gate_up_ok && debug_activation &&
+        ds4_gpu_inkling2_situ_tensor(debug_activation, debug_gate_up,
+                                      USED, EXPERT_DIM, beta, linear_beta) &&
+        ds4_gpu_tensor_read(debug_activation, 0, actual_activation,
+                            sizeof(actual_activation));
+    for (uint32_t i = 0; activation_ok && i < USED * EXPERT_DIM; i++) {
+        if (!near(actual_activation[i], activation[i],
+                  3e-5f * fmaxf(1.0f, fabsf(activation[i])))) {
+            const uint32_t slot = i / EXPERT_DIM;
+            const uint32_t row = i - slot * EXPERT_DIM;
+            fprintf(stderr,
+                    "Inkling2 SiTU mismatch i=%u gate=%g up=%g got=%g expected=%g\n",
+                    i, actual_gate_up[(uint64_t)slot * 2u * EXPERT_DIM + row],
+                    actual_gate_up[(uint64_t)slot * 2u * EXPERT_DIM + EXPERT_DIM + row],
+                    actual_activation[i], activation[i]);
+            activation_ok = 0;
+        }
+    }
+    float actual_down[USED * HIDDEN];
+    ds4_gpu_tensor *debug_down = ds4_gpu_tensor_alloc(sizeof(actual_down));
+    int down_ok = activation_ok && debug_down &&
+        ds4_gpu_inkling2_expert_gemv_tensor(
+            debug_down, g_synthetic_moe_map, g_synthetic_moe_size, down_offset,
+            20u, EXPERT_DIM, HIDDEN, EXPERTS, USED, 1, debug_ids, debug_activation) &&
+        ds4_gpu_tensor_read(debug_down, 0, actual_down, sizeof(actual_down));
+    for (uint32_t slot = 0; down_ok && slot < USED; slot++) {
+        for (uint32_t row = 0; down_ok && row < HIDDEN; row++) {
+            const float expected_row = synthetic_iq4_expert_dot(
+                quantized, down_offset, (uint32_t)selected[slot], row,
+                HIDDEN, EXPERT_DIM, activation + (uint64_t)slot * EXPERT_DIM);
+            const uint64_t i = (uint64_t)slot * HIDDEN + row;
+            if (!near(actual_down[i], expected_row,
+                      4e-4f * fmaxf(1.0f, fabsf(expected_row)))) {
+                fprintf(stderr, "Inkling2 down GEMV mismatch slot=%u row=%u got=%g expected=%g\n",
+                        slot, row, actual_down[i], expected_row);
+                down_ok = 0;
+            }
+        }
+    }
+    ds4_gpu_tensor_free(debug_gate_up);
+    ds4_gpu_tensor_free(debug_activation);
+    ds4_gpu_tensor_free(debug_down);
+    ds4_gpu_tensor_free(debug_ids);
+    ds4_gpu_tensor_free(debug_input);
+    if (!down_ok) return 0;
+
+    ds4_gpu_tensor *tx = upload(input, sizeof(input));
+    ds4_gpu_tensor *tb = upload(bias, sizeof(bias));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(expected));
+    if (!tx || !tb || !to) {
+        fprintf(stderr, "Inkling2 SiTU MoE fixture tensor allocation failed\n");
+    }
+    int ok = tx && tb && to && ds4_inkling_moe_situ_metal(
+        to, tx, tb, g_synthetic_moe_map, g_synthetic_moe_size,
+        router_offset, gate_up_offset, down_offset, HIDDEN, EXPERT_DIM,
+        EXPERTS, USED, 20u, 8.0f, beta, linear_beta);
+    float actual[HIDDEN];
+    if (ok && !ds4_gpu_tensor_read(to, 0, actual, sizeof(actual))) {
+        fprintf(stderr, "Inkling2 SiTU MoE output read failed\n");
+        ok = 0;
+    }
+    for (uint32_t i = 0; ok && i < HIDDEN; i++) {
+        const float tolerance = 1.5e-3f * fmaxf(1.0f, fabsf(expected[i]));
+        if (!near(actual[i], expected[i], tolerance)) {
+            fprintf(stderr, "Inkling2 SiTU MoE mismatch i=%u got=%g expected=%g\n",
+                    i, actual[i], expected[i]);
+            ok = 0;
+        }
+    }
+    float q8_expected[HIDDEN] = { 0 };
+    float q8_gate_up[USED * 2u * EXPERT_DIM];
+    float q8_activation[USED * EXPERT_DIM];
+    for (uint32_t slot = 0; ok && slot < USED; slot++) {
+        for (uint32_t row = 0; row < 2u * EXPERT_DIM; row++) {
+            q8_gate_up[(uint64_t)slot * 2u * EXPERT_DIM + row] =
+                synthetic_q8_expert_dot(map, q8_gate_up_offset,
+                    (uint32_t)selected[slot], row, 2u * EXPERT_DIM, HIDDEN, input);
+        }
+        for (uint32_t row = 0; row < EXPERT_DIM; row++) {
+            const float gate = q8_gate_up[(uint64_t)slot * 2u * EXPERT_DIM + row];
+            const float up = q8_gate_up[(uint64_t)slot * 2u * EXPERT_DIM + EXPERT_DIM + row];
+            q8_activation[(uint64_t)slot * EXPERT_DIM + row] =
+                beta * tanhf(gate / beta) * sigmoid_ref(gate) *
+                linear_beta * tanhf(up / linear_beta);
+        }
+        for (uint32_t row = 0; row < HIDDEN; row++) {
+            q8_expected[row] += route_weights[slot] * synthetic_q8_expert_dot(
+                map, q8_down_offset, (uint32_t)selected[slot], row,
+                HIDDEN, EXPERT_DIM, q8_activation + (uint64_t)slot * EXPERT_DIM);
+        }
+    }
+    float q8_actual[HIDDEN];
+    ds4_gpu_tensor *tq8_out = ds4_gpu_tensor_alloc(sizeof(q8_actual));
+    int q8_ok = ok && tq8_out && ds4_inkling_moe_situ_metal(
+        tq8_out, tx, tb, g_synthetic_moe_map, g_synthetic_moe_size,
+        router_offset, q8_gate_up_offset, q8_down_offset, HIDDEN, EXPERT_DIM,
+        EXPERTS, USED, 8u, 8.0f, beta, linear_beta) &&
+        ds4_gpu_tensor_read(tq8_out, 0, q8_actual, sizeof(q8_actual));
+    for (uint32_t i = 0; q8_ok && i < HIDDEN; i++) {
+        const float tolerance = 1.5e-3f * fmaxf(1.0f, fabsf(q8_expected[i]));
+        if (!near(q8_actual[i], q8_expected[i], tolerance)) {
+            fprintf(stderr, "Inkling2 Q8_0 SiTU MoE mismatch i=%u got=%g expected=%g\n",
+                    i, q8_actual[i], q8_expected[i]);
+            q8_ok = 0;
+        }
+    }
+    if (!q8_ok) ok = 0;
+    ds4_gpu_tensor_free(tq8_out);
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tb);
+    ds4_gpu_tensor_free(to);
+    return ok;
+}
+
 static void make_small_plan(ds4_inkling_plan *plan) {
     uint8_t pattern[DS4_INKLING_PHYSICAL_LAYERS];
     memset(pattern, 1, sizeof(pattern));
@@ -822,6 +1169,7 @@ int main(void) {
     CHECK(test_router_topk());
     CHECK(test_quantized_matvec());
     CHECK(test_expert_accumulation());
+    CHECK(test_situ_moe_metal());
     CHECK(test_qk_and_relative_bias());
     CHECK(test_attention_output_gate());
     CHECK(test_attention_and_shortconv());
@@ -837,5 +1185,6 @@ int main(void) {
 cleanup:
     ds4_gpu_cleanup();
     free(g_synthetic_model_map);
+    free(g_synthetic_moe_map);
     return ok ? 0 : 1;
 }
