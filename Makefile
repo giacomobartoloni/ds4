@@ -1580,6 +1580,8 @@ clean:
 	rm -f tests/test_inkling2_mapping
 	rm -f tests/test_inkling2_metal
 	rm -f tests/test_inkling2_state
+	rm -f tests/test_inkling2_model
+	rm -f tests/test_inkling2_gguf
 	rm -f ds4_inkling_moe.o
 	rm -f ds4_inkling_loop.o
 	rm -f speed-bench/inkling2_metal_quant_bench
@@ -1695,3 +1697,20 @@ tests/test_inkling2_state: tests/test_inkling2_state.o ds4_inkling_state.o
 .PHONY: test-inkling2-state
 test-inkling2-state: tests/test_inkling2_state
 	./tests/test_inkling2_state
+
+tests/test_inkling2_model: tests/test_inkling2_model.c ds4_inkling.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< -lm
+
+.PHONY: test-inkling2-model
+test-inkling2-model: tests/test_inkling2_model
+	./tests/test_inkling2_model
+
+tests/test_inkling2_gguf.o: tests/test_inkling2_gguf.c ds4.c ds4.h ds4_gguf.h ds4_inkling.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_inkling2_gguf: tests/test_inkling2_gguf.o ds4_engram.c $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-inkling2-gguf
+test-inkling2-gguf: tests/test_inkling2_gguf
+	./tests/test_inkling2_gguf

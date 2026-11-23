@@ -2,7 +2,10 @@
 #define DS4_INKLING_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #define DS4_INKLING_PHYSICAL_LAYERS 24u
@@ -40,6 +43,117 @@ typedef struct {
     const uint8_t *sliding_window_pattern;
     size_t pattern_count;
 } ds4_inkling_config;
+
+/* Validated metadata for the initial text-only IQ4_NL Inkling 2 Mini GGUF. */
+typedef struct {
+    uint32_t physical_layers;
+    uint32_t embedding_dim;
+    uint32_t vocab_padded;
+    uint32_t vocab_unpadded;
+    uint32_t head_dim;
+    uint32_t expert_count;
+    uint32_t experts_used;
+    uint32_t expert_ffn_dim;
+    uint64_t context_length;
+    uint32_t loop_start;
+    uint32_t loop_end;
+    uint32_t loop_passes;
+    uint32_t gate_rank;
+    uint32_t residual_block_size;
+    uint32_t sliding_window;
+    uint32_t shortconv_cache;
+    uint32_t relative_dim;
+    uint32_t relative_extent;
+    uint32_t log_scale_floor;
+    uint32_t query_heads[DS4_INKLING_PHYSICAL_LAYERS];
+    uint32_t kv_heads[DS4_INKLING_PHYSICAL_LAYERS];
+    uint8_t sliding_window_pattern[DS4_INKLING_PHYSICAL_LAYERS];
+    float rms_epsilon;
+    float qk_clip;
+    float relative_clip;
+    float log_scale_alpha;
+    float expert_weight_scale;
+    float situ_beta;
+    float situ_linear_beta;
+    float final_logit_softcap;
+    bool loop_varying;
+} ds4_inkling_model_config;
+
+typedef enum {
+    DS4_INKLING_MODEL_OK = 0,
+    DS4_INKLING_MODEL_INVALID_ARGUMENT,
+    DS4_INKLING_MODEL_UNSUPPORTED_CONFIG,
+    DS4_INKLING_MODEL_INVALID_PATTERN,
+    DS4_INKLING_MODEL_INVALID_NUMERIC,
+} ds4_inkling_model_status;
+
+static inline ds4_inkling_model_status ds4_inkling_model_fail(
+        ds4_inkling_model_status status,
+        char *error,
+        size_t error_capacity,
+        const char *message) {
+    if (error && error_capacity) snprintf(error, error_capacity, "%s", message);
+    return status;
+}
+
+static inline int ds4_inkling_model_near(float actual, float expected) {
+    return isfinite(actual) && fabsf(actual - expected) <=
+        1.0e-5f * fmaxf(1.0f, fabsf(expected));
+}
+
+static inline ds4_inkling_model_status ds4_inkling_model_validate(
+        const ds4_inkling_model_config *config,
+        char *error,
+        size_t error_capacity) {
+    if (error && error_capacity) error[0] = '\0';
+    if (!config) {
+        return ds4_inkling_model_fail(DS4_INKLING_MODEL_INVALID_ARGUMENT,
+                                      error, error_capacity,
+                                      "model configuration is null");
+    }
+    if (config->physical_layers != 24u || config->embedding_dim != 2304u ||
+        config->vocab_padded != 201024u || config->vocab_unpadded != 200058u ||
+        config->head_dim != 128u || config->expert_count != 128u ||
+        config->experts_used != 8u || config->expert_ffn_dim != 1152u ||
+        config->context_length < 8192u || config->context_length > 1048576u ||
+        config->loop_start != 6u || config->loop_end != 18u ||
+        config->loop_passes != 3u || config->gate_rank != 64u ||
+        config->residual_block_size != 6u || config->sliding_window != 1024u ||
+        config->shortconv_cache != 4u || config->relative_dim != 16u ||
+        config->relative_extent != 1024u || config->log_scale_floor != 8192u ||
+        config->loop_varying) {
+        return ds4_inkling_model_fail(DS4_INKLING_MODEL_UNSUPPORTED_CONFIG,
+                                      error, error_capacity,
+                                      "metadata does not match supported Inkling 2 Mini dimensions");
+    }
+    for (uint32_t layer = 0; layer < DS4_INKLING_PHYSICAL_LAYERS; layer++) {
+        if (config->query_heads[layer] != 24u || config->kv_heads[layer] != 8u) {
+            return ds4_inkling_model_fail(DS4_INKLING_MODEL_UNSUPPORTED_CONFIG,
+                                          error, error_capacity,
+                                          "per-layer attention head counts are unsupported");
+        }
+        const uint8_t expected_sliding = (uint8_t)(layer % 6u != 5u);
+        if (config->sliding_window_pattern[layer] > 1u ||
+            config->sliding_window_pattern[layer] != expected_sliding) {
+            return ds4_inkling_model_fail(DS4_INKLING_MODEL_INVALID_PATTERN,
+                                          error, error_capacity,
+                                          "attention schedule must be sliding except layers 5, 11, 17, and 23");
+        }
+    }
+    if (!ds4_inkling_model_near(config->rms_epsilon, 1.0e-6f) ||
+        !ds4_inkling_model_near(config->qk_clip, 22.627416610717773f) ||
+        !ds4_inkling_model_near(config->relative_clip, 8.0f) ||
+        !ds4_inkling_model_near(config->log_scale_alpha, 0.1f) ||
+        !ds4_inkling_model_near(config->expert_weight_scale, 8.0f) ||
+        !ds4_inkling_model_near(config->situ_beta, 4.0f) ||
+        !ds4_inkling_model_near(config->situ_linear_beta, 25.0f) ||
+        !ds4_inkling_model_near(config->final_logit_softcap, 30.0f)) {
+        return ds4_inkling_model_fail(DS4_INKLING_MODEL_INVALID_NUMERIC,
+                                      error, error_capacity,
+                                      "normalization, clipping, routing, or activation metadata is unsupported");
+    }
+    return DS4_INKLING_MODEL_OK;
+}
 
 typedef struct {
     uint32_t physical_layer_count;

@@ -43,6 +43,7 @@
 
 #include "ds4.h"
 #include "ds4_gguf.h"
+#include "ds4_inkling.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -528,6 +529,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_INKLING2 = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -538,6 +540,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_INKLING2 = 7,
 } ds4_variant;
 
 typedef struct {
@@ -878,6 +881,30 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* Text-only Inkling 2 Mini. Repeated loop visits share these 24 physical
+ * layer weights; the separate visit plan owns 48 independent cache slots. */
+static const ds4_shape DS4_SHAPE_INKLING2 = {
+    .name = "Inkling 2 Mini",
+    .family = DS4_MODEL_FAMILY_INKLING2,
+    .variant = DS4_VARIANT_INKLING2,
+    .n_layer = 24,
+    .n_embd = 2304,
+    .n_vocab = 201024,
+    .n_head = 24,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 0,
+    .n_expert = 128,
+    .n_expert_used = 8,
+    .n_ff_exp = 1152,
+    .n_swa = 1024,
+    .n_full_attn_interval = 6,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 8.0f,
+    .rope_orig_ctx = 1048576,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -1009,6 +1036,10 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
 
 static bool ds4_model_is_qwen4(void) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP;
+}
+
+static bool ds4_model_is_inkling2(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_INKLING2;
 }
 
 /* Trunk layers repeat 3 GDN + 1 full attention; the MTP block is attention. */
@@ -4767,6 +4798,57 @@ typedef struct {
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
+enum {
+    DS4_INKLING_CTRL_Q = 0,
+    DS4_INKLING_CTRL_K = 1,
+    DS4_INKLING_CTRL_V = 2,
+    DS4_INKLING_CTRL_FFN = 3,
+    DS4_INKLING_CTRL_COUNT = 4,
+};
+
+typedef struct {
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_output;
+    ds4_tensor *attn_gate;
+    ds4_tensor *attn_q_clip;
+    ds4_tensor *attn_sink_proj;
+    ds4_tensor *attn_rel;
+    ds4_tensor *attn_rel_bias;
+    ds4_tensor *attn_rel_clip;
+    ds4_tensor *attn_k_conv;
+    ds4_tensor *attn_v_conv;
+    ds4_tensor *attn_post_conv;
+    ds4_tensor *ffn_post_conv;
+    ds4_tensor *attn_norm;
+    ds4_tensor *attn_q_inp_norm;
+    ds4_tensor *attn_k_inp_norm;
+    ds4_tensor *attn_v_inp_norm;
+    ds4_tensor *attn_k_conv_proj;
+    ds4_tensor *attn_v_conv_proj;
+    ds4_tensor *attn_res_query;
+    ds4_tensor *ffn_res_query;
+    ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_gate_inp;
+    ds4_tensor *ffn_exp_probs_b;
+    ds4_tensor *ffn_gate_up_exps;
+    ds4_tensor *ffn_down_exps;
+    ds4_tensor *loop_msg_query;
+    ds4_tensor *loop_ctrl_down[DS4_INKLING_CTRL_COUNT];
+    ds4_tensor *loop_ctrl_gain[DS4_INKLING_CTRL_COUNT];
+    ds4_tensor *loop_ctrl_forget[DS4_INKLING_CTRL_COUNT];
+} ds4_inkling_layer_weights;
+
+typedef struct {
+    ds4_tensor *token_embd;
+    ds4_tensor *token_embd_norm;
+    ds4_tensor *output;
+    ds4_tensor *output_norm;
+    ds4_tensor *output_res_query;
+    ds4_inkling_layer_weights layer[DS4_INKLING_PHYSICAL_LAYERS];
+} ds4_inkling_weights;
+
 typedef struct {
     ds4_tensor *e_proj;
     ds4_tensor *h_proj;
@@ -7193,10 +7275,141 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+static ds4_inkling_model_config g_ds4_inkling_model_config;
+
+static bool model_read_u32_array(
+        const ds4_model *m,
+        const char *key,
+        uint32_t *values,
+        uint64_t expected_len) {
+    ds4_array_ref array;
+    if (!model_get_array(m, key, &array) || array.type != GGUF_VALUE_UINT32 ||
+        array.len != expected_len) return false;
+    ds4_cursor cursor = cursor_at(m, array.data_pos);
+    for (uint64_t i = 0; i < expected_len; i++) {
+        if (!cursor_u32(&cursor, &values[i])) return false;
+    }
+    return true;
+}
+
+static bool model_read_bool_array(
+        const ds4_model *m,
+        const char *key,
+        uint8_t *values,
+        uint64_t expected_len) {
+    ds4_array_ref array;
+    if (!model_get_array(m, key, &array) || array.type != GGUF_VALUE_BOOL ||
+        array.len != expected_len) return false;
+    ds4_cursor cursor = cursor_at(m, array.data_pos);
+    for (uint64_t i = 0; i < expected_len; i++) {
+        uint8_t value = 0;
+        if (!cursor_read(&cursor, &value, sizeof(value)) || value > 1u) return false;
+        values[i] = value;
+    }
+    return true;
+}
+
+static void config_validate_inkling2_model(const ds4_model *m) {
+    static const char *const prefix = "inkling2_loop.";
+    ds4_inkling_model_config config = {0};
+    char key[128];
+#define INKLING_KEY(suffix) \
+    (snprintf(key, sizeof(key), "%s%s", prefix, (suffix)), key)
+
+    config.physical_layers = required_u32(m, INKLING_KEY("block_count"));
+    config.embedding_dim = required_u32(m, INKLING_KEY("embedding_length"));
+    config.vocab_padded = required_u32(m, INKLING_KEY("vocab_size"));
+    config.vocab_unpadded = required_u32(m, INKLING_KEY("vocab_size_unpadded"));
+    config.context_length = required_u64_compat(m, INKLING_KEY("context_length"));
+    config.expert_count = required_u32(m, INKLING_KEY("expert_count"));
+    config.experts_used = required_u32(m, INKLING_KEY("expert_used_count"));
+    config.expert_ffn_dim = required_u32(m, INKLING_KEY("expert_feed_forward_length"));
+    config.loop_start = required_u32(m, INKLING_KEY("loop.start"));
+    config.loop_end = required_u32(m, INKLING_KEY("loop.end"));
+    config.loop_passes = required_u32(m, INKLING_KEY("loop.count"));
+    config.gate_rank = required_u32(m, INKLING_KEY("loop.gate_rank"));
+    config.loop_varying = required_bool(m, INKLING_KEY("loop.varying"));
+    config.residual_block_size = required_u32(m, INKLING_KEY("attn_res.block_size"));
+    config.sliding_window = required_u32(m, INKLING_KEY("attention.sliding_window"));
+    config.shortconv_cache = required_u32(m, INKLING_KEY("shortconv.l_cache"));
+    config.relative_dim = required_u32(m, INKLING_KEY("attention.relative_length"));
+    config.relative_extent = required_u32(m, INKLING_KEY("attention.relative_extent"));
+    config.log_scale_floor = required_u32(m, INKLING_KEY("attention.log_scale_floor"));
+    config.rms_epsilon = required_f32(m, INKLING_KEY("attention.layer_norm_rms_epsilon"));
+    config.qk_clip = required_f32(m, INKLING_KEY("attention.qk_clip"));
+    config.relative_clip = required_f32(m, INKLING_KEY("attention.relative_clip"));
+    config.log_scale_alpha = required_f32(m, INKLING_KEY("attention.log_scale_alpha"));
+    config.expert_weight_scale = required_f32(m, INKLING_KEY("expert_weights_scale"));
+    config.situ_beta = required_f32(m, INKLING_KEY("activation.situ_beta"));
+    config.situ_linear_beta = required_f32(m, INKLING_KEY("activation.situ_linear_beta"));
+    config.final_logit_softcap = required_f32(m, INKLING_KEY("final_logit_softcapping"));
+
+    const uint32_t key_dim = required_u32(m, INKLING_KEY("attention.key_length"));
+    const uint32_t value_dim = required_u32(m, INKLING_KEY("attention.value_length"));
+    if (key_dim != value_dim) ds4_die("Inkling2 key and value head dimensions differ");
+    config.head_dim = key_dim;
+    if (required_u32(m, INKLING_KEY("attention.key_length_swa")) != key_dim ||
+        required_u32(m, INKLING_KEY("attention.value_length_swa")) != value_dim ||
+        required_u32(m, INKLING_KEY("feed_forward_length")) != config.expert_ffn_dim ||
+        required_u32(m, INKLING_KEY("rope.dimension_count")) != 0u) {
+        ds4_die("Inkling2 sliding-attention, feed-forward, or rotary dimensions are unsupported");
+    }
+    if (!model_read_u32_array(m, INKLING_KEY("attention.head_count"),
+                              config.query_heads, DS4_INKLING_PHYSICAL_LAYERS) ||
+        !model_read_u32_array(m, INKLING_KEY("attention.head_count_kv"),
+                              config.kv_heads, DS4_INKLING_PHYSICAL_LAYERS) ||
+        !model_read_bool_array(m, INKLING_KEY("attention.sliding_window_pattern"),
+                               config.sliding_window_pattern,
+                               DS4_INKLING_PHYSICAL_LAYERS)) {
+        ds4_die("Inkling2 per-layer head or attention-pattern metadata is invalid");
+    }
+
+    ds4_str tokenizer_pre = {0};
+    if (!model_get_string(m, "tokenizer.ggml.pre", &tokenizer_pre) ||
+        !ds4_streq(tokenizer_pre, "inkling2")) {
+        ds4_die("Inkling2 GGUF requires tokenizer.ggml.pre=inkling2");
+    }
+    ds4_str tokenizer_model = {0};
+    if (!model_get_string(m, "tokenizer.ggml.model", &tokenizer_model) ||
+        !ds4_streq(tokenizer_model, "gpt2") ||
+        required_u32(m, "tokenizer.ggml.eos_token_id") != 200006u ||
+        required_u32(m, "tokenizer.ggml.padding_token_id") != 199999u) {
+        ds4_die("Inkling2 tokenizer model or special-token IDs are unsupported");
+    }
+    ds4_array_ref tokens, merges;
+    if (!model_get_array(m, "tokenizer.ggml.tokens", &tokens) ||
+        tokens.type != GGUF_VALUE_STRING || tokens.len != config.vocab_unpadded ||
+        !model_get_array(m, "tokenizer.ggml.merges", &merges) ||
+        merges.type != GGUF_VALUE_STRING) {
+        ds4_die("Inkling2 tokenizer metadata is missing or inconsistent with the unpadded vocabulary");
+    }
+    if (required_bool(m, "tokenizer.ggml.add_bos_token") ||
+        required_bool(m, "tokenizer.ggml.add_eos_token")) {
+        ds4_die("Inkling2 tokenizer must not add BOS or EOS implicitly");
+    }
+
+    char error[192] = {0};
+    if (ds4_inkling_model_validate(&config, error, sizeof(error)) !=
+        DS4_INKLING_MODEL_OK) {
+        fprintf(stderr, "ds4: unsupported Inkling2 GGUF: %s\n", error);
+        exit(1);
+    }
+    g_ds4_inkling_model_config = config;
+    g_ds4_shape = DS4_SHAPE_INKLING2;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+#undef INKLING_KEY
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
+    memset(&g_ds4_inkling_model_config, 0,
+           sizeof(g_ds4_inkling_model_config));
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
+        if (ds4_streq(arch, "inkling2_loop")) {
+            config_validate_inkling2_model(m);
+            return;
+        }
         if (ds4_streq(arch, "deepseek41")) {
             config_validate_deepseek41_model(m);
             return;
@@ -7996,6 +8209,161 @@ static void weights_bind(
     }
 
     weights_validate_layout(w, start, end, require_token_embd, require_output);
+}
+
+static ds4_tensor *inkling_required_tensor(
+        const ds4_model *m,
+        const char *name,
+        uint32_t type,
+        uint32_t ndim,
+        uint64_t d0,
+        uint64_t d1,
+        uint64_t d2) {
+    ds4_tensor *tensor = model_find_tensor(m, name);
+    if (!tensor) {
+        fprintf(stderr, "ds4: Inkling2 GGUF is missing tensor %s\n", name);
+        exit(1);
+    }
+    tensor_expect_layout(tensor, type, ndim, d0, d1, d2);
+    return tensor;
+}
+
+/* Bind only the 24 physical owners. Repeated loop visits point back to these
+ * tensors; the independent 48-slot cache plan belongs to session state. */
+static void inkling_weights_bind(ds4_inkling_weights *weights,
+                                 const ds4_model *model) {
+    enum {
+        INKLING_HIDDEN = 2304,
+        INKLING_VOCAB_PADDED = 201024,
+        INKLING_QUERY_DIM = 24 * 128,
+        INKLING_KV_DIM = 8 * 128,
+        INKLING_REL_DIM = 24 * 16,
+        INKLING_EXPERTS = 128,
+        INKLING_FFN = 1152,
+        INKLING_GATE_RANK = 64,
+    };
+    static const char *const ctrl_names[DS4_INKLING_CTRL_COUNT] = {
+        "q", "k", "v", "ffn",
+    };
+    char name[128];
+    memset(weights, 0, sizeof(*weights));
+    if (model->n_tensors != 704u) {
+        fprintf(stderr,
+                "ds4: Inkling2 Mini IQ4_NL GGUF has %" PRIu64
+                " tensor descriptors, expected 704\n",
+                model->n_tensors);
+        exit(1);
+    }
+
+    weights->token_embd = inkling_required_tensor(
+        model, "token_embd.weight", DS4_TENSOR_Q8_0, 2,
+        INKLING_HIDDEN, INKLING_VOCAB_PADDED, 0);
+    weights->token_embd_norm = inkling_required_tensor(
+        model, "token_embd_norm.weight", DS4_TENSOR_F32, 1,
+        INKLING_HIDDEN, 0, 0);
+    weights->output = inkling_required_tensor(
+        model, "output.weight", DS4_TENSOR_Q8_0, 2,
+        INKLING_HIDDEN, INKLING_VOCAB_PADDED, 0);
+    weights->output_norm = inkling_required_tensor(
+        model, "output_norm.weight", DS4_TENSOR_F32, 1,
+        INKLING_HIDDEN, 0, 0);
+    weights->output_res_query = inkling_required_tensor(
+        model, "output_res_query.weight", DS4_TENSOR_F32, 1,
+        INKLING_HIDDEN, 0, 0);
+
+    for (uint32_t il = 0; il < DS4_INKLING_PHYSICAL_LAYERS; il++) {
+        ds4_inkling_layer_weights *layer = &weights->layer[il];
+        const bool sliding =
+            g_ds4_inkling_model_config.sliding_window_pattern[il] != 0;
+        const uint32_t expert_type = il < 20u ?
+            DS4_TENSOR_IQ4_NL : DS4_TENSOR_Q8_0;
+#define BIND_INKLING(field, suffix, tensor_type, ndim, d0, d1, d2) do { \
+        snprintf(name, sizeof(name), "blk.%u.%s", il, (suffix)); \
+        layer->field = inkling_required_tensor( \
+            model, name, (tensor_type), (ndim), (d0), (d1), (d2)); \
+    } while (0)
+        BIND_INKLING(attn_q, "attn_q.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_HIDDEN, INKLING_QUERY_DIM, 0);
+        BIND_INKLING(attn_k, "attn_k.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_HIDDEN, INKLING_KV_DIM, 0);
+        BIND_INKLING(attn_v, "attn_v.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_HIDDEN, INKLING_KV_DIM, 0);
+        BIND_INKLING(attn_output, "attn_output.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_QUERY_DIM, INKLING_HIDDEN, 0);
+        BIND_INKLING(attn_gate, "attn_gate.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_HIDDEN, INKLING_QUERY_DIM, 0);
+        BIND_INKLING(attn_q_clip, "attn_q_clip.weight", DS4_TENSOR_F32, 2,
+                     128, 24, 0);
+        BIND_INKLING(attn_sink_proj, "attn_sink_proj.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_HIDDEN, 24, 0);
+        BIND_INKLING(attn_rel, "attn_rel.weight", DS4_TENSOR_Q8_0, 2,
+                     INKLING_HIDDEN, INKLING_REL_DIM, 0);
+        BIND_INKLING(attn_rel_bias, "attn_rel_bias.weight", DS4_TENSOR_F32, 2,
+                     16, 1024, 0);
+        BIND_INKLING(attn_rel_clip, "attn_rel_clip.weight", DS4_TENSOR_F32, 2,
+                     16, 24, 0);
+        BIND_INKLING(attn_k_conv, "attn_k_conv.weight", DS4_TENSOR_F32, 2,
+                     4, INKLING_KV_DIM, 0);
+        BIND_INKLING(attn_v_conv, "attn_v_conv.weight", DS4_TENSOR_F32, 2,
+                     4, INKLING_KV_DIM, 0);
+        BIND_INKLING(attn_post_conv, "attn_post_conv.weight", DS4_TENSOR_F32, 2,
+                     4, INKLING_HIDDEN, 0);
+        BIND_INKLING(ffn_post_conv, "ffn_post_conv.weight", DS4_TENSOR_F32, 2,
+                     4, INKLING_HIDDEN, 0);
+        if (sliding) {
+            BIND_INKLING(attn_norm, "attn_norm.weight", DS4_TENSOR_F32, 1,
+                         INKLING_HIDDEN, 0, 0);
+        } else {
+            BIND_INKLING(attn_q_inp_norm, "attn_q_inp_norm.weight", DS4_TENSOR_F32, 1,
+                         INKLING_HIDDEN, 0, 0);
+            BIND_INKLING(attn_k_inp_norm, "attn_k_inp_norm.weight", DS4_TENSOR_F32, 1,
+                         INKLING_HIDDEN, 0, 0);
+            BIND_INKLING(attn_v_inp_norm, "attn_v_inp_norm.weight", DS4_TENSOR_F32, 1,
+                         INKLING_HIDDEN, 0, 0);
+            BIND_INKLING(attn_k_conv_proj, "attn_k_conv_proj.weight", DS4_TENSOR_Q8_0, 2,
+                         INKLING_HIDDEN, 32, 0);
+            BIND_INKLING(attn_v_conv_proj, "attn_v_conv_proj.weight", DS4_TENSOR_Q8_0, 2,
+                         INKLING_HIDDEN, 32, 0);
+        }
+        if (il != 0) {
+            BIND_INKLING(attn_res_query, "attn_res_query.weight", DS4_TENSOR_F32, 1,
+                         INKLING_HIDDEN, 0, 0);
+        }
+        BIND_INKLING(ffn_res_query, "ffn_res_query.weight", DS4_TENSOR_F32, 1,
+                     INKLING_HIDDEN, 0, 0);
+        BIND_INKLING(ffn_norm, "ffn_norm.weight", DS4_TENSOR_F32, 1,
+                     INKLING_HIDDEN, 0, 0);
+        BIND_INKLING(ffn_gate_inp, "ffn_gate_inp.weight", DS4_TENSOR_F32, 2,
+                     INKLING_HIDDEN, INKLING_EXPERTS, 0);
+        BIND_INKLING(ffn_exp_probs_b, "exp_probs_b.bias", DS4_TENSOR_F32, 1,
+                     INKLING_EXPERTS, 0, 0);
+        BIND_INKLING(ffn_gate_up_exps, "ffn_gate_up_exps.weight", expert_type, 3,
+                     INKLING_HIDDEN, INKLING_HIDDEN, INKLING_EXPERTS);
+        BIND_INKLING(ffn_down_exps, "ffn_down_exps.weight", expert_type, 3,
+                     INKLING_FFN, INKLING_HIDDEN, INKLING_EXPERTS);
+
+        if (il >= DS4_INKLING_LOOP_START && il < DS4_INKLING_LOOP_END) {
+            BIND_INKLING(loop_msg_query, "loop_msg_query.weight", DS4_TENSOR_F32, 2,
+                         INKLING_HIDDEN, 4, 0);
+            for (uint32_t ctrl = 0; ctrl < DS4_INKLING_CTRL_COUNT; ctrl++) {
+                snprintf(name, sizeof(name), "blk.%u.loop_%s_ctrl_down.weight",
+                         il, ctrl_names[ctrl]);
+                layer->loop_ctrl_down[ctrl] = inkling_required_tensor(
+                    model, name, DS4_TENSOR_F32, 2, 4608, INKLING_GATE_RANK, 0);
+                snprintf(name, sizeof(name), "blk.%u.loop_%s_ctrl_gain.weight",
+                         il, ctrl_names[ctrl]);
+                layer->loop_ctrl_gain[ctrl] = inkling_required_tensor(
+                    model, name, DS4_TENSOR_F32, 2, INKLING_GATE_RANK,
+                    INKLING_HIDDEN, 0);
+                snprintf(name, sizeof(name), "blk.%u.loop_%s_ctrl_forget.weight",
+                         il, ctrl_names[ctrl]);
+                layer->loop_ctrl_forget[ctrl] = inkling_required_tensor(
+                    model, name, DS4_TENSOR_F32, 2, INKLING_GATE_RANK,
+                    INKLING_HIDDEN, 0);
+            }
+        }
+#undef BIND_INKLING
+    }
 }
 
 typedef struct {
@@ -44483,6 +44851,8 @@ struct ds4_engine {
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
+    ds4_inkling_weights inkling_weights;
+    ds4_inkling_plan inkling_plan;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
@@ -73836,6 +74206,35 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_inkling2()) {
+        inkling_weights_bind(&e->inkling_weights, &e->model);
+        ds4_inkling_config plan_config = {
+            .physical_layers = g_ds4_inkling_model_config.physical_layers,
+            .loop_start = g_ds4_inkling_model_config.loop_start,
+            .loop_end = g_ds4_inkling_model_config.loop_end,
+            .loop_passes = g_ds4_inkling_model_config.loop_passes,
+            .residual_block_size = g_ds4_inkling_model_config.residual_block_size,
+            .sliding_window_pattern =
+                g_ds4_inkling_model_config.sliding_window_pattern,
+            .pattern_count = DS4_INKLING_PHYSICAL_LAYERS,
+        };
+        if (ds4_inkling_build_plan(&plan_config, &e->inkling_plan) !=
+            DS4_INKLING_PLAN_OK) {
+            fprintf(stderr, "ds4: failed to build the Inkling2 48-visit plan\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (!opt->inspect_only) {
+            fprintf(stderr,
+                    "ds4: Inkling 2 Mini GGUF validated, but its native decoder is not integrated yet\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        *out = e;
+        return 0;
+    }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* V4.1's model views are read-only to the GPU: untracked by default */
     if (e->backend == DS4_BACKEND_METAL)

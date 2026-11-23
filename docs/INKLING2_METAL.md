@@ -7,13 +7,14 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | Milestone | Status | Evidence |
 | --- | --- | --- |
 | M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
-| M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; live GGUF validation remains pending because weights are absent. |
+| M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; the pinned remote GGUF directory was range-checked without reading payload bytes. |
 | M2: native Metal control operators | Complete for isolated no-weight tests | Focused scalar-oracle tests pass on Apple M4; model integration is not part of this milestone. |
 | M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. |
 | M4: attention, convolution, and visit state | Partial, isolated operators | State, decode attention, Q/K preparation, relative bias, and shortconv pass synthetic state/oracle tests on Apple M4; prefill graph and model integration remain open. |
 | M5: routed expert FFN | Partial, isolated Metal operation | Router, top-8 IQ4_NL/Q8_0 expert projections, SiTU, down projection, and routed accumulation pass synthetic scalar-oracle tests; DS4 layer/model wiring remains open. |
 | M6: loop-controller operators | Partial, isolated operators | Learned residual mixing and low-rank control update match scalar references on Apple M4 at hidden 2304/rank 64; model and decoder integration remain open. |
-| M6+: generation, numerical parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
+| M7: native GGUF metadata and weight binding | Complete for sparse synthetic descriptors | DS4 validates the live 704-tensor layout with sparse synthetic payloads, binds 24 physical weight owners, and stores the 48-visit plan; inspect-only is supported. |
+| M8: tokenizer, decoder, generation, and parity | Not complete | Generation is rejected with an explicit diagnostic until tokenizer and native decoder wiring are implemented and validated. |
 
 ## M0 baseline
 
@@ -25,7 +26,7 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 - `./ds4_test --server`: PASS (`server: OK`, `ds4 tests: ok`).
 - `./ds4_test --metal-kernels`: FAIL on the unmodified baseline with 29 assertions. Four compressor pair state-store cases fail at `tests/ds4_test.c:1678` and the associated output comparisons at lines 1754–1758. Four gathered KV staging cases fail kernel selection at line 3315; raw and compressed output comparisons fail at lines 3365–3366. The failure log is preserved locally as `/tmp/ds4-inkling2-metal-baseline.log`; this is baseline evidence, not a result from Inkling code.
 - Metal runtime source compilation and device initialization were reached on the M4 during the kernel suite. The standalone Xcode build tool and `metal` compiler are unavailable, so offline shader compilation is not available.
-- The requested GGUF is not present. `make test` (which requires `ds4flash.gguf`), live GGUF inspection, model inference, numerical comparison against a reference runtime, and throughput/memory benchmarks have not been run. No model weights were downloaded.
+- The requested GGUF is not present locally. On 2026-11-23 the pinned remote file's directory-only byte range (`0..11,977,631`, exactly the GGUF `data_offset`) was parsed to validate metadata and descriptors; the exact range contained no tensor payload. A preliminary broader probe crossed the data offset by about 605 KB before the exact range was established; those bytes were transient in process memory and were not saved. No model file was saved. `make test` (which requires `ds4flash.gguf`), local model inference, numerical comparison against a reference runtime, and throughput/memory benchmarks have not been run.
 
 ## Pinned implementation references
 
@@ -47,13 +48,25 @@ These source revisions were inspected as format and semantic references; DS4 doe
 
 `gguf-tools/inkling2_inspect.py` reads GGUF v3 metadata and tensor descriptors. It validates tensor shapes, canonical byte sizes for the supported F32/F16/Q8_0/IQ4_NL tensor types, alignment, overlap, and file bounds without reading tensor payloads. Use `--summary`, `--tensors`, `--json`, or `--validate-inkling2`; all modes report that payload bytes were not read. The Inkling validator checks the loop metadata, 24-entry attention schedule, 48 logical visits, 156 F32 loop-controller tensors, and the IQ4_NL/Q8_0 expert tensor assignments.
 
-Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descriptors, primitive/array metadata, truncation and size limits, duplicate keys and names, invalid shapes and types, offset alignment/overlap/bounds, quant block sizes, the expected Inkling layout, and payload-free inspection. The live GGUF is absent, so `--validate-inkling2` has not yet been run against model bytes.
+Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descriptors, primitive/array metadata, truncation and size limits, duplicate keys and names, invalid shapes and types, offset alignment/overlap/bounds, quant block sizes, the expected Inkling layout, and payload-free inspection. A pinned remote range parse confirmed `data_offset=11,977,632`, 704 tensors, and counts F32=478/Q8_0=186/IQ4_NL=40; no payload bytes were part of that exact range and no local GGUF is present.
 
 ## 48-visit plan and loader block sizes
 
 `ds4_inkling.h` validates the supported 24-layer metadata and emits the execution order: prelude layers `[0,6)`, core `[6,18)` for three passes, then epilogue `[18,24)`. Each plan entry stores a physical layer index as its shared weight owner and a unique cache slot. Pass 0 uses cache slots 6–17, pass 1 uses 24–35, and pass 2 uses 36–47; prelude and epilogue use their physical indices. The planner validates the supplied attention pattern and rejects changed boundaries, pass counts, residual block size, or layer schedule. It describes the cache ownership needed by the runtime; inference buffers are not yet connected to it.
 
 `ds4_gguf.h` is the shared type-size table used by the mmap loader and the C test. It corrects GGML type 19 IQ1_S to 256 elements / 50 bytes and type 20 IQ4_NL to 32 elements / 18 bytes. The canonical IQ4_NL layout is a 2-byte scale plus 16 packed bytes (`QK4_NL=32`) in the pinned llama.cpp source.
+
+## M7 native metadata validation and tensor binding
+
+`config_validate_inkling2_model` accepts only the pinned text model contract: 24 physical layers, hidden 2304, padded/unpadded vocabulary 201024/200058, 24 query heads and 8 KV heads per layer, loop `[6,18)` for three passes, rank 64, six-layer residual blocks, 1024 sliding window, four-position short convolution, zero rotary dimension, and the recorded numeric parameters. It also checks Inkling's `gpt2` tokenizer metadata, EOS/padding IDs, and no implicit BOS/EOS.
+
+`inkling_weights_bind` requires all 704 descriptors and validates every bound tensor's name, rank, dimensions, and type. The engine stores one array of 24 physical layer weights. Its loop plan contains 48 references to those physical owners with 48 unique cache IDs; it does not copy weights for repeated visits. Full-attention layers bind their Q/K/V norms and Q/K convolution projections, while sliding layers bind their single attention norm. Expert matrices use IQ4_NL in layers 0–19 and Q8_0 in layers 20–23.
+
+`make test-inkling2-gguf` creates a sparse, payload-free 17.6 GB GGUF fixture from the live descriptor inventory, exercises the real mmap parser and metadata validator, checks the complete binder and engine inspect-only path, and verifies rejection of a missing descriptor, wrong tensor type, and wrong shape. This allocates only a sparse file and does not write model payloads. `make test-inkling2-model` checks valid and unsupported architecture metadata independently.
+
+The normal engine-open path currently rejects Inkling after successful binding and plan creation with an explicit “native decoder is not integrated yet” error. It must not fall through to the DeepSeek generic tensor layout. The remaining work is tokenizer/chat-template support, native prefill/decode scheduling, per-session 48-slot state wiring, greedy generation, and same-weight parity.
+
+After M7, `make` and `make cpu` pass, and `./ds4_test --server` passes on the M4 host. `make test-inkling2-model test-inkling2-gguf test-inkling2-mapping test-inkling2-inspect test-inkling2-state test-inkling2-metal` passes. `./ds4_test --metal-kernels` still reports 29 failures; the extracted assertion records are byte-for-byte identical to `/tmp/ds4-inkling2-metal-baseline.log` from M0, with no new or resolved records.
 
 `make test-inkling2-mapping` passes: 48 ordered visits, 48 unique cache slots, 24 physical weight owners, 8 full-attention visits, 40 sliding-window visits, and canonical IQ1_S/IQ4_NL block sizes. The mapping is currently a tested planning primitive, not an end-to-end inference path.
 
