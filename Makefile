@@ -173,10 +173,10 @@ tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h
+tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h ds4_inkling_state.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
-tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o
+tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o ds4_inkling_state.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-inkling2-metal
@@ -192,6 +192,16 @@ speed-bench/inkling2_metal_quant_bench: speed-bench/inkling2_metal_quant_bench.o
 .PHONY: inkling2-metal-quant-bench
 inkling2-metal-quant-bench: speed-bench/inkling2_metal_quant_bench
 	./speed-bench/inkling2_metal_quant_bench
+
+speed-bench/inkling2_metal_m4_bench.o: speed-bench/inkling2_metal_m4_bench.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+speed-bench/inkling2_metal_m4_bench: speed-bench/inkling2_metal_m4_bench.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: inkling2-metal-m4-bench
+inkling2-metal-m4-bench: speed-bench/inkling2_metal_m4_bench
+	./speed-bench/inkling2_metal_m4_bench
 
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
@@ -1553,7 +1563,9 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 clean:
 	rm -f tests/test_inkling2_mapping
 	rm -f tests/test_inkling2_metal
+	rm -f tests/test_inkling2_state
 	rm -f speed-bench/inkling2_metal_quant_bench
+	rm -f speed-bench/inkling2_metal_m4_bench
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_memory tests/test_qwen4_mtp_policy tests/test_qwen4_ssd_experts
@@ -1651,3 +1663,16 @@ tests/test_inkling2_mapping: tests/test_inkling2_mapping.c ds4_inkling.h ds4_ggu
 .PHONY: test-inkling2-mapping
 test-inkling2-mapping: tests/test_inkling2_mapping
 	./tests/test_inkling2_mapping
+
+tests/test_inkling2_state.o: tests/test_inkling2_state.c ds4_inkling.h ds4_inkling_state.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+ds4_inkling_state.o: ds4_inkling_state.c ds4_inkling_state.h ds4_inkling.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_inkling2_state: tests/test_inkling2_state.o ds4_inkling_state.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-inkling2-state
+test-inkling2-state: tests/test_inkling2_state
+	./tests/test_inkling2_state

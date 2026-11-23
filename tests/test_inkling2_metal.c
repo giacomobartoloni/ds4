@@ -2,6 +2,7 @@
 
 #include "ds4_gpu.h"
 
+#include <assert.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -10,6 +11,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "../ds4_inkling_state.h"
+
 bool ds4_log_is_tty(FILE *fp) {
     (void)fp;
     return false;
@@ -17,6 +20,13 @@ bool ds4_log_is_tty(FILE *fp) {
 
 static void *g_synthetic_model_map;
 static uint64_t g_synthetic_model_size;
+static float g_m4_qk_relative_max_error;
+static float g_m4_attention_max_error;
+static float g_m4_full_attention_max_error;
+static float g_m4_gate_max_error;
+static float g_m4_conv_max_error;
+static float g_m4_conv_chunk_max_error;
+static float g_m4_static_conv_max_error;
 
 #define CHECK(cond) do { \
     if (!(cond)) { \
@@ -40,6 +50,14 @@ static ds4_gpu_tensor *upload(const void *src, uint64_t bytes) {
 static int near(float actual, float expected, float tolerance) {
     return isfinite(actual) && isfinite(expected) &&
            fabsf(actual - expected) <= tolerance;
+}
+
+static int near_record(float actual, float expected, float tolerance,
+                       float *max_abs_error) {
+    if (!isfinite(actual) || !isfinite(expected)) return 0;
+    const float error = fabsf(actual - expected);
+    if (error > *max_abs_error) *max_abs_error = error;
+    return error <= tolerance;
 }
 
 static float sigmoid_ref(float x) {
@@ -480,6 +498,317 @@ static int test_expert_accumulation(void) {
     return ok;
 }
 
+static void make_small_plan(ds4_inkling_plan *plan) {
+    uint8_t pattern[DS4_INKLING_PHYSICAL_LAYERS];
+    memset(pattern, 1, sizeof(pattern));
+    pattern[5] = pattern[11] = pattern[17] = pattern[23] = 0;
+    const ds4_inkling_config config = {
+        .physical_layers = DS4_INKLING_PHYSICAL_LAYERS,
+        .loop_start = DS4_INKLING_LOOP_START,
+        .loop_end = DS4_INKLING_LOOP_END,
+        .loop_passes = DS4_INKLING_LOOP_PASSES,
+        .residual_block_size = DS4_INKLING_RESIDUAL_BLOCK,
+        .sliding_window_pattern = pattern,
+        .pattern_count = DS4_INKLING_PHYSICAL_LAYERS,
+    };
+    assert(ds4_inkling_build_plan(&config, plan) == DS4_INKLING_PLAN_OK);
+}
+
+static int test_qk_and_relative_bias(void) {
+    const float input[] = { 3, 4, 0, 0, 0, -2, 1, 0 };
+    const float learned_scale[] = { 2, 1, 1, 1, 1, 0.5f, 1, 1 };
+    const uint64_t positions[] = { 7, 31 };
+    float expected[8], actual[8];
+    if (!ds4_inkling_prepare_qk(expected, input, learned_scale, positions,
+        2, 4, 3.0f, 0.5f, 8.0f, 1)) return 0;
+    ds4_gpu_tensor *tx = upload(input, sizeof(input));
+    ds4_gpu_tensor *ts = upload(learned_scale, sizeof(learned_scale));
+    ds4_gpu_tensor *tp = upload(positions, sizeof(positions));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(actual));
+    int ok = tx && ts && tp && to &&
+        ds4_gpu_inkling2_qk_prepare_tensor(
+            to, tx, ts, tp, 2, 4, 3.0f, 0.5f, 8.0f, 1) &&
+        ds4_gpu_tensor_read(to, 0, actual, sizeof(actual));
+    for (uint32_t i = 0; ok && i < 8; i++) {
+        if (!near_record(actual[i], expected[i], 2e-5f,
+                         &g_m4_qk_relative_max_error)) {
+            fprintf(stderr, "Inkling2 QK prepare mismatch i=%u got=%g expected=%g\n",
+                    i, actual[i], expected[i]);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(ts);
+    ds4_gpu_tensor_free(tp);
+    ds4_gpu_tensor_free(to);
+    if (!ok) return 0;
+
+    const float projected[] = { 1, 2, -1, 0.5f };
+    const float table[] = { 1, 2, 3, -2, 1, 0 };
+    const int64_t distances[] = { 0, 2, 3, -1 };
+    float expected_bias[4], actual_bias[4];
+    if (!ds4_inkling_relative_bias(expected_bias, projected, table, distances,
+                                    1, 2, 2, 3, 2)) return 0;
+    ds4_gpu_tensor *tr = upload(projected, sizeof(projected));
+    ds4_gpu_tensor *tt = upload(table, sizeof(table));
+    ds4_gpu_tensor *td = upload(distances, sizeof(distances));
+    ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(sizeof(actual_bias));
+    ok = tr && tt && td && tb &&
+        ds4_gpu_inkling2_relative_bias_tensor(tb, tr, tt, td, 1, 2, 2, 3, 2) &&
+        ds4_gpu_tensor_read(tb, 0, actual_bias, sizeof(actual_bias));
+    for (uint32_t i = 0; ok && i < 4; i++) {
+        if (!near_record(actual_bias[i], expected_bias[i], 2e-6f,
+                         &g_m4_qk_relative_max_error)) {
+            fprintf(stderr, "Inkling2 relative bias mismatch i=%u\n", i);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tr);
+    ds4_gpu_tensor_free(tt);
+    ds4_gpu_tensor_free(td);
+    ds4_gpu_tensor_free(tb);
+    return ok;
+}
+
+static int test_attention_output_gate(void) {
+    enum { N = 8 };
+    const float attention[N] = { -4.0f, -1.0f, 0.0f, 0.5f, 2.0f, 5.0f, -3.0f, 1.0f };
+    const float gates[N] = { -INFINITY, INFINITY, 0.0f, -0.5f, 0.5f, 100.0f, -100.0f, NAN };
+    float actual[N];
+    ds4_gpu_tensor *ta = upload(attention, sizeof(attention));
+    ds4_gpu_tensor *tg = upload(gates, sizeof(gates));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(actual));
+    int ok = ta && tg && to &&
+        ds4_gpu_inkling2_attention_output_gate_tensor(to, ta, tg, N) &&
+        ds4_gpu_tensor_read(to, 0, actual, sizeof(actual));
+    for (uint32_t i = 0; ok && i < N; i++) {
+        if (isnan(gates[i])) {
+            if (!isnan(actual[i])) ok = 0;
+        } else if (!near_record(actual[i], attention[i] * sigmoid_ref(gates[i]),
+                                2e-6f, &g_m4_gate_max_error)) {
+            fprintf(stderr, "Inkling2 attention gate mismatch i=%u\n", i);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(ta);
+    ds4_gpu_tensor_free(tg);
+    ds4_gpu_tensor_free(to);
+    return ok;
+}
+
+static int test_attention_and_shortconv(void) {
+    ds4_inkling_plan plan;
+    make_small_plan(&plan);
+    const ds4_inkling_state_config config = {
+        .context_capacity = 16,
+        .sliding_window = 4,
+        .kv_width = 4,
+        .conv_width = { 4, 4, 4, 4 },
+    };
+    ds4_inkling_state_session session;
+    if (!ds4_inkling_state_session_init(&session, &plan, &config)) return 0;
+    ds4_inkling_state_slot *slot = &session.slots[0];
+    for (uint32_t pos = 0; pos < 6; pos++) {
+        const uint16_t key[4] = {
+            (uint16_t)(0x3c00u + pos), (uint16_t)(0x3800u + pos),
+            (uint16_t)(0xbc00u + pos), (uint16_t)(0x3400u + pos),
+        };
+        const uint16_t value[4] = {
+            (uint16_t)(0x4000u + pos), (uint16_t)(0xc000u + pos),
+            (uint16_t)(0x3c00u + pos), (uint16_t)(0xbc00u + pos),
+        };
+        if (!ds4_inkling_state_append_kv_fp16(slot, pos, key, value)) {
+            ds4_inkling_state_session_free(&session);
+            return 0;
+        }
+    }
+    enum { QH = 2, KVH = 1, DIM = 4, EXTENT = 4 };
+    const float query[QH * DIM] = { 0.25f, -0.5f, 1.0f, 0.125f,
+                                    -1.0f, 0.25f, 0.5f, 0.75f };
+    const float bias[QH * EXTENT] = { 0.5f, 0, -0.25f, 0.125f,
+                                      -0.5f, 0.25f, 0, 0.375f };
+    const float sink[QH] = { 0.2f, -0.3f };
+    float expected[QH * DIM], actual[QH * DIM];
+    int ok = ds4_inkling_state_attention(slot, query, QH, KVH, DIM, 5,
+        bias, EXTENT, sink, expected);
+    ds4_gpu_tensor *tq = upload(query, sizeof(query));
+    ds4_gpu_tensor *tk = upload(slot->key,
+        (uint64_t)slot->capacity * slot->kv_width * sizeof(uint16_t));
+    ds4_gpu_tensor *tv = upload(slot->value,
+        (uint64_t)slot->capacity * slot->kv_width * sizeof(uint16_t));
+    ds4_gpu_tensor *tb = upload(bias, sizeof(bias));
+    ds4_gpu_tensor *ts = upload(sink, sizeof(sink));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(actual));
+    ok = ok && tq && tk && tv && tb && ts && to &&
+        ds4_gpu_inkling2_attention_decode_tensor(
+            to, tq, tk, tv, tb, ts, QH, KVH, DIM,
+            slot->capacity, slot->count, ds4_inkling_state_oldest_position(slot),
+            5, 4, EXTENT) &&
+        ds4_gpu_tensor_read(to, 0, actual, sizeof(actual));
+    for (uint32_t i = 0; ok && i < QH * DIM; i++) {
+        if (!near_record(actual[i], expected[i], 4e-5f,
+                         &g_m4_attention_max_error)) {
+            fprintf(stderr, "Inkling2 attention mismatch i=%u got=%g expected=%g\n",
+                    i, actual[i], expected[i]);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tq);
+    ds4_gpu_tensor_free(tk);
+    ds4_gpu_tensor_free(tv);
+    ds4_gpu_tensor_free(tb);
+    ds4_gpu_tensor_free(ts);
+    ds4_gpu_tensor_free(to);
+
+    enum { FULL_CAPACITY = 1030, FULL_COUNT = 1025 };
+    uint16_t *global_keys = calloc((size_t)FULL_CAPACITY * 2, sizeof(uint16_t));
+    uint16_t *global_values = malloc((size_t)FULL_CAPACITY * 2 * sizeof(uint16_t));
+    if (!global_keys || !global_values) {
+        free(global_keys);
+        free(global_values);
+        ds4_inkling_state_session_free(&session);
+        return 0;
+    }
+    for (uint32_t i = 0; i < FULL_CAPACITY * 2u; i++) global_values[i] = 0x3c00u;
+    const float global_query[2] = { 0, 0 };
+    const float global_sink[1] = { 0 };
+    float global_actual[2];
+    ds4_gpu_tensor *tgk = upload(global_keys,
+        (uint64_t)FULL_CAPACITY * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *tgv = upload(global_values,
+        (uint64_t)FULL_CAPACITY * 2u * sizeof(uint16_t));
+    ds4_gpu_tensor *tgq = upload(global_query, sizeof(global_query));
+    ds4_gpu_tensor *tgs = upload(global_sink, sizeof(global_sink));
+    ds4_gpu_tensor *tgo = ds4_gpu_tensor_alloc(sizeof(global_actual));
+    const float global_expected = (float)FULL_COUNT / (float)(FULL_COUNT + 1u);
+    ok = ok && tgk && tgv && tgq && tgs && tgo &&
+        ds4_gpu_inkling2_attention_decode_tensor(
+            tgo, tgq, tgk, tgv, NULL, tgs, 1, 1, 2,
+            FULL_CAPACITY, FULL_COUNT, 0, FULL_COUNT - 1u, 0, 0) &&
+        ds4_gpu_tensor_read(tgo, 0, global_actual, sizeof(global_actual));
+    for (uint32_t i = 0; ok && i < 2; i++) {
+        if (!near_record(global_actual[i], global_expected, 2e-6f,
+                         &g_m4_full_attention_max_error)) {
+            fprintf(stderr,
+                    "Inkling2 full attention truncated global cache: got=%g expected=%g\n",
+                    global_actual[i], global_expected);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tgk);
+    ds4_gpu_tensor_free(tgv);
+    ds4_gpu_tensor_free(tgq);
+    ds4_gpu_tensor_free(tgs);
+    ds4_gpu_tensor_free(tgo);
+    free(global_keys);
+    free(global_values);
+
+    enum { TOKENS = 7, CHANNELS = 4, HEADS = 2, KERNEL = 4 };
+    float input[TOKENS * CHANNELS];
+    float static_taps[KERNEL * CHANNELS];
+    float dynamic_taps[TOKENS * HEADS * KERNEL];
+    float expected_conv[TOKENS * CHANNELS], actual_conv[TOKENS * CHANNELS];
+    for (uint32_t i = 0; i < TOKENS * CHANNELS; i++)
+        input[i] = (float)((int)i - 9) / 7.0f;
+    for (uint32_t i = 0; i < KERNEL * CHANNELS; i++)
+        static_taps[i] = (float)((int)(i % 7) - 3) / 9.0f;
+    for (uint32_t i = 0; i < TOKENS * HEADS * KERNEL; i++)
+        dynamic_taps[i] = (float)((int)(i % 5) - 2) / 11.0f;
+    ds4_inkling_state_slot *conv_slot = &session.slots[1];
+    ok = ok && ds4_inkling_state_shortconv(
+        conv_slot, DS4_INKLING_CONV_KEY, input, static_taps, dynamic_taps,
+        expected_conv, TOKENS, CHANNELS, HEADS, KERNEL);
+    ds4_gpu_tensor *tx = upload(input, sizeof(input));
+    ds4_gpu_tensor *tt = upload(static_taps, sizeof(static_taps));
+    ds4_gpu_tensor *td = upload(dynamic_taps, sizeof(dynamic_taps));
+    ds4_gpu_tensor *th = ds4_gpu_tensor_alloc(
+        DS4_INKLING_CONV_HISTORY * CHANNELS * sizeof(float));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(actual_conv));
+    ok = ok && tx && tt && td && th && tout &&
+        ds4_gpu_tensor_fill_f32(th, 1.0f, DS4_INKLING_CONV_HISTORY * CHANNELS) &&
+        ds4_gpu_inkling2_shortconv_tensor(
+            tout, th, tx, tt, td, TOKENS, CHANNELS, HEADS, KERNEL, 0) &&
+        ds4_gpu_tensor_read(tout, 0, actual_conv, sizeof(actual_conv));
+    for (uint32_t i = 0; ok && i < TOKENS * CHANNELS; i++) {
+        if (!near_record(actual_conv[i], expected_conv[i], 3e-5f,
+                         &g_m4_conv_max_error)) {
+            fprintf(stderr, "Inkling2 dynamic shortconv mismatch i=%u got=%g expected=%g\n",
+                    i, actual_conv[i], expected_conv[i]);
+            ok = 0;
+        }
+    }
+
+    ds4_gpu_tensor *tchunk_history = ds4_gpu_tensor_alloc(
+        DS4_INKLING_CONV_HISTORY * CHANNELS * sizeof(float));
+    float chunked_conv[TOKENS * CHANNELS];
+    const uint32_t split[] = { 2, 1, 4 };
+    uint32_t offset = 0;
+    ok = ok && tchunk_history && ds4_gpu_tensor_fill_f32(
+        tchunk_history, 2.0f, DS4_INKLING_CONV_HISTORY * CHANNELS);
+    for (uint32_t part = 0; ok && part < 3; part++) {
+        const uint32_t count = split[part];
+        ds4_gpu_tensor *tpart_x = upload(input + (uint64_t)offset * CHANNELS,
+            (uint64_t)count * CHANNELS * sizeof(float));
+        ds4_gpu_tensor *tpart_dynamic = upload(
+            dynamic_taps + (uint64_t)offset * HEADS * KERNEL,
+            (uint64_t)count * HEADS * KERNEL * sizeof(float));
+        ds4_gpu_tensor *tpart_out = ds4_gpu_tensor_alloc(
+            (uint64_t)count * CHANNELS * sizeof(float));
+        const uint32_t previous_count = offset < 3u ? offset : 3u;
+        ok = tpart_x && tpart_dynamic && tpart_out &&
+            ds4_gpu_inkling2_shortconv_tensor(
+                tpart_out, tchunk_history, tpart_x, tt, tpart_dynamic,
+                count, CHANNELS, HEADS, KERNEL, previous_count) &&
+            ds4_gpu_tensor_read(tpart_out, 0,
+                chunked_conv + (uint64_t)offset * CHANNELS,
+                (uint64_t)count * CHANNELS * sizeof(float));
+        ds4_gpu_tensor_free(tpart_x);
+        ds4_gpu_tensor_free(tpart_dynamic);
+        ds4_gpu_tensor_free(tpart_out);
+        offset += count;
+    }
+    for (uint32_t i = 0; ok && i < TOKENS * CHANNELS; i++) {
+        if (!near_record(chunked_conv[i], actual_conv[i], 3e-5f,
+                         &g_m4_conv_chunk_max_error)) {
+            fprintf(stderr, "Inkling2 Metal conv chunk mismatch i=%u\n", i);
+            ok = 0;
+        }
+    }
+
+    float expected_static[TOKENS * CHANNELS], actual_static[TOKENS * CHANNELS];
+    ok = ok && ds4_inkling_state_reset(conv_slot) &&
+        ds4_inkling_state_shortconv(
+            conv_slot, DS4_INKLING_CONV_KEY, input, static_taps, NULL,
+            expected_static, TOKENS, CHANNELS, 1, KERNEL);
+    ds4_gpu_tensor *tstatic_history = ds4_gpu_tensor_alloc(
+        DS4_INKLING_CONV_HISTORY * CHANNELS * sizeof(float));
+    ds4_gpu_tensor *tstatic_out = ds4_gpu_tensor_alloc(sizeof(actual_static));
+    ok = ok && tstatic_history && tstatic_out &&
+        ds4_gpu_tensor_fill_f32(tstatic_history, -3.0f,
+                                DS4_INKLING_CONV_HISTORY * CHANNELS) &&
+        ds4_gpu_inkling2_shortconv_tensor(
+            tstatic_out, tstatic_history, tx, tt, NULL, TOKENS, CHANNELS, 1,
+            KERNEL, 0) &&
+        ds4_gpu_tensor_read(tstatic_out, 0, actual_static, sizeof(actual_static));
+    for (uint32_t i = 0; ok && i < TOKENS * CHANNELS; i++) {
+        if (!near_record(actual_static[i], expected_static[i], 3e-5f,
+                         &g_m4_static_conv_max_error)) {
+            fprintf(stderr, "Inkling2 static shortconv mismatch i=%u\n", i);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tt);
+    ds4_gpu_tensor_free(td);
+    ds4_gpu_tensor_free(th);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tchunk_history);
+    ds4_gpu_tensor_free(tstatic_history);
+    ds4_gpu_tensor_free(tstatic_out);
+    ds4_inkling_state_session_free(&session);
+    return ok;
+}
+
 int main(void) {
     int ok = 1;
     if (!ds4_gpu_init()) {
@@ -493,6 +822,17 @@ int main(void) {
     CHECK(test_router_topk());
     CHECK(test_quantized_matvec());
     CHECK(test_expert_accumulation());
+    CHECK(test_qk_and_relative_bias());
+    CHECK(test_attention_output_gate());
+    CHECK(test_attention_and_shortconv());
+    fprintf(stderr,
+            "Inkling2 M4 max absolute error: QK/relative %.8g, attention %.8g, "
+            "full-1025 %.8g, gate %.8g, dynamic-conv %.8g, chunk-delta %.8g, "
+            "static-conv %.8g\n",
+            g_m4_qk_relative_max_error, g_m4_attention_max_error,
+            g_m4_full_attention_max_error, g_m4_gate_max_error,
+            g_m4_conv_max_error, g_m4_conv_chunk_max_error,
+            g_m4_static_conv_max_error);
     fprintf(stderr, "Inkling2 Metal operators: ok\n");
 cleanup:
     ds4_gpu_cleanup();

@@ -23325,6 +23325,52 @@ typedef struct {
     uint32_t pad;
 } ds4_gpu_inkling2_iq4_nl_args;
 
+typedef struct {
+    uint32_t rows;
+    uint32_t width;
+    float threshold;
+    float log_scale_alpha;
+    float log_scale_floor;
+    uint32_t apply_log_scale;
+    uint32_t pad0;
+    uint32_t pad1;
+} ds4_gpu_inkling2_qk_args;
+
+typedef struct {
+    uint32_t rows;
+    uint32_t heads;
+    uint32_t relative_dim;
+    uint32_t relative_extent;
+    uint32_t keys;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+} ds4_gpu_inkling2_relative_bias_args;
+
+typedef struct {
+    uint32_t query_heads;
+    uint32_t kv_heads;
+    uint32_t head_dim;
+    uint32_t capacity;
+    uint32_t count;
+    uint32_t sliding_window;
+    uint32_t relative_extent;
+    uint32_t has_sink;
+    uint64_t oldest_position;
+    uint64_t query_position;
+} ds4_gpu_inkling2_attention_args;
+
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t n_channels;
+    uint32_t n_heads;
+    uint32_t kernel_size;
+    uint32_t history_count;
+    uint32_t has_dynamic_taps;
+    uint32_t pad0;
+    uint32_t pad1;
+} ds4_gpu_inkling2_shortconv_args;
+
 static int ds4_gpu_inkling2_tensor_fits(
         const ds4_gpu_tensor *tensor, uint64_t bytes, const char *name) {
     if (!ds4_gpu_tensor_buffer(tensor) || ds4_gpu_tensor_bytes(tensor) < bytes) {
@@ -23612,6 +23658,331 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned,
                                           "Inkling2 expert accumulation")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_qk_prepare_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *learned_scale,
+        const ds4_gpu_tensor *positions,
+        uint32_t                rows,
+        uint32_t                width,
+        float                   threshold,
+        float                   log_scale_alpha,
+        float                   log_scale_floor,
+        int                     apply_log_scale) {
+    if ((!g_initialized && !ds4_gpu_init()) || rows == 0 || width == 0 ||
+        !isfinite(threshold) || threshold <= 0.0f ||
+        !isfinite(log_scale_alpha) ||
+        (apply_log_scale &&
+         (!isfinite(log_scale_floor) || log_scale_floor <= 0.0f))) return 0;
+    const uint64_t elements = (uint64_t)rows * width;
+    if (elements > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t bytes = elements * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, bytes, "QK output") ||
+        !ds4_gpu_inkling2_tensor_fits(x, bytes, "QK input") ||
+        !ds4_gpu_inkling2_tensor_fits(learned_scale, bytes, "QK learned scale") ||
+        !ds4_gpu_inkling2_tensor_fits(positions,
+                                      (uint64_t)rows * sizeof(uint64_t),
+                                      "QK positions")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_qk_prepare");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_qk_args args = {
+            .rows = rows,
+            .width = width,
+            .threshold = threshold,
+            .log_scale_alpha = log_scale_alpha,
+            .log_scale_floor = log_scale_floor,
+            .apply_log_scale = apply_log_scale != 0,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(learned_scale)
+                offset:ds4_gpu_tensor_offset(learned_scale) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(positions)
+                offset:ds4_gpu_tensor_offset(positions) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 QK prepare")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_relative_bias_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *relative_states,
+        const ds4_gpu_tensor *projection,
+        const ds4_gpu_tensor *relative_distances,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                relative_dim,
+        uint32_t                relative_extent,
+        uint32_t                keys) {
+    if ((!g_initialized && !ds4_gpu_init()) || rows == 0 || heads == 0 ||
+        relative_dim == 0 || relative_extent == 0 || keys == 0) return 0;
+    const uint64_t query_heads = (uint64_t)rows * heads;
+    if (query_heads > UINT64_MAX / relative_dim ||
+        query_heads * relative_dim > UINT64_MAX / sizeof(float) ||
+        (uint64_t)relative_dim * relative_extent > UINT64_MAX / sizeof(float) ||
+        query_heads > UINT64_MAX / keys ||
+        query_heads * keys > UINT64_MAX / sizeof(float) ||
+        (uint64_t)rows * keys > UINT64_MAX / sizeof(int64_t)) return 0;
+    const uint64_t state_bytes = query_heads * relative_dim * sizeof(float);
+    const uint64_t projection_bytes =
+        (uint64_t)relative_dim * relative_extent * sizeof(float);
+    const uint64_t distance_bytes = (uint64_t)rows * keys * sizeof(int64_t);
+    const uint64_t output_bytes = query_heads * keys * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, output_bytes, "relative bias output") ||
+        !ds4_gpu_inkling2_tensor_fits(relative_states, state_bytes,
+                                      "relative states") ||
+        !ds4_gpu_inkling2_tensor_fits(projection, projection_bytes,
+                                      "relative projection") ||
+        !ds4_gpu_inkling2_tensor_fits(relative_distances, distance_bytes,
+                                      "relative distances")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_relative_bias");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_relative_bias_args args = {
+            .rows = rows,
+            .heads = heads,
+            .relative_dim = relative_dim,
+            .relative_extent = relative_extent,
+            .keys = keys,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(relative_states)
+                offset:ds4_gpu_tensor_offset(relative_states) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(projection)
+                offset:ds4_gpu_tensor_offset(projection) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(relative_distances)
+                offset:ds4_gpu_tensor_offset(relative_distances) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        const uint64_t count = query_heads * keys;
+        const NSUInteger groups = (NSUInteger)((count + 255u) / 256u);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                           "Inkling2 relative bias")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_attention_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache_fp16,
+        const ds4_gpu_tensor *value_cache_fp16,
+        const ds4_gpu_tensor *relative_bias,
+        const ds4_gpu_tensor *sink_logits,
+        uint32_t                query_heads,
+        uint32_t                kv_heads,
+        uint32_t                head_dim,
+        uint32_t                capacity,
+        uint32_t                count,
+        uint64_t                oldest_position,
+        uint64_t                query_position,
+        uint32_t                sliding_window,
+        uint32_t                relative_extent) {
+    if ((!g_initialized && !ds4_gpu_init()) || query_heads == 0 || kv_heads == 0 ||
+        head_dim == 0 || query_heads % kv_heads != 0 || capacity == 0 ||
+        count > capacity || query_position == UINT64_MAX ||
+        oldest_position > UINT64_MAX - count ||
+        (uint64_t)query_heads * head_dim > UINT64_MAX / sizeof(float) ||
+        (relative_extent != 0 &&
+         (uint64_t)query_heads * relative_extent > UINT64_MAX / sizeof(float))) return 0;
+    const uint64_t kv_rows = (uint64_t)capacity * kv_heads;
+    if (kv_rows > UINT64_MAX / head_dim ||
+        kv_rows * head_dim > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t query_bytes = (uint64_t)query_heads * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)capacity * kv_heads * head_dim * sizeof(uint16_t);
+    const uint64_t output_bytes = query_bytes;
+    if (!ds4_gpu_inkling2_tensor_fits(out, output_bytes, "attention output") ||
+        !ds4_gpu_inkling2_tensor_fits(query, query_bytes, "attention query") ||
+        !ds4_gpu_inkling2_tensor_fits(key_cache_fp16, kv_bytes, "attention keys") ||
+        !ds4_gpu_inkling2_tensor_fits(value_cache_fp16, kv_bytes, "attention values") ||
+        (relative_extent != 0 &&
+         !ds4_gpu_inkling2_tensor_fits(relative_bias,
+             (uint64_t)query_heads * relative_extent * sizeof(float),
+             "attention relative bias")) ||
+        (sink_logits && !ds4_gpu_inkling2_tensor_fits(
+            sink_logits, (uint64_t)query_heads * sizeof(float), "attention sinks"))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_attention_decode");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_attention_args args = {
+            .query_heads = query_heads,
+            .kv_heads = kv_heads,
+            .head_dim = head_dim,
+            .capacity = capacity,
+            .count = count,
+            .sliding_window = sliding_window,
+            .relative_extent = relative_extent,
+            .has_sink = sink_logits != NULL,
+            .oldest_position = oldest_position,
+            .query_position = query_position,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(query)
+                offset:ds4_gpu_tensor_offset(query) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(key_cache_fp16)
+                offset:ds4_gpu_tensor_offset(key_cache_fp16) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(value_cache_fp16)
+                offset:ds4_gpu_tensor_offset(value_cache_fp16) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(relative_bias)
+                offset:ds4_gpu_tensor_offset(relative_bias) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(sink_logits)
+                offset:ds4_gpu_tensor_offset(sink_logits) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(query_heads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                           "Inkling2 attention decode")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_attention_output_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *attention,
+        const ds4_gpu_tensor *gate_logits,
+        uint32_t                count) {
+    if ((!g_initialized && !ds4_gpu_init()) || count == 0) return 0;
+    const uint64_t bytes = (uint64_t)count * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, bytes, "attention gate output") ||
+        !ds4_gpu_inkling2_tensor_fits(attention, bytes, "attention values") ||
+        !ds4_gpu_inkling2_tensor_fits(gate_logits, bytes, "attention gate")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_attention_output_gate");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_args args = { .count = count };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(attention)
+                offset:ds4_gpu_tensor_offset(attention) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gate_logits)
+                offset:ds4_gpu_tensor_offset(gate_logits) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        const NSUInteger groups = (NSUInteger)(((uint64_t)count + 255u) / 256u);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                           "Inkling2 attention output gate")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_shortconv_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *history,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *static_taps,
+        const ds4_gpu_tensor *dynamic_taps,
+        uint32_t                n_tokens,
+        uint32_t                n_channels,
+        uint32_t                n_heads,
+        uint32_t                kernel_size,
+        uint32_t                history_count) {
+    const uint64_t dynamic_rows = (uint64_t)n_tokens * n_heads;
+    if ((!g_initialized && !ds4_gpu_init()) || n_tokens == 0 || n_channels == 0 ||
+        n_heads == 0 || n_channels % n_heads != 0 || kernel_size == 0 ||
+        kernel_size > 4u || history_count > 3u ||
+        (uint64_t)n_tokens * n_channels > UINT64_MAX / sizeof(float) ||
+        (uint64_t)n_channels * kernel_size > UINT64_MAX / sizeof(float) ||
+        (dynamic_taps && (dynamic_rows > UINT64_MAX / kernel_size ||
+         dynamic_rows * kernel_size > UINT64_MAX / sizeof(float)))) return 0;
+    const uint64_t output_bytes = (uint64_t)n_tokens * n_channels * sizeof(float);
+    const uint64_t history_bytes = 3u * (uint64_t)n_channels * sizeof(float);
+    const uint64_t tap_bytes = (uint64_t)n_channels * kernel_size * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, output_bytes, "shortconv output") ||
+        !ds4_gpu_inkling2_tensor_fits(history, history_bytes, "shortconv history") ||
+        !ds4_gpu_inkling2_tensor_fits(x, output_bytes, "shortconv input") ||
+        !ds4_gpu_inkling2_tensor_fits(static_taps, tap_bytes, "shortconv taps") ||
+        (dynamic_taps && !ds4_gpu_inkling2_tensor_fits(dynamic_taps,
+            dynamic_rows * kernel_size * sizeof(float),
+            "shortconv dynamic taps"))) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_shortconv");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_shortconv_args args = {
+            .n_tokens = n_tokens,
+            .n_channels = n_channels,
+            .n_heads = n_heads,
+            .kernel_size = kernel_size,
+            .history_count = history_count,
+            .has_dynamic_taps = dynamic_taps != NULL,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(static_taps)
+                offset:ds4_gpu_tensor_offset(static_taps) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(dynamic_taps)
+                offset:ds4_gpu_tensor_offset(dynamic_taps) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(history)
+                offset:ds4_gpu_tensor_offset(history) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:5];
+        const NSUInteger groups = (NSUInteger)(((uint64_t)n_channels + 127u) / 128u);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                           "Inkling2 causal shortconv")) return 0;
     }
     return 1;
 }

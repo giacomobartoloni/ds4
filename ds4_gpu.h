@@ -1316,6 +1316,66 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                out_dim,
         uint32_t                n_used);
+
+/* M4 decode operators. KV rows use interleaved FP16 [token][kv_head][dim]. */
+int ds4_gpu_inkling2_qk_prepare_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *learned_scale,
+        const ds4_gpu_tensor *positions,
+        uint32_t                rows,
+        uint32_t                width,
+        float                   threshold,
+        float                   log_scale_alpha,
+        float                   log_scale_floor,
+        int                     apply_log_scale);
+
+int ds4_gpu_inkling2_relative_bias_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *relative_states,
+        const ds4_gpu_tensor *projection,
+        const ds4_gpu_tensor *relative_distances,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                relative_dim,
+        uint32_t                relative_extent,
+        uint32_t                keys);
+
+int ds4_gpu_inkling2_attention_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache_fp16,
+        const ds4_gpu_tensor *value_cache_fp16,
+        const ds4_gpu_tensor *relative_bias,
+        const ds4_gpu_tensor *sink_logits,
+        uint32_t                query_heads,
+        uint32_t                kv_heads,
+        uint32_t                head_dim,
+        uint32_t                capacity,
+        uint32_t                count,
+        uint64_t                oldest_position,
+        uint64_t                query_position,
+        uint32_t                sliding_window,
+        uint32_t                relative_extent);
+
+int ds4_gpu_inkling2_attention_output_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *attention,
+        const ds4_gpu_tensor *gate_logits,
+        uint32_t                count);
+
+/* `history` is in-place, chronological [K-1][channel] FP32. */
+int ds4_gpu_inkling2_shortconv_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *history,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *static_taps,
+        const ds4_gpu_tensor *dynamic_taps,
+        uint32_t                n_tokens,
+        uint32_t                n_channels,
+        uint32_t                n_heads,
+        uint32_t                kernel_size,
+        uint32_t                history_count);
 #endif
 
 int ds4_gpu_rms_norm_weight_bf16_tensor(

@@ -10,7 +10,8 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; live GGUF validation remains pending because weights are absent. |
 | M2: native Metal control operators | Complete for isolated no-weight tests | Focused scalar-oracle tests pass on Apple M4; model integration is not part of this milestone. |
 | M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. The expert FFN is not yet integrated. |
-| M3+: full expert FFN, attention/state, generation, parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
+| M4: attention, convolution, and visit state | Partial, isolated operators | State, decode attention, Q/K preparation, relative bias, and shortconv pass synthetic state/oracle tests on Apple M4; prefill graph and model integration remain open. |
+| M5+: loop, generation, numerical parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
 
 ## M0 baseline
 
@@ -80,3 +81,28 @@ The extended `make test-inkling2-metal` fixture checks 96-element inputs and fiv
 The standalone `make inkling2-metal-quant-bench` was run on synthetic 1152 × 2304 matrices with three warmups and three serial runs of ten synchronous calls each. IQ4_NL took 537.6, 574.7, and 596.7 µs/op; reused Q8_0 took 331.5, 294.7, and 278.8 µs/op. These timings include DS4 dispatch and synchronization, use synthetic weights, and are not model throughput results.
 
 After M3, `./ds4_test --metal-kernels` still reports the same 29 assertion records as M0; comparison found no new or resolved records. The model is absent, so no real checkpoint block, MoE output, full-model memory, or text-generation parity has been measured.
+
+## M4 isolated attention, convolution, and visit state
+
+`ds4_inkling_state.h` and `ds4_inkling_state.c` allocate one independent state slot for each planner cache id. The session derives each slot's type from the visit plan: sliding slots keep a 1024-row ring and full-attention slots keep the configured context capacity (8192 for the initial model path). Keys and values are stored as raw FP16 bits in `[position % capacity][kv_head][head_dim]` order. The session also owns separate length-three histories for key, value, attention output, and FFN output for every visit.
+
+The state API rejects non-sequential appends and malformed visit maps. A transaction backs up only KV ring rows touched by its writes and snapshots the four short-convolution histories; rollback restores overwritten ring contents and positions, while commit retains the update. Deep clone copies the full cache and convolution histories into an independently allocated compatible slot, which supports reuse of a completed prefix state. `ds4_inkling_state_conv_export_history` converts the internal rolling history to the chronological, zero-padded layout consumed by the Metal short-convolution kernel.
+
+The scalar C operators provide the comparison path for per-head learned scaling, Q/K L2 clipping, optional full-attention log scaling, projected relative-distance bias, causal attention with GQA and a zero-value attention sink, and static or input-dependent short convolution. The dynamic tap layout follows the reference: lag zero is the current token, static weights are `[kernel][channel]`, and dynamic weights are `[token][head][kernel]`. Sliding decode uses the local window; full decode walks every retained absolute position, including positions beyond 1024.
+
+`metal/inkling2.metal` and `ds4_gpu_inkling2_*_tensor` add matching GPU operators for Q/K preparation, relative-bias projection, sliding/full decode attention, sigmoid attention output gating, and static/dynamic causal short convolution. Q/K preparation and attention keep FP32 accumulations; K/V remain FP16. Decode attention assigns a 128-lane threadgroup to each query head, reduces Q·K over head dimensions, and uses an online softmax so it does not materialize a score row. Causal shortconv currently assigns one lane to each channel and walks the token chunk serially.
+
+`make test-inkling2-state` and `make test-inkling2-metal` pass on Apple M4. The state test checks independent pass-0/pass-1/pass-2 cache slots for the same physical layer, rejects malformed visit plans, checks local ring wrap, full-cache retention, commit/rollback including overwritten rows, reset, deep prefix clone, chronological convolution history, chunked versus monolithic static/dynamic convolution, Q/K scale-clip-log order, relative-distance masking, and full attention through position 1024. The Metal test compares Q/K preparation, relative bias, attention with sink and a wrapped sliding cache, full attention over 1025 keys, sigmoid output gating edge values, and static/dynamic convolution to scalar C references. GPU convolution chunk calls of lengths 2, 1, and 4 match one seven-token call, including nonzero stale history supplied with a zero history count.
+
+The M4 Metal test reported maximum absolute errors of `0` for QK preparation/relative bias, `2.3841858e-07` for sliding attention with relative bias and sink, `0` for 1025-key full attention, `1.1350518e-43` for the tested attention-gate values, and `0` for dynamic convolution, chunked convolution delta, and static convolution. These are synthetic operator fixtures, not full-model parity.
+
+The synthetic `make inkling2-metal-m4-bench` benchmark was run before and after changing attention from one serial lane per query head to the 128-lane online-softmax kernel. It uses 24 query heads, 8 KV heads × 128 dimensions, 2 warmups, and three serial runs of three synchronous operations per row on Apple M4. Keys and values are synthetic; these are operator timings with dispatch/synchronization, not model throughput.
+
+| Decode cache | Before: ms/op, three runs | After: ms/op, three runs |
+| --- | --- | --- |
+| SWA, 1024 retained rows | 29.162 / 29.354 / 29.299 | 3.161 / 2.789 / 2.608 |
+| Full attention, 8192 rows | 228.665 / 235.979 / 230.192 | 13.922 / 13.664 / 13.926 |
+
+The optimized kernel passed the same scalar-oracle test suite before the after-run benchmark. This result only characterizes the attention operator and does not predict end-to-end Inkling tokens per second.
+
+This milestone is still partial: DS4 does not yet schedule these operators as an Inkling decoder layer. Batched causal attention prefill, Q/K/V and gate/sink/relative projections, post-attention/post-FFN graph wiring, expert FFN, loop controller, tokenizer/template path, and same-GGUF parity remain open. No GGUF was present, so no real-model output or model throughput claim is made.
