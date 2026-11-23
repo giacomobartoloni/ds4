@@ -35,6 +35,24 @@ struct ds4_metal_args_inkling2_situ {
     float linear_beta;
 };
 
+struct ds4_metal_args_inkling2_mix {
+    uint32_t hidden_dim;
+    uint32_t state_count;
+    uint32_t query_count;
+    float epsilon;
+};
+
+struct ds4_metal_args_inkling2_control_norm {
+    uint32_t hidden_dim;
+    float epsilon;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+struct ds4_metal_args_inkling2_control_update {
+    uint32_t hidden_dim;
+};
+
 struct ds4_metal_args_inkling2_qk {
     uint32_t rows;
     uint32_t width;
@@ -294,6 +312,126 @@ static inline float inkling2_tanh_saturating(float value) {
     if (value >= 10.0f) return 1.0f;
     if (value <= -10.0f) return -1.0f;
     return tanh(value);
+}
+
+/* RMS-normalize the residual bank, score each state against one learned query,
+ * then return its softmax-weighted normalized state. One group handles a query. */
+kernel void kernel_inkling2_mix(
+        constant ds4_metal_args_inkling2_mix &args [[buffer(0)]],
+        device const float *states [[buffer(1)]],
+        device const float *queries [[buffer(2)]],
+        device float *out [[buffer(3)]],
+        threadgroup float *partial [[threadgroup(0)]],
+        threadgroup float *inverse_norm [[threadgroup(1)]],
+        threadgroup float *scores [[threadgroup(2)]],
+        threadgroup float *mix_weights [[threadgroup(3)]],
+        uint query [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    if (query >= args.query_count) return;
+    const ulong query_offset = (ulong)query * args.hidden_dim;
+    const float score_scale = rsqrt(float(args.hidden_dim));
+    for (uint state = 0; state < args.state_count; state++) {
+        const ulong state_offset = (ulong)state * args.hidden_dim;
+        float sum_sq = 0.0f;
+        for (uint col = lane; col < args.hidden_dim; col += lanes) {
+            const float value = states[state_offset + col];
+            sum_sq += value * value;
+        }
+        partial[lane] = sum_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0u) {
+            inverse_norm[state] = rsqrt(partial[0] / float(args.hidden_dim) + args.epsilon);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float dot = 0.0f;
+        for (uint col = lane; col < args.hidden_dim; col += lanes) {
+            dot += states[state_offset + col] * inverse_norm[state] *
+                   queries[query_offset + col];
+        }
+        partial[lane] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0u) scores[state] = partial[0] * score_scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        float max_score = -INFINITY;
+        for (uint state = 0; state < args.state_count; state++)
+            max_score = max(max_score, scores[state]);
+        float denominator = 0.0f;
+        for (uint state = 0; state < args.state_count; state++) {
+            mix_weights[state] = exp(scores[state] - max_score);
+            denominator += mix_weights[state];
+        }
+        const float inverse_denominator = 1.0f / denominator;
+        for (uint state = 0; state < args.state_count; state++)
+            mix_weights[state] *= inverse_denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint col = lane; col < args.hidden_dim; col += lanes) {
+        float value = 0.0f;
+        for (uint state = 0; state < args.state_count; state++) {
+            value += mix_weights[state] * inverse_norm[state] *
+                     states[(ulong)state * args.hidden_dim + col];
+        }
+        out[query_offset + col] = value;
+    }
+}
+
+/* Normalize current and message independently into consecutive rows. */
+kernel void kernel_inkling2_control_prepare(
+        constant ds4_metal_args_inkling2_control_norm &args [[buffer(0)]],
+        device const float *current [[buffer(1)]],
+        device const float *message [[buffer(2)]],
+        device float *out [[buffer(3)]],
+        threadgroup float *partial [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    if (row >= 2u) return;
+    device const float *input = row == 0u ? current : message;
+    float sum_sq = 0.0f;
+    for (uint col = lane; col < args.hidden_dim; col += lanes) {
+        const float value = input[col];
+        sum_sq += value * value;
+    }
+    partial[lane] = sum_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse_norm = rsqrt(partial[0] / float(args.hidden_dim) + args.epsilon);
+    const ulong offset = (ulong)row * args.hidden_dim;
+    for (uint col = lane; col < args.hidden_dim; col += lanes)
+        out[offset + col] = input[col] * inverse_norm;
+}
+
+/* Inkling loop update uses tanh-projected gain and forget values. */
+kernel void kernel_inkling2_control_update(
+        constant ds4_metal_args_inkling2_control_update &args [[buffer(0)]],
+        device const float *current [[buffer(1)]],
+        device const float *message [[buffer(2)]],
+        device const float *gain [[buffer(3)]],
+        device const float *forget [[buffer(4)]],
+        device float *out [[buffer(5)]],
+        uint index [[thread_position_in_grid]]) {
+    if (index >= args.hidden_dim) return;
+    const float gain_gate = inkling2_tanh_saturating(gain[index]);
+    const float forget_gate = inkling2_tanh_saturating(forget[index]);
+    out[index] = current[index] - forget_gate * current[index] +
+                 gain_gate * message[index];
 }
 
 kernel void kernel_inkling2_situ(

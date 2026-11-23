@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "../ds4_inkling_moe.h"
+#include "../ds4_inkling_loop.h"
 #include "../ds4_inkling_state.h"
 
 bool ds4_log_is_tty(FILE *fp) {
@@ -23,6 +24,7 @@ static void *g_synthetic_model_map;
 static uint64_t g_synthetic_model_size;
 static void *g_synthetic_moe_map;
 static uint64_t g_synthetic_moe_size;
+static void *g_synthetic_loop_map;
 static float g_m4_qk_relative_max_error;
 static float g_m4_attention_max_error;
 static float g_m4_full_attention_max_error;
@@ -845,6 +847,122 @@ static int test_situ_moe_metal(void) {
     return ok;
 }
 
+static int test_loop_mix_and_control_metal(void) {
+    enum { HIDDEN = 2304, STATES = 5, QUERIES = 4, RANK = 64 };
+    const uint64_t down_offset = 64u;
+    const uint64_t down_bytes = (uint64_t)RANK * 2u * HIDDEN * sizeof(float);
+    const uint64_t gain_offset = align_up_u64(down_offset + down_bytes, 64u);
+    const uint64_t gain_bytes = (uint64_t)HIDDEN * RANK * sizeof(float);
+    const uint64_t forget_offset = align_up_u64(gain_offset + gain_bytes, 64u);
+    const uint64_t forget_bytes = gain_bytes;
+    const uint64_t model_size = forget_offset + forget_bytes + 64u;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || model_size > SIZE_MAX) return 0;
+    const uint64_t allocation = align_up_u64(model_size, (uint64_t)page);
+    if (posix_memalign(&g_synthetic_loop_map, (size_t)page,
+                       (size_t)allocation) != 0) return 0;
+    memset(g_synthetic_loop_map, 0, (size_t)allocation);
+
+    uint8_t *map = g_synthetic_loop_map;
+    float *down = (float *)(void *)(map + down_offset);
+    float *gain = (float *)(void *)(map + gain_offset);
+    float *forget = (float *)(void *)(map + forget_offset);
+    for (uint32_t row = 0; row < RANK; row++) {
+        for (uint32_t col = 0; col < 2u * HIDDEN; col++) {
+            down[(uint64_t)row * 2u * HIDDEN + col] =
+                (float)((int32_t)((row * 7u + col * 3u) % 31u) - 15) / 256.0f;
+        }
+    }
+    for (uint32_t row = 0; row < HIDDEN; row++) {
+        for (uint32_t col = 0; col < RANK; col++) {
+            gain[(uint64_t)row * RANK + col] =
+                (float)((int32_t)((row * 5u + col * 11u) % 29u) - 14) / 64.0f;
+            forget[(uint64_t)row * RANK + col] =
+                (float)((int32_t)((row * 13u + col * 3u) % 27u) - 13) / 72.0f;
+        }
+    }
+    if (!ds4_gpu_set_model_map(g_synthetic_loop_map, model_size)) {
+        fprintf(stderr, "Inkling2 loop synthetic model map registration failed\n");
+        return 0;
+    }
+
+    float states[STATES * HIDDEN], queries[QUERIES * HIDDEN];
+    float expected_mix[QUERIES * HIDDEN], actual_mix[QUERIES * HIDDEN];
+    for (uint32_t state = 0; state < STATES; state++) {
+        for (uint32_t i = 0; i < HIDDEN; i++) {
+            states[(uint64_t)state * HIDDEN + i] =
+                sinf((float)(state + 1u) * (float)(i + 1u) * 0.13f) +
+                (float)state * 0.08f;
+        }
+    }
+    for (uint32_t query = 0; query < QUERIES; query++) {
+        for (uint32_t i = 0; i < HIDDEN; i++) {
+            queries[(uint64_t)query * HIDDEN + i] =
+                cosf((float)(query + 2u) * (float)(i + 3u) * 0.071f);
+        }
+    }
+    ds4_gpu_tensor *tstates = upload(states, sizeof(states));
+    ds4_gpu_tensor *tqueries = upload(queries, sizeof(queries));
+    ds4_gpu_tensor *tmix = ds4_gpu_tensor_alloc(sizeof(actual_mix));
+    float max_mix_error = 0.0f;
+    int mix_ok = tstates && tqueries && tmix &&
+        ds4_inkling_mix_ref(expected_mix, states, queries, STATES, HIDDEN,
+                            QUERIES, 1e-6f) &&
+        ds4_inkling_mix_metal(tmix, tstates, tqueries, STATES, HIDDEN,
+                              QUERIES, 1e-6f) &&
+        ds4_gpu_tensor_read(tmix, 0, actual_mix, sizeof(actual_mix));
+    for (uint32_t i = 0; mix_ok && i < QUERIES * HIDDEN; i++) {
+        if (!near_record(actual_mix[i], expected_mix[i], 4e-5f,
+                         &max_mix_error)) {
+            fprintf(stderr, "Inkling2 loop mix mismatch i=%u got=%g expected=%g\n",
+                    i, actual_mix[i], expected_mix[i]);
+            mix_ok = 0;
+        }
+    }
+
+    float current[HIDDEN], message[HIDDEN], expected_control[HIDDEN];
+    float actual_control[HIDDEN];
+    for (uint32_t i = 0; i < HIDDEN; i++) {
+        current[i] = sinf((float)i * 0.17f) * 0.8f;
+        message[i] = cosf((float)i * 0.11f) * 0.6f;
+    }
+    ds4_gpu_tensor *tcurrent = upload(current, sizeof(current));
+    ds4_gpu_tensor *tmessage = upload(message, sizeof(message));
+    ds4_gpu_tensor *tcontrol = ds4_gpu_tensor_alloc(sizeof(actual_control));
+    float max_control_error = 0.0f;
+    int control_ok = mix_ok && tcurrent && tmessage && tcontrol &&
+        ds4_inkling_control_ref(expected_control, current, message, down,
+                                gain, forget, HIDDEN, RANK, 1e-6f) &&
+        ds4_inkling_control_metal(tcontrol, tcurrent, tmessage,
+                                  g_synthetic_loop_map, model_size,
+                                  down_offset, gain_offset, forget_offset,
+                                  HIDDEN, RANK, 1e-6f) &&
+        ds4_gpu_tensor_read(tcontrol, 0, actual_control,
+                            sizeof(actual_control));
+    for (uint32_t i = 0; control_ok && i < HIDDEN; i++) {
+        if (!near_record(actual_control[i], expected_control[i], 5e-5f,
+                         &max_control_error)) {
+            fprintf(stderr,
+                    "Inkling2 loop control mismatch i=%u got=%g expected=%g\n",
+                    i, actual_control[i], expected_control[i]);
+            control_ok = 0;
+        }
+    }
+
+    if (mix_ok && control_ok) {
+        printf("Inkling2 loop mix/control max absolute error: %.9g / %.9g\n",
+               max_mix_error, max_control_error);
+    }
+
+    ds4_gpu_tensor_free(tstates);
+    ds4_gpu_tensor_free(tqueries);
+    ds4_gpu_tensor_free(tmix);
+    ds4_gpu_tensor_free(tcurrent);
+    ds4_gpu_tensor_free(tmessage);
+    ds4_gpu_tensor_free(tcontrol);
+    return mix_ok && control_ok;
+}
+
 static void make_small_plan(ds4_inkling_plan *plan) {
     uint8_t pattern[DS4_INKLING_PHYSICAL_LAYERS];
     memset(pattern, 1, sizeof(pattern));
@@ -1173,6 +1291,7 @@ int main(void) {
     CHECK(test_qk_and_relative_bias());
     CHECK(test_attention_output_gate());
     CHECK(test_attention_and_shortconv());
+    CHECK(test_loop_mix_and_control_metal());
     fprintf(stderr,
             "Inkling2 M4 max absolute error: QK/relative %.8g, attention %.8g, "
             "full-1025 %.8g, gate %.8g, dynamic-conv %.8g, chunk-delta %.8g, "
@@ -1186,5 +1305,6 @@ cleanup:
     ds4_gpu_cleanup();
     free(g_synthetic_model_map);
     free(g_synthetic_moe_map);
+    free(g_synthetic_loop_map);
     return ok ? 0 : 1;
 }

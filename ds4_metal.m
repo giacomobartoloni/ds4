@@ -23345,6 +23345,24 @@ typedef struct {
 } ds4_gpu_inkling2_situ_args;
 
 typedef struct {
+    uint32_t hidden_dim;
+    uint32_t state_count;
+    uint32_t query_count;
+    float epsilon;
+} ds4_gpu_inkling2_mix_args;
+
+typedef struct {
+    uint32_t hidden_dim;
+    float epsilon;
+    uint32_t pad0;
+    uint32_t pad1;
+} ds4_gpu_inkling2_control_norm_args;
+
+typedef struct {
+    uint32_t hidden_dim;
+} ds4_gpu_inkling2_control_update_args;
+
+typedef struct {
     uint32_t rows;
     uint32_t width;
     float threshold;
@@ -23805,6 +23823,160 @@ int ds4_gpu_inkling2_situ_tensor(
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 SiTU")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_mix_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *states,
+        const ds4_gpu_tensor *queries,
+        uint32_t              state_count,
+        uint32_t              hidden_dim,
+        uint32_t              query_count,
+        float                 epsilon) {
+    if ((!g_initialized && !ds4_gpu_init()) || !out || !states || !queries ||
+        state_count == 0 || state_count > 6u || hidden_dim == 0 ||
+        query_count == 0 || query_count > 4u ||
+        !isfinite(epsilon) || epsilon <= 0.0f) return 0;
+    const uint64_t state_elements = (uint64_t)state_count * hidden_dim;
+    const uint64_t query_elements = (uint64_t)query_count * hidden_dim;
+    if (state_elements > UINT64_MAX / sizeof(float) ||
+        query_elements > UINT64_MAX / sizeof(float)) return 0;
+    if (!ds4_gpu_inkling2_tensor_fits(states, state_elements * sizeof(float),
+                                      "Inkling residual states") ||
+        !ds4_gpu_inkling2_tensor_fits(queries, query_elements * sizeof(float),
+                                      "Inkling residual queries") ||
+        !ds4_gpu_inkling2_tensor_fits(out, query_elements * sizeof(float),
+                                      "Inkling residual mix output")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_mix");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_mix_args args = {
+            .hidden_dim = hidden_dim,
+            .state_count = state_count,
+            .query_count = query_count,
+            .epsilon = epsilon,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(states)
+                offset:ds4_gpu_tensor_offset(states) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(queries)
+                offset:ds4_gpu_tensor_offset(queries) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:(NSUInteger)state_count * sizeof(float) atIndex:1];
+        [enc setThreadgroupMemoryLength:(NSUInteger)state_count * sizeof(float) atIndex:2];
+        [enc setThreadgroupMemoryLength:(NSUInteger)state_count * sizeof(float) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(query_count, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling residual mix")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_control_prepare_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        uint32_t              hidden_dim,
+        float                 epsilon) {
+    if ((!g_initialized && !ds4_gpu_init()) || !out || !current || !message ||
+        hidden_dim == 0 || !isfinite(epsilon) || epsilon <= 0.0f) return 0;
+    const uint64_t vector_bytes = (uint64_t)hidden_dim * sizeof(float);
+    if (vector_bytes > UINT64_MAX / 2u ||
+        !ds4_gpu_inkling2_tensor_fits(current, vector_bytes,
+                                      "Inkling loop current") ||
+        !ds4_gpu_inkling2_tensor_fits(message, vector_bytes,
+                                      "Inkling loop message") ||
+        !ds4_gpu_inkling2_tensor_fits(out, vector_bytes * 2u,
+                                      "Inkling loop normalized inputs")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_control_prepare");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_control_norm_args args = {
+            .hidden_dim = hidden_dim,
+            .epsilon = epsilon,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(current)
+                offset:ds4_gpu_tensor_offset(current) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(message)
+                offset:ds4_gpu_tensor_offset(message) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(2, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                          "Inkling loop input normalization")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_control_update_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const ds4_gpu_tensor *gain,
+        const ds4_gpu_tensor *forget,
+        uint32_t              hidden_dim) {
+    if ((!g_initialized && !ds4_gpu_init()) || !out || !current || !message ||
+        !gain || !forget || hidden_dim == 0) return 0;
+    const uint64_t bytes = (uint64_t)hidden_dim * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, bytes, "Inkling loop update output") ||
+        !ds4_gpu_inkling2_tensor_fits(current, bytes, "Inkling loop update current") ||
+        !ds4_gpu_inkling2_tensor_fits(message, bytes, "Inkling loop update message") ||
+        !ds4_gpu_inkling2_tensor_fits(gain, bytes, "Inkling loop gain") ||
+        !ds4_gpu_inkling2_tensor_fits(forget, bytes, "Inkling loop forget")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_control_update");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_control_update_args args = { .hidden_dim = hidden_dim };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(current)
+                offset:ds4_gpu_tensor_offset(current) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(message)
+                offset:ds4_gpu_tensor_offset(message) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(gain)
+                offset:ds4_gpu_tensor_offset(gain) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(forget)
+                offset:ds4_gpu_tensor_offset(forget) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:5];
+        const NSUInteger groups = (NSUInteger)(((uint64_t)hidden_dim + 255u) / 256u);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                          "Inkling loop gated update")) return 0;
     }
     return 1;
 }

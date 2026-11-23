@@ -1343,6 +1343,33 @@ int ds4_gpu_inkling2_situ_tensor(
         float                 beta,
         float                 linear_beta);
 
+/* Mix normalized residual states with one or more learned query vectors. */
+int ds4_gpu_inkling2_mix_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *states,
+        const ds4_gpu_tensor *queries,
+        uint32_t              state_count,
+        uint32_t              hidden_dim,
+        uint32_t              query_count,
+        float                 epsilon);
+
+/* Normalize current/message into [2][hidden_dim] for a loop controller. */
+int ds4_gpu_inkling2_control_prepare_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        uint32_t              hidden_dim,
+        float                 epsilon);
+
+/* Apply tanh to projected gain/forget values and mix the controller message. */
+int ds4_gpu_inkling2_control_update_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const ds4_gpu_tensor *gain,
+        const ds4_gpu_tensor *forget,
+        uint32_t              hidden_dim);
+
 /* M4 decode operators. KV rows use interleaved FP16 [token][kv_head][dim]. */
 int ds4_gpu_inkling2_qk_prepare_tensor(
         ds4_gpu_tensor       *out,

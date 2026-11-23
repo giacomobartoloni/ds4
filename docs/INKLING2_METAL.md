@@ -12,7 +12,8 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. |
 | M4: attention, convolution, and visit state | Partial, isolated operators | State, decode attention, Q/K preparation, relative bias, and shortconv pass synthetic state/oracle tests on Apple M4; prefill graph and model integration remain open. |
 | M5: routed expert FFN | Partial, isolated Metal operation | Router, top-8 IQ4_NL/Q8_0 expert projections, SiTU, down projection, and routed accumulation pass synthetic scalar-oracle tests; DS4 layer/model wiring remains open. |
-| M6+: loop, generation, numerical parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
+| M6: loop-controller operators | Partial, isolated operators | Learned residual mixing and low-rank control update match scalar references on Apple M4 at hidden 2304/rank 64; model and decoder integration remain open. |
+| M6+: generation, numerical parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
 
 ## M0 baseline
 
@@ -119,3 +120,13 @@ The SiTU kernel implements `beta * tanh(gate / beta) * sigmoid(gate) * linear_be
 `make inkling2-metal-moe-bench` was run on the M4 with 2304 hidden width, 1152 expert width, 8 of 128 experts, and 546.8 MiB of synthetic IQ4_NL expert weights. Two warmups were followed by three runs of three synchronous calls. The measured routed-FFN latency was 6.355, 4.398, and 4.564 ms/op. The first run includes additional cold-page and pipeline effects; the latter two are 4.398 and 4.564 ms/op. These measurements include router, dispatch, synchronization, projections, SiTU, and accumulation. They are synthetic operator timing, not model tokens/sec.
 
 M5 remains partial: native model loading/weight binding, attention and FFN residual wiring, 48-visit loop execution, prefill, tokenizer/template/EOS behavior, text generation, and same-GGUF numerical parity are open. The GGUF is absent, so real-model output and performance have not been measured.
+
+## M6 isolated loop-controller operators
+
+`ds4_inkling_loop.c` adds scalar references for learned residual-state mixing and the low-rank loop controller. Mixing RMS-normalizes each candidate state with the model epsilon, scores each normalized state against its learned query at `1 / sqrt(hidden_dim)`, applies a stable softmax, and returns the weighted normalized-state sum. The controller RMS-normalizes current state and message separately, concatenates them, reuses DS4's F32 matmul primitive for the learned down/gain/forget projections, applies `tanh` to gain and forget vectors, and updates the residual state.
+
+`metal/inkling2.metal` adds a cooperative query/state mix kernel, controller input normalization, and the gated update. `ds4_inkling_loop.c` composes these with DS4's existing F32 GPU matmul for the three controller projections. The implementation uses the pinned llama.cpp Inkling 2 graph semantics and does not add an external inference runtime.
+
+`make test-inkling2-metal` compares the Metal path with scalar C at the target model dimensions: hidden 2304, controller rank 64, five candidate states, and four learned queries. It passes on Apple M4; maximum absolute errors were `4.02331352e-07` for residual mixing and `5.36441803e-07` for the controller update. The test uses synthetic inputs and controller matrices and covers multi-lane reductions above 256 elements.
+
+M6 is still partial: these are independent operators, not a wired 48-visit decoder. The GGUF loader, per-layer tensor binding, pass-start prelude restore, controller message banks, causal prefill, tokenizer/template/EOS behavior, end-to-end generation, and same-GGUF parity remain open. No model weights were present, so these checks have not been claimed.

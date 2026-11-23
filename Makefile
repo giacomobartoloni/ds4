@@ -173,13 +173,16 @@ tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
-tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h ds4_inkling_moe.h ds4_inkling_state.h
+tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h ds4_inkling_loop.h ds4_inkling_moe.h ds4_inkling_state.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
 ds4_inkling_moe.o: ds4_inkling_moe.c ds4_inkling_moe.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
-tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o ds4_inkling_state.o ds4_inkling_moe.o
+ds4_inkling_loop.o: ds4_inkling_loop.c ds4_inkling_loop.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o ds4_inkling_state.o ds4_inkling_moe.o ds4_inkling_loop.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 .PHONY: test-inkling2-metal
@@ -1578,6 +1581,7 @@ clean:
 	rm -f tests/test_inkling2_metal
 	rm -f tests/test_inkling2_state
 	rm -f ds4_inkling_moe.o
+	rm -f ds4_inkling_loop.o
 	rm -f speed-bench/inkling2_metal_quant_bench
 	rm -f speed-bench/inkling2_metal_m4_bench
 	rm -f speed-bench/inkling2_metal_moe_bench
