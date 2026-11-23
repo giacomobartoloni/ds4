@@ -222,7 +222,7 @@ speed-bench/inkling2_metal_m4_bench: speed-bench/inkling2_metal_m4_bench.o ds4_m
 inkling2-metal-m4-bench: speed-bench/inkling2_metal_m4_bench
 	./speed-bench/inkling2_metal_m4_bench
 
-speed-bench/inkling2_metal_moe_bench.o: speed-bench/inkling2_metal_moe_bench.c ds4_inkling_moe.h ds4_gpu.h
+speed-bench/inkling2_metal_moe_bench.o: speed-bench/inkling2_metal_moe_bench.c ds4_inkling_moe.h ds4_inkling_gpu_state.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
 speed-bench/inkling2_metal_moe_bench: speed-bench/inkling2_metal_moe_bench.o ds4_inkling_moe.o ds4_metal.o ds4_image.o

@@ -25,6 +25,8 @@ struct ds4_metal_args_inkling2_expert_gemv {
     uint32_t blocks_per_row;
     uint32_t input_per_expert;
     uint32_t pad0;
+    uint32_t simd_width;
+    uint32_t pad1;
     ulong expert_bytes;
 };
 
@@ -299,13 +301,15 @@ kernel void kernel_inkling2_expert_gemv(
             sum += scale * float(quant) * x[x_offset + i];
         }
     }
-    partial[lane] = sum;
+    const float simd_total = simd_sum(sum);
+    const uint simd_group = lane / args.simd_width;
+    if (lane % args.simd_width == 0u) partial[simd_group] = simd_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) partial[lane] += partial[lane + stride];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < args.simd_width) {
+        const uint simd_groups = (lanes + args.simd_width - 1u) / args.simd_width;
+        const float total = simd_sum(lane < simd_groups ? partial[lane] : 0.0f);
+        if (lane == 0u) out[(ulong)slot * args.out_dim + row] = total;
     }
-    if (lane == 0u) out[(ulong)slot * args.out_dim + row] = partial[0];
 }
 
 static inline float inkling2_tanh_saturating(float value) {

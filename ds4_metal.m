@@ -23334,6 +23334,8 @@ typedef struct {
     uint32_t blocks_per_row;
     uint32_t input_per_expert;
     uint32_t pad0;
+    uint32_t simd_width;
+    uint32_t pad1;
     uint64_t expert_bytes;
 } ds4_gpu_inkling2_expert_gemv_args;
 
@@ -23754,8 +23756,11 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
             .weight_type = weight_type,
             .blocks_per_row = blocks_per_row,
             .input_per_expert = input_per_expert != 0,
+            .simd_width = (uint32_t)pipeline.threadExecutionWidth,
+            .pad1 = 0,
             .expert_bytes = expert_bytes,
         };
+        if (args.simd_width == 0u) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;

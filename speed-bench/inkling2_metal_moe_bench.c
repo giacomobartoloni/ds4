@@ -1,6 +1,7 @@
 #define _DARWIN_C_SOURCE
 
 #include "ds4_inkling_moe.h"
+#include "ds4_inkling_gpu_state.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,26 +62,41 @@ static void fill_experts(uint8_t *dst, uint32_t rows, uint32_t in_dim,
     }
 }
 
-static int run_benchmark(ds4_gpu_tensor *out, const ds4_gpu_tensor *input,
-                         const ds4_gpu_tensor *bias, const void *model_map,
-                         uint64_t model_size, uint64_t router_offset,
-                         uint64_t gate_up_offset, uint64_t down_offset) {
-    for (uint32_t i = 0; i < WARMUP; i++) {
-        if (!ds4_inkling_moe_situ_metal(
+static int run_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *input,
+                     const ds4_gpu_tensor *bias, const void *model_map,
+                     uint64_t model_size, uint64_t router_offset,
+                     uint64_t gate_up_offset, uint64_t down_offset,
+                     const ds4_inkling_gpu_moe_workspace *workspace,
+                     uint32_t repetitions) {
+    if (!ds4_gpu_begin_commands()) return 0;
+    int ok = 1;
+    for (uint32_t i = 0; i < repetitions; i++) {
+        if (!ds4_inkling_moe_situ_metal_with_workspace(
                 out, input, bias, model_map, model_size,
                 router_offset, gate_up_offset, down_offset,
                 HIDDEN_DIM, EXPERT_DIM, N_EXPERTS, N_USED, 20u,
-                8.0f, 1.0f, 1.0f)) return 0;
+                8.0f, 1.0f, 1.0f, workspace)) {
+            ok = 0;
+            break;
+        }
+    }
+    const int commands_ok = ds4_gpu_end_commands();
+    return ok && commands_ok;
+}
+
+static int run_benchmark(ds4_gpu_tensor *out, const ds4_gpu_tensor *input,
+                         const ds4_gpu_tensor *bias, const void *model_map,
+                         uint64_t model_size, uint64_t router_offset,
+                         uint64_t gate_up_offset, uint64_t down_offset,
+                         const ds4_inkling_gpu_moe_workspace *workspace) {
+    for (uint32_t i = 0; i < WARMUP; i++) {
+        if (!run_batch(out, input, bias, model_map, model_size, router_offset,
+                       gate_up_offset, down_offset, workspace, 1u)) return 0;
     }
     for (uint32_t run = 0; run < RUNS; run++) {
         const double start = monotonic_ms();
-        for (uint32_t i = 0; i < REPETITIONS; i++) {
-            if (!ds4_inkling_moe_situ_metal(
-                    out, input, bias, model_map, model_size,
-                    router_offset, gate_up_offset, down_offset,
-                    HIDDEN_DIM, EXPERT_DIM, N_EXPERTS, N_USED, 20u,
-                    8.0f, 1.0f, 1.0f)) return 0;
-        }
+        if (!run_batch(out, input, bias, model_map, model_size, router_offset,
+                       gate_up_offset, down_offset, workspace, REPETITIONS)) return 0;
         const double elapsed = monotonic_ms() - start;
         fprintf(stderr, "Inkling2 synthetic IQ4_NL routed FFN run %u: %.3f ms/op\n",
                 run + 1u, elapsed / REPETITIONS);
@@ -130,13 +146,35 @@ int main(void) {
         (uint64_t)N_EXPERTS * sizeof(float));
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
         (uint64_t)HIDDEN_DIM * sizeof(float));
-    if (!input_host || !bias_host || !input || !bias || !out) {
+    ds4_inkling_gpu_moe_workspace workspace = {
+        .logits = ds4_gpu_tensor_alloc((uint64_t)N_EXPERTS * sizeof(float)),
+        .ids = ds4_gpu_tensor_alloc((uint64_t)N_USED * sizeof(int32_t)),
+        .weights = ds4_gpu_tensor_alloc((uint64_t)N_USED * sizeof(float)),
+        .gate_up = ds4_gpu_tensor_alloc(
+            (uint64_t)N_USED * 2u * EXPERT_DIM * sizeof(float)),
+        .activation = ds4_gpu_tensor_alloc(
+            (uint64_t)N_USED * EXPERT_DIM * sizeof(float)),
+        .expert_outputs = ds4_gpu_tensor_alloc(
+            (uint64_t)N_USED * HIDDEN_DIM * sizeof(float)),
+        .zero_bias = ds4_gpu_tensor_alloc((uint64_t)N_EXPERTS * sizeof(float)),
+    };
+    if (!input_host || !bias_host || !input || !bias || !out ||
+        !workspace.logits || !workspace.ids || !workspace.weights ||
+        !workspace.gate_up || !workspace.activation ||
+        !workspace.expert_outputs || !workspace.zero_bias) {
         fprintf(stderr, "Inkling2 MoE benchmark activation allocation failed\n");
         free(input_host);
         free(bias_host);
         ds4_gpu_tensor_free(input);
         ds4_gpu_tensor_free(bias);
         ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(workspace.logits);
+        ds4_gpu_tensor_free(workspace.ids);
+        ds4_gpu_tensor_free(workspace.weights);
+        ds4_gpu_tensor_free(workspace.gate_up);
+        ds4_gpu_tensor_free(workspace.activation);
+        ds4_gpu_tensor_free(workspace.expert_outputs);
+        ds4_gpu_tensor_free(workspace.zero_bias);
         free(model_map);
         return 1;
     }
@@ -154,17 +192,26 @@ int main(void) {
         fprintf(stderr,
                 "Inkling2 synthetic M5 routed FFN benchmark: %u hidden, %u expert, "
                 "%u/%u experts, %.1f MiB IQ4_NL weights, %u warmups, "
-                "%u runs x %u synchronous operations; no model weights\n",
+                "%u runs x %u calls per command buffer; one sync per run; "
+                "no model weights\n",
                 HIDDEN_DIM, EXPERT_DIM, N_USED, N_EXPERTS,
                 (double)(gate_up_bytes + down_bytes) / (1024.0 * 1024.0),
                 WARMUP, RUNS, REPETITIONS);
         ok = run_benchmark(out, input, bias, model_map, model_size,
-                           router_offset, gate_up_offset, down_offset);
+                           router_offset, gate_up_offset, down_offset,
+                           &workspace);
     }
     if (!ok) fprintf(stderr, "Inkling2 Metal routed FFN benchmark failed\n");
     ds4_gpu_tensor_free(input);
     ds4_gpu_tensor_free(bias);
     ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(workspace.logits);
+    ds4_gpu_tensor_free(workspace.ids);
+    ds4_gpu_tensor_free(workspace.weights);
+    ds4_gpu_tensor_free(workspace.gate_up);
+    ds4_gpu_tensor_free(workspace.activation);
+    ds4_gpu_tensor_free(workspace.expert_outputs);
+    ds4_gpu_tensor_free(workspace.zero_bias);
     ds4_gpu_cleanup();
     free(input_host);
     free(bias_host);
