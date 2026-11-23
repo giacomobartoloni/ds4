@@ -8,7 +8,8 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | --- | --- | --- |
 | M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
 | M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; live GGUF validation remains pending because weights are absent. |
-| M2+: native operators, generation, numeric parity, and performance | Not started | Model-dependent validation requires the GGUF to be available locally. |
+| M2: native Metal control operators | Complete for isolated no-weight tests | Focused scalar-oracle tests pass on Apple M4; model integration is not part of this milestone. |
+| M3+: quantized layers, attention/state, generation, parity, and performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
 
 ## M0 baseline
 
@@ -51,3 +52,18 @@ Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descr
 `ds4_gguf.h` is the shared type-size table used by the mmap loader and the C test. It corrects GGML type 19 IQ1_S to 256 elements / 50 bytes and type 20 IQ4_NL to 32 elements / 18 bytes. The canonical IQ4_NL layout is a 2-byte scale plus 16 packed bytes (`QK4_NL=32`) in the pinned llama.cpp source.
 
 `make test-inkling2-mapping` passes: 48 ordered visits, 48 unique cache slots, 24 physical weight owners, 8 full-attention visits, 40 sliding-window visits, and canonical IQ1_S/IQ4_NL block sizes. The mapping is currently a tested planning primitive, not an end-to-end inference path.
+
+## M2 native Metal control operators
+
+`metal/inkling2.metal` is included in DS4's runtime Metal source library. The Objective-C wrappers use DS4 tensors, command buffers, and pipeline cache; RMSNorm reuses `ds4_gpu_rms_norm_plain_rows_tensor` instead of adding a second implementation.
+
+- Recurrent gate update computes `(1 - forget) * current + gain * message` elementwise.
+- Row-wise L2 clipping accumulates each row's squared norm in FP32 and scales rows above the positive finite limit. Rows shorter than a threadgroup and all-zero rows are covered.
+- The router is fixed to the model's 128 experts and up to 8 selected experts. It ranks `sigmoid(logit) + correction_bias`, breaks ties by lower expert ID, then normalizes the un-biased sigmoid scores and applies the routed scale. NaN sigmoid inputs map to zero; NaN adjusted scores rank last. One GPU lane scans each token serially for this correctness-first implementation.
+- Logit softcap computes `cap * tanh(logit / cap)` and explicitly maps positive/negative infinity to positive/negative `cap`; NaNs propagate.
+
+`make test-inkling2-metal` passes on the Apple M4. The test compares these operators to scalar C references, including router ties, L2 clipping boundaries, zero/short rows, and softcap infinities/NaN. RMSNorm uses three independently compared rows, including a zero row.
+
+After M2, `./ds4_test --metal-kernels` still reports exactly the 29 baseline assertion failures. Comparing captured assertion records against `/tmp/ds4-inkling2-metal-baseline.log` found no new or resolved records. Existing failures remain in compressor pair state-store and gathered KV staging/kernel-selection cases. No M2 throughput claim is made; the serial router and reductions have not been benchmarked or optimized.
+
+These operators are not yet connected to a model execution path. The live Inkling GGUF remains absent, so end-to-end generation and same-weight numerical parity remain unverified.

@@ -173,6 +173,16 @@ tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_inkling2_metal.o: tests/test_inkling2_metal.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_inkling2_metal: tests/test_inkling2_metal.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-inkling2-metal
+test-inkling2-metal: tests/test_inkling2_metal
+	./tests/test_inkling2_metal
+
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
 
@@ -1532,6 +1542,7 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
 	rm -f tests/test_inkling2_mapping
+	rm -f tests/test_inkling2_metal
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_memory tests/test_qwen4_mtp_policy tests/test_qwen4_ssd_experts

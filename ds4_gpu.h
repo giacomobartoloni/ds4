@@ -1266,6 +1266,41 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+#ifdef __APPLE__
+/* Inkling 2 controller and routing operators. Tensors are contiguous f32
+ * except `selected`, which contains int32 expert IDs in token-major order. */
+int ds4_gpu_inkling2_gate_update_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const ds4_gpu_tensor *gain,
+        const ds4_gpu_tensor *forget,
+        uint32_t                count);
+
+int ds4_gpu_inkling2_clip_l2_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   max_norm);
+
+int ds4_gpu_inkling2_logit_softcap_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *logits,
+        uint32_t                count,
+        float                   cap);
+
+int ds4_gpu_inkling2_router_topk_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *correction_bias,
+        uint32_t                n_tokens,
+        uint32_t                n_experts,
+        uint32_t                n_used,
+        float                   routed_scale);
+#endif
+
 int ds4_gpu_rms_norm_weight_bf16_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
