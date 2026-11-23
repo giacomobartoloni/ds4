@@ -7,7 +7,7 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | Milestone | Status | Evidence |
 | --- | --- | --- |
 | M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
-| M1: GGUF inspector and 48-visit mapping | In progress | Read-only inspector and 18 synthetic tests are complete; the native visit planner and loader type-size correction are next. |
+| M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; live GGUF validation remains pending because weights are absent. |
 | M2+: native operators, generation, numeric parity, and performance | Not started | Model-dependent validation requires the GGUF to be available locally. |
 
 ## M0 baseline
@@ -43,3 +43,11 @@ These source revisions were inspected as format and semantic references; DS4 doe
 `gguf-tools/inkling2_inspect.py` reads GGUF v3 metadata and tensor descriptors. It validates tensor shapes, canonical byte sizes for the supported F32/F16/Q8_0/IQ4_NL tensor types, alignment, overlap, and file bounds without reading tensor payloads. Use `--summary`, `--tensors`, `--json`, or `--validate-inkling2`; all modes report that payload bytes were not read. The Inkling validator checks the loop metadata, 24-entry attention schedule, 48 logical visits, 156 F32 loop-controller tensors, and the IQ4_NL/Q8_0 expert tensor assignments.
 
 Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descriptors, primitive/array metadata, truncation and size limits, duplicate keys and names, invalid shapes and types, offset alignment/overlap/bounds, quant block sizes, the expected Inkling layout, and payload-free inspection. The live GGUF is absent, so `--validate-inkling2` has not yet been run against model bytes.
+
+## 48-visit plan and loader block sizes
+
+`ds4_inkling.h` validates the supported 24-layer metadata and emits the execution order: prelude layers `[0,6)`, core `[6,18)` for three passes, then epilogue `[18,24)`. Each plan entry stores a physical layer index as its shared weight owner and a unique cache slot. Pass 0 uses cache slots 6–17, pass 1 uses 24–35, and pass 2 uses 36–47; prelude and epilogue use their physical indices. The planner validates the supplied attention pattern and rejects changed boundaries, pass counts, residual block size, or layer schedule. It describes the cache ownership needed by the runtime; inference buffers are not yet connected to it.
+
+`ds4_gguf.h` is the shared type-size table used by the mmap loader and the C test. It corrects GGML type 19 IQ1_S to 256 elements / 50 bytes and type 20 IQ4_NL to 32 elements / 18 bytes. The canonical IQ4_NL layout is a 2-byte scale plus 16 packed bytes (`QK4_NL=32`) in the pinned llama.cpp source.
+
+`make test-inkling2-mapping` passes: 48 ordered visits, 48 unique cache slots, 24 physical weight owners, 8 full-attention visits, 40 sliding-window visits, and canonical IQ1_S/IQ4_NL block sizes. The mapping is currently a tested planning primitive, not an end-to-end inference path.
