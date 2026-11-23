@@ -44782,11 +44782,21 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
 struct ds4_vocab {
     ds4_str *token;
     int n_vocab;
+    bool ignore_merges;
     int bos_id;
     int eos_id;
     int system_id;
     int user_id;
     int assistant_id;
+    int tool_id;
+    int content_text_id;
+    int content_image_id;
+    int content_thinking_id;
+    int content_xml_id;
+    int content_invoke_tool_json_id;
+    int content_invoke_tool_text_id;
+    int begin_text_id;
+    int end_message_id;
     int observation_id;
     int sop_id;
     int think_start_id;
@@ -45264,6 +45274,13 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
+    int direct_token = -1;
+    if (vocab->ignore_merges &&
+        table_get(&vocab->token_to_id, encoded, encoded_len, &direct_token)) {
+        token_vec_push(out, direct_token);
+        free(encoded);
+        return;
+    }
 
     int n_sym = 0;
     int cap_sym = 32;
@@ -45808,6 +45825,184 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+static bool gpt4o_is_letter_mark(qwen4_char_info ch) {
+    return ch.valid && (ch.letter || ch.mark);
+}
+
+static bool gpt4o_ascii_lower(qwen4_char_info ch) {
+    return ch.cp >= 'a' && ch.cp <= 'z';
+}
+
+static bool gpt4o_ascii_upper(qwen4_char_info ch) {
+    return ch.cp >= 'A' && ch.cp <= 'Z';
+}
+
+static uint64_t gpt4o_attach_contraction(const char *text, uint64_t len,
+                                        uint64_t end) {
+    static const char *const suffixes[] = {
+        "s", "t", "re", "ve", "m", "ll", "d",
+    };
+    if (end >= len || text[end] != '\'') return end;
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        const size_t suffix_len = strlen(suffixes[i]);
+        if (suffix_len > len - end - 1u) continue;
+        bool matches = true;
+        for (size_t j = 0; j < suffix_len; j++) {
+            if (ascii_tolower_cp((uint8_t)text[end + 1u + j]) !=
+                (uint8_t)suffixes[i][j]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return end + 1u + suffix_len;
+    }
+    return end;
+}
+
+/* GPT4O's ordered letter alternatives distinguish ASCII upper/lower runs;
+ * Unicode letters and marks participate in both regex character classes. */
+static uint64_t gpt4o_letter_piece_end(const char *text, uint64_t len,
+                                       uint64_t start) {
+    const qwen4_char_info first = qwen4_char_at(text, len, start);
+    uint64_t letter_start = start;
+    if (!gpt4o_is_letter_mark(first)) {
+        if (first.cp == '\r' || first.cp == '\n' || first.number) return start;
+        letter_start = first.next;
+        if (!gpt4o_is_letter_mark(qwen4_char_at(text, len, letter_start)))
+            return start;
+    }
+
+    uint64_t run_end = letter_start;
+    uint64_t last_char_start = letter_start;
+    while (run_end < len) {
+        const qwen4_char_info ch = qwen4_char_at(text, len, run_end);
+        if (!gpt4o_is_letter_mark(ch)) break;
+        last_char_start = run_end;
+        run_end = ch.next;
+    }
+    if (run_end == letter_start) return start;
+
+    /* Alternative 1: zero or more non-lowercase letters, then one or more
+     * non-uppercase letters. Greedy backtracking permits a Unicode-only run. */
+    uint64_t upperish_end = letter_start;
+    while (upperish_end < run_end) {
+        const qwen4_char_info ch = qwen4_char_at(text, len, upperish_end);
+        if (gpt4o_ascii_lower(ch)) break;
+        upperish_end = ch.next;
+    }
+    uint64_t end = start;
+    if (upperish_end < run_end) {
+        end = upperish_end;
+        while (end < run_end) {
+            const qwen4_char_info ch = qwen4_char_at(text, len, end);
+            if (gpt4o_ascii_upper(ch)) break;
+            end = ch.next;
+        }
+        if (end == upperish_end) end = start;
+    } else if (!gpt4o_ascii_upper(qwen4_char_at(text, len, last_char_start))) {
+        end = run_end;
+    }
+
+    /* Alternative 2: one or more non-lowercase letters, then any remaining
+     * non-uppercase letters. It handles all-uppercase words. */
+    if (end == start) {
+        uint64_t upper_end = letter_start;
+        while (upper_end < run_end) {
+            const qwen4_char_info ch = qwen4_char_at(text, len, upper_end);
+            if (gpt4o_ascii_lower(ch)) break;
+            upper_end = ch.next;
+        }
+        if (upper_end > letter_start) {
+            end = upper_end;
+            while (end < run_end) {
+                const qwen4_char_info ch = qwen4_char_at(text, len, end);
+                if (gpt4o_ascii_upper(ch)) break;
+                end = ch.next;
+            }
+        }
+    }
+    if (end == start) return start;
+    return gpt4o_attach_contraction(text, len, end);
+}
+
+static void bpe_tokenize_text_gpt4o(const ds4_vocab *vocab,
+                                   const char *text,
+                                   token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t start = pos;
+        const uint64_t letters_end = gpt4o_letter_piece_end(text, len, pos);
+        if (letters_end > pos) {
+            pos = letters_end;
+            bpe_emit_piece(vocab, (ds4_str){text + start, pos - start}, out);
+            continue;
+        }
+
+        const qwen4_char_info cur = qwen4_char_at(text, len, pos);
+        if (!cur.valid) break;
+        if (cur.number) {
+            int digits = 0;
+            while (pos < len && digits < 3) {
+                const qwen4_char_info ch = qwen4_char_at(text, len, pos);
+                if (!ch.valid || !ch.number) break;
+                pos = ch.next;
+                digits++;
+            }
+            bpe_emit_piece(vocab, (ds4_str){text + start, pos - start}, out);
+            continue;
+        }
+
+        qwen4_char_info punct = cur;
+        uint64_t punct_start = pos;
+        if (cur.cp == ' ') {
+            punct_start = cur.next;
+            punct = qwen4_char_at(text, len, punct_start);
+        }
+        if (punct.valid && !punct.space && !punct.letter && !punct.mark &&
+            !punct.number) {
+            pos = punct_start;
+            while (pos < len) {
+                const qwen4_char_info ch = qwen4_char_at(text, len, pos);
+                if (!ch.valid || ch.space || ch.letter || ch.mark || ch.number)
+                    break;
+                pos = ch.next;
+            }
+            while (pos < len) {
+                const qwen4_char_info ch = qwen4_char_at(text, len, pos);
+                if (!ch.valid || (ch.cp != '\r' && ch.cp != '\n' && ch.cp != '/')) break;
+                pos = ch.next;
+            }
+            bpe_emit_piece(vocab, (ds4_str){text + start, pos - start}, out);
+            continue;
+        }
+
+        if (cur.space) {
+            uint64_t p = pos;
+            uint64_t last_newline_end = 0;
+            uint64_t last_space_start = pos;
+            int spaces = 0;
+            while (p < len) {
+                const qwen4_char_info ch = qwen4_char_at(text, len, p);
+                if (!ch.valid || !ch.space) break;
+                last_space_start = p;
+                if (ch.cp == '\r' || ch.cp == '\n') last_newline_end = ch.next;
+                p = ch.next;
+                spaces++;
+            }
+            if (last_newline_end) pos = last_newline_end;
+            else if (spaces > 1 && p < len) pos = last_space_start;
+            else pos = p;
+            bpe_emit_piece(vocab, (ds4_str){text + start, pos - start}, out);
+            continue;
+        }
+
+        pos = cur.next;
+        if (pos == start) pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){text + start, pos - start}, out);
+    }
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -45827,6 +46022,10 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  * token stream for code prompts and produces wrong long-context logits.
  */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (ds4_model_is_inkling2()) {
+        bpe_tokenize_text_gpt4o(vocab, text, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
@@ -45957,6 +46156,58 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_start_id = -1;
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
+    vocab->tool_id = -1;
+    vocab->content_text_id = -1;
+    vocab->content_image_id = -1;
+    vocab->content_thinking_id = -1;
+    vocab->content_xml_id = -1;
+    vocab->content_invoke_tool_json_id = -1;
+    vocab->content_invoke_tool_text_id = -1;
+    vocab->begin_text_id = -1;
+    vocab->end_message_id = -1;
+
+    if (ds4_model_is_inkling2()) {
+        vocab->ignore_merges = true;
+        vocab->bos_id = -1;
+        vocab->eos_id = vocab_lookup(vocab, "<|content_model_end_sampling|>");
+        vocab->endoftext_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->system_id = vocab_lookup(vocab, "<|message_system|>");
+        vocab->user_id = vocab_lookup(vocab, "<|message_user|>");
+        vocab->assistant_id = vocab_lookup(vocab, "<|message_model|>");
+        vocab->tool_id = vocab_lookup(vocab, "<|message_tool|>");
+        vocab->content_text_id = vocab_lookup(vocab, "<|content_text|>");
+        vocab->content_image_id = vocab_lookup_optional(vocab, "<|content_image|>");
+        vocab->content_thinking_id = vocab_lookup(vocab, "<|content_thinking|>");
+        vocab->content_xml_id = vocab_lookup_optional(vocab, "<|content_xml|>");
+        vocab->content_invoke_tool_json_id =
+            vocab_lookup_optional(vocab, "<|content_invoke_tool_json|>");
+        vocab->content_invoke_tool_text_id =
+            vocab_lookup_optional(vocab, "<|content_invoke_tool_text|>");
+        vocab->begin_text_id = vocab_lookup_optional(vocab, "<|begin_of_text|>");
+        vocab->end_message_id = vocab_lookup(vocab, "<|end_message|>");
+        if (vocab->eos_id != 200006 || vocab->endoftext_id != 199999 ||
+            vocab->user_id != 200000 || vocab->assistant_id != 200001 ||
+            vocab->system_id != 200002 || vocab->tool_id != 200003 ||
+            vocab->content_text_id != 200004 ||
+            vocab->content_thinking_id != 200008 ||
+            vocab->end_message_id != 200010) {
+            ds4_die("Inkling2 special-token IDs do not match its GGUF metadata");
+        }
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab->content_thinking_id;
+        vocab->think_end_id = -1;
+        vocab->tool_call_start_id = -1;
+        vocab->tool_call_end_id = -1;
+        vocab->tool_response_start_id = -1;
+        vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
@@ -46052,7 +46303,9 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_LOW:
+    case DS4_THINK_MINIMAL:
     case DS4_THINK_MEDIUM:
+    case DS4_THINK_XHIGH:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -46062,6 +46315,7 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
     int level = ds4_think_mode_level(mode);
+    if (mode == DS4_THINK_XHIGH) level = 75;
     if (mode == DS4_THINK_HIGH) level = 75;
     if (mode == DS4_THINK_MAX) level = 100;
     if (level <= 0) return NULL;
@@ -46070,10 +46324,16 @@ const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
     return text;
 }
 
+static void inkling_append_effort_message(const ds4_vocab *vocab,
+                                          ds4_think_mode mode,
+                                          token_vec *out);
+
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (ds4_model_is_inkling2()) {
+        inkling_append_effort_message(vocab, think_mode, out);
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
             token_vec_push(out, vocab->system_id);
@@ -46138,12 +46398,141 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+static bool inkling_effort_hundredths(ds4_think_mode mode,
+                                      unsigned *hundredths) {
+    const int level = ds4_think_mode_level(mode);
+    if (level >= 0) {
+        if (level > 99) return false;
+        *hundredths = (unsigned)level;
+        return true;
+    }
+    switch (mode) {
+    case DS4_THINK_NONE:    *hundredths = 0; return true;
+    case DS4_THINK_MINIMAL: *hundredths = 10; return true;
+    case DS4_THINK_LOW:     *hundredths = 20; return true;
+    case DS4_THINK_MEDIUM:  *hundredths = 70; return true;
+    case DS4_THINK_HIGH:    *hundredths = 90; return true;
+    case DS4_THINK_XHIGH:   *hundredths = 99; return true;
+    case DS4_THINK_MAX:     *hundredths = 99; return true;
+    }
+    return false;
+}
+
+static void inkling_effort_text(ds4_think_mode mode, char *out, size_t cap) {
+    unsigned hundredths = 0;
+    if (!out || cap == 0 || !inkling_effort_hundredths(mode, &hundredths)) {
+        ds4_die("Inkling2 reasoning_effort must be in [0.0, 0.99]");
+    }
+    if (hundredths == 0) {
+        snprintf(out, cap, "Thinking effort level: 0");
+        return;
+    }
+    const unsigned whole = hundredths / 100u;
+    unsigned fraction = hundredths % 100u;
+    if (fraction % 10u == 0) {
+        snprintf(out, cap, "Thinking effort level: %u.%u", whole,
+                 fraction / 10u);
+    } else {
+        snprintf(out, cap, "Thinking effort level: %u.%02u", whole,
+                 fraction);
+    }
+}
+
+static void inkling_append_effort_message(const ds4_vocab *vocab,
+                                          ds4_think_mode mode,
+                                          token_vec *out) {
+    char text[64];
+    inkling_effort_text(mode, text, sizeof(text));
+    token_vec_push(out, vocab->system_id);
+    token_vec_push(out, vocab->content_text_id);
+    bpe_tokenize_text(vocab, text, out);
+    token_vec_push(out, vocab->end_message_id);
+}
+
+static bool inkling_has_effort_message(const ds4_vocab *vocab,
+                                       const ds4_tokens *tokens) {
+    static const ds4_think_mode named_modes[] = {
+        DS4_THINK_NONE, DS4_THINK_MINIMAL, DS4_THINK_LOW,
+        DS4_THINK_MEDIUM, DS4_THINK_HIGH, DS4_THINK_XHIGH, DS4_THINK_MAX,
+    };
+    if (!tokens || tokens->len < 3) return false;
+    for (int i = 0; i + 2 < tokens->len; i++) {
+        if (tokens->v[i] == vocab->system_id &&
+            tokens->v[i + 1] == vocab->content_text_id) {
+            for (size_t m = 0;
+                 m < sizeof(named_modes) / sizeof(named_modes[0]); m++) {
+                const ds4_think_mode mode = named_modes[m];
+                token_vec expected = {0};
+                char text[64];
+                inkling_effort_text(mode, text, sizeof(text));
+                bpe_tokenize_text(vocab, text, &expected);
+                const int end = i + 2 + expected.len;
+                const bool match = end < tokens->len &&
+                    tokens->v[end] == vocab->end_message_id &&
+                    memcmp(tokens->v + i + 2, expected.v,
+                           (size_t)expected.len * sizeof(expected.v[0])) == 0;
+                token_vec_free(&expected);
+                if (match) return true;
+            }
+            for (unsigned level = 0; level <= 99u; level++) {
+                const ds4_think_mode mode =
+                    (ds4_think_mode)(DS4_THINK_LEVEL_BASE + level);
+                token_vec expected = {0};
+                char text[64];
+                inkling_effort_text(mode, text, sizeof(text));
+                bpe_tokenize_text(vocab, text, &expected);
+                const int end = i + 2 + expected.len;
+                const bool match = end < tokens->len &&
+                    tokens->v[end] == vocab->end_message_id &&
+                    memcmp(tokens->v + i + 2, expected.v,
+                           (size_t)expected.len * sizeof(expected.v[0])) == 0;
+                token_vec_free(&expected);
+                if (match) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void inkling_ensure_effort_message(const ds4_vocab *vocab,
+                                          ds4_tokens *tokens,
+                                          ds4_think_mode default_mode) {
+    if (!inkling_has_effort_message(vocab, tokens))
+        inkling_append_effort_message(vocab, default_mode,
+                                      (token_vec *)tokens);
+}
+
+static void inkling_append_message(const ds4_vocab *vocab,
+                                   int role_id,
+                                   const char *content,
+                                   bool assistant_turn,
+                                   token_vec *out) {
+    token_vec_push(out, role_id);
+    token_vec_push(out, vocab->content_text_id);
+    bpe_tokenize_text(vocab, content ? content : "", out);
+    token_vec_push(out, vocab->end_message_id);
+    if (assistant_turn) token_vec_push(out, vocab->eos_id);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_inkling2()) {
+        if (vocab->system_id < 0 || vocab->user_id < 0 ||
+            vocab->assistant_id < 0 || vocab->content_text_id < 0 ||
+            vocab->end_message_id < 0 || vocab->eos_id < 0) {
+            ds4_die("this tokenizer does not provide the Inkling2 chat markers");
+        }
+        if (system && system[0])
+            inkling_append_message(vocab, vocab->system_id, system, false, out);
+        inkling_append_effort_message(vocab, think_mode, out);
+        inkling_append_message(vocab, vocab->user_id, prompt, false, out);
+        token_vec_push(out, vocab->assistant_id);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -46199,6 +46588,19 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         const char *text;
         int token;
     } specials[] = {
+        {"<|message_user|>",          vocab->user_id},
+        {"<|message_model|>",         vocab->assistant_id},
+        {"<|message_system|>",        vocab->system_id},
+        {"<|message_tool|>",          vocab->tool_id},
+        {"<|content_text|>",          vocab->content_text_id},
+        {"<|content_image|>",         vocab->content_image_id},
+        {"<|content_thinking|>",      vocab->content_thinking_id},
+        {"<|content_xml|>",            vocab->content_xml_id},
+        {"<|content_invoke_tool_json|>", vocab->content_invoke_tool_json_id},
+        {"<|content_invoke_tool_text|>", vocab->content_invoke_tool_text_id},
+        {"<|content_model_end_sampling|>", vocab->eos_id},
+        {"<|begin_of_text|>",          vocab->begin_text_id},
+        {"<|end_message|>",            vocab->end_message_id},
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"[gMASK]",                vocab->bos_id},
@@ -46341,6 +46743,20 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (ds4_model_is_inkling2()) {
+        int role_id = vocab->user_id;
+        const bool system = !strcmp(role, "system") || !strcmp(role, "developer");
+        const bool assistant = !strcmp(role, "assistant");
+        if (system) role_id = vocab->system_id;
+        else if (assistant) role_id = vocab->assistant_id;
+        else if (!strcmp(role, "tool") || !strcmp(role, "function"))
+            role_id = vocab->tool_id;
+        if (!system)
+            inkling_ensure_effort_message(vocab, tokens, DS4_THINK_HIGH);
+        inkling_append_message(vocab, role_id, content, assistant, tokens);
+        return;
+    }
+
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             qwen4_chat_open(vocab, "user", tokens);
@@ -46407,6 +46823,11 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_inkling2()) {
+        inkling_ensure_effort_message(&e->vocab, tokens, think_mode);
+        token_vec_push(tokens, e->vocab.assistant_id);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -63149,7 +63570,10 @@ static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_LOW || mode == DS4_THINK_MEDIUM || mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX || ds4_think_mode_level(mode) > 0;
+    return mode == DS4_THINK_LOW || mode == DS4_THINK_MINIMAL ||
+           mode == DS4_THINK_MEDIUM || mode == DS4_THINK_HIGH ||
+           mode == DS4_THINK_XHIGH ||
+           mode == DS4_THINK_MAX || ds4_think_mode_level(mode) > 0;
 }
 
 int ds4_think_mode_level(ds4_think_mode mode) {
@@ -63160,12 +63584,24 @@ int ds4_think_mode_level(ds4_think_mode mode) {
 
 bool ds4_think_mode_parse_level(const char *text, ds4_think_mode *out) {
     if (!text || !out || !text[0]) return false;
-    unsigned level = 0;
-    for (const char *p = text; *p; p++) {
-        if (*p < '0' || *p > '9' || level > 100) return false;
-        level = level * 10u + (unsigned)(*p - '0');
+    unsigned whole = 0;
+    const char *p = text;
+    while (*p >= '0' && *p <= '9') {
+        if (whole > 100u) return false;
+        whole = whole * 10u + (unsigned)(*p++ - '0');
     }
-    if (level > 100) return false;
+    if (whole > 100u) return false;
+    unsigned level = whole;
+    if (*p == '.') {
+        if (whole != 0) return false;
+        p++;
+        if (*p < '0' || *p > '9') return false;
+        level = (unsigned)(*p++ - '0') * 10u;
+        if (*p >= '0' && *p <= '9') level += (unsigned)(*p++ - '0');
+        if (*p != '\0' || level > 99u) return false;
+    } else if (*p != '\0') {
+        return false;
+    }
     *out = (ds4_think_mode)(DS4_THINK_LEVEL_BASE + level);
     return true;
 }
@@ -63183,6 +63619,8 @@ const char *ds4_think_mode_name(ds4_think_mode mode) {
     case DS4_THINK_MAX:  return "max";
     case DS4_THINK_LOW:  return "low";
     case DS4_THINK_MEDIUM: return "medium";
+    case DS4_THINK_MINIMAL: return "minimal";
+    case DS4_THINK_XHIGH: return "xhigh";
     }
     return "unknown";
 }
@@ -63197,7 +63635,9 @@ uint32_t ds4_think_max_min_context(void) {
 
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size) {
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        mode == DS4_THINK_MAX && (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_INKLING2 &&
+        mode == DS4_THINK_MAX &&
+        (uint32_t)(ctx_size > 0 ? ctx_size : 0) < DS4_THINK_MAX_MIN_CONTEXT) {
         return DS4_THINK_HIGH;
     }
     return mode;
@@ -75629,8 +76069,10 @@ bool ds4_engine_is_qwen4(ds4_engine *e) {
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_HIGH:
+    case DS4_THINK_XHIGH:
     case DS4_THINK_MAX:  return DS4_QWEN4_REASONING_XHIGH;
     case DS4_THINK_LOW:  return DS4_QWEN4_REASONING_LOW;
+    case DS4_THINK_MINIMAL: return DS4_QWEN4_REASONING_LOW;
     case DS4_THINK_MEDIUM: return NULL;   /* the template sets no instruction for medium */
     case DS4_THINK_NONE: return NULL;
     }
@@ -76461,6 +76903,11 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 bool ds4_engine_is_deepseek41(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
+}
+
+bool ds4_engine_is_inkling2(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_inkling2();
 }
 
 void ds4_engine_close(ds4_engine *e) {

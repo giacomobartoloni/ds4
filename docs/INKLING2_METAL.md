@@ -2,19 +2,21 @@
 
 This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. The first supported model format is the mixed IQ4_NL GGUF, with an 8192-token context and FP16 key/value state. DS4 loads the GGUF directly through its mmap loader and executes operators in its native C and Metal paths; it does not use llama.cpp or MLX as a runtime dependency.
 
-## Milestone status
+## Handoff gate status
 
-| Milestone | Status | Evidence |
+The numbered section headings later in this document preserve the incremental implementation slices used by the commit history. This table maps the current code to the canonical gates in the supplied handoff; an isolated operator or loader test does not count as end-to-end model support.
+
+| Handoff gate | Status | Evidence |
 | --- | --- | --- |
-| M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
-| M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; the pinned remote GGUF directory was range-checked without reading payload bytes. |
-| M2: native Metal control operators | Complete for isolated no-weight tests | Focused scalar-oracle tests pass on Apple M4; model integration is not part of this milestone. |
-| M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. |
-| M4: attention, convolution, and visit state | Partial, isolated operators | State, decode attention, Q/K preparation, relative bias, and shortconv pass synthetic state/oracle tests on Apple M4; prefill graph and model integration remain open. |
-| M5: routed expert FFN | Partial, isolated Metal operation | Router, top-8 IQ4_NL/Q8_0 expert projections, SiTU, down projection, and routed accumulation pass synthetic scalar-oracle tests; DS4 layer/model wiring remains open. |
-| M6: loop-controller operators | Partial, isolated operators | Learned residual mixing and low-rank control update match scalar references on Apple M4 at hidden 2304/rank 64; model and decoder integration remain open. |
-| M7: native GGUF metadata and weight binding | Complete for sparse synthetic descriptors | DS4 validates the live 704-tensor layout with sparse synthetic payloads, binds 24 physical weight owners, and stores the 48-visit plan; inspect-only is supported. |
-| M8: tokenizer, decoder, generation, and parity | Not complete | Generation is rejected with an explicit diagnostic until tokenizer and native decoder wiring are implemented and validated. |
+| M0: repository, references, and host baseline | Partial | Fork/base, M4 host, build and server results are recorded. Same-GGUF llama.cpp timing is unavailable because the checkpoint is not local. |
+| M1: GGUF inspector, tensor table, and visit map | Complete for no-weight validation | Inspector/planner tests pass; the exact remote directory range was checked without reading tensor payloads; sparse fixtures validate binding and malformed descriptors. |
+| M2: Metal plumbing and scalar-oracle operators | Complete for isolated control operators | Runtime Metal integration, RMSNorm, clipping, deterministic top-k routing, and logit softcap have focused M4 oracle coverage. The 29 pre-existing Metal-suite failures are unchanged from baseline. |
+| M3: IQ4_NL/Q8_0 quantized products and expert routing | Complete for synthetic fixtures | Quantized GEMV and composed top-8 expert FFN fixtures pass against scalar references. No real checkpoint blocks were available for comparison. |
+| M4: attention, convolution, and per-visit state | Partial | Decode attention, convolution, state transactions, and independent cache slots pass synthetic tests; architecture-level prefill/decode scheduling is not wired. |
+| M5: loop core, output layer, and text generation | Not complete | Tensor binding, visit plan, loop operators, tokenizer, and prompt serialization are available as pieces; no native model graph, logits, or generated text is integrated. |
+| M6: full-model M4 performance | Not run | Synthetic operator timings exist, but full-model profiling and tokens/sec require the checkpoint and a correct M5 graph. |
+| M7: integration hardening and user workflow | Partial | Builds, focused suites, server regressions, GGUF validation, and this documentation pass. A model-backed completion demo and same-weight benchmark are unavailable. |
+| M8: post-release formats and optional features | Not started | NVFP4/MXFP8, low-precision KV, vision/audio, and speculative decoding remain out of scope for this IQ4_NL path. |
 
 ## M0 baseline
 
@@ -34,7 +36,7 @@ These source revisions were inspected as format and semantic references; DS4 doe
 
 - llama.cpp: [`212c547fe908b288f6659d48741e6ffac1ff409c`](https://github.com/ggml-org/llama.cpp/tree/212c547fe908b288f6659d48741e6ffac1ff409c), including [`src/models/inkling2.cpp`](https://github.com/ggml-org/llama.cpp/blob/212c547fe908b288f6659d48741e6ffac1ff409c/src/models/inkling2.cpp) and [`src/models/inkling2-loop.cpp`](https://github.com/ggml-org/llama.cpp/blob/212c547fe908b288f6659d48741e6ffac1ff409c/src/models/inkling2-loop.cpp).
 - Hugging Face Transformers: [`d9bdc606d543e1a85c0d7121af9379fbd2445bf3`](https://github.com/huggingface/transformers/tree/d9bdc606d543e1a85c0d7121af9379fbd2445bf3).
-- Inkling 2 Mini model repository revision: [`7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6`](https://huggingface.co/HuggingFaceTB/Inkling-2-Mini/tree/7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6).
+- Inkling 2 Mini model repository revision: [`7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6); official text chat template: [`chat_template.jinja` at `1fb4134b9a74f9681054f4ef82e4bf1f458a2337`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/blob/1fb4134b9a74f9681054f4ef82e4bf1f458a2337/chat_template.jinja).
 - IQ4_NL GGUF repository revision: [`e8a2cecf0e78914f07cc27b9be711a9b2c7561d9`](https://huggingface.co/HuggingFaceTB/Inkling-2-Mini-GGUF/tree/e8a2cecf0e78914f07cc27b9be711a9b2c7561d9).
 
 ## Initial execution contract
@@ -64,7 +66,7 @@ Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descr
 
 `make test-inkling2-gguf` creates a sparse, payload-free 17.6 GB GGUF fixture from the live descriptor inventory, exercises the real mmap parser and metadata validator, checks the complete binder and engine inspect-only path, and verifies rejection of a missing descriptor, wrong tensor type, and wrong shape. This allocates only a sparse file and does not write model payloads. `make test-inkling2-model` checks valid and unsupported architecture metadata independently.
 
-The normal engine-open path currently rejects Inkling after successful binding and plan creation with an explicit “native decoder is not integrated yet” error. It must not fall through to the DeepSeek generic tensor layout. The remaining work is tokenizer/chat-template support, native prefill/decode scheduling, per-session 48-slot state wiring, greedy generation, and same-weight parity.
+The normal engine-open path currently rejects Inkling after successful binding and plan creation with an explicit “native decoder is not integrated yet” error. It must not fall through to the DeepSeek generic tensor layout. Native prefill/decode scheduling, per-session 48-slot state wiring, greedy generation, and same-weight parity remain open.
 
 After M7, `make` and `make cpu` pass, and `./ds4_test --server` passes on the M4 host. `make test-inkling2-model test-inkling2-gguf test-inkling2-mapping test-inkling2-inspect test-inkling2-state test-inkling2-metal` passes. `./ds4_test --metal-kernels` still reports 29 failures; the extracted assertion records are byte-for-byte identical to `/tmp/ds4-inkling2-metal-baseline.log` from M0, with no new or resolved records.
 
@@ -143,3 +145,13 @@ M5 remains partial: native model loading/weight binding, attention and FFN resid
 `make test-inkling2-metal` compares the Metal path with scalar C at the target model dimensions: hidden 2304, controller rank 64, five candidate states, and four learned queries. It passes on Apple M4; maximum absolute errors were `4.02331352e-07` for residual mixing and `5.36441803e-07` for the controller update. The test uses synthetic inputs and controller matrices and covers multi-lane reductions above 256 elements.
 
 M6 is still partial: these are independent operators, not a wired 48-visit decoder. The GGUF loader, per-layer tensor binding, pass-start prelude restore, controller message banks, causal prefill, tokenizer/template/EOS behavior, end-to-end generation, and same-GGUF parity remain open. No model weights were present, so these checks have not been claimed.
+
+## Text tokenizer and chat prompt groundwork (M5 prerequisite)
+
+Inkling uses the GPT4O BPE pre-tokenizer with `ignore_merges=true` and no implicit BOS. The C path now performs the GPT4O letter-case splits, contraction attachment, one-to-three digit groups, optional leading-space handling, punctuation/newline/slash grouping, and direct vocabulary lookup before falling back to the existing ranked BPE merges. Its special-token table binds the required role, text, thinking, end-message, and end-sampling IDs and rejects a GGUF whose core IDs differ from the pinned metadata. The pre-tokenizer behavior is checked against llama.cpp's pinned GPT4O expression; no external tokenizer runtime is linked.
+
+The text-only prompt APIs render the model template's role markers and content blocks. Initial system messages come first, then the reasoning-effort system block is inserted before the first non-system message. Named values map to `none=0.0`, `minimal=0.1`, `low=0.2`, `medium=0.7`, `high=0.9`, and `xhigh=max=0.99`; decimal strings in `[0.0, 0.99]` are accepted through the shared reasoning-mode parser. Assistant history ends with both `end_message` and `content_model_end_sampling`; an open generation prompt ends with `message_model`. The CLI's one-shot and REPL prompt builders preserve this order. Tool schemas, image/audio payloads, and structured assistant tool-call generation are not implemented by this text-only path.
+
+`make test-inkling2-tokenizer` checks GPT4O splitting for mixed/all-uppercase words, contractions, Unicode letters, number groups, punctuation spanning newline/slash, direct-word lookup, ranked-merge fallback, exact effort strings, numeric-effort de-duplication, rendered special-token recognition, text chat message order, and the generation prefix. The server regression suite additionally checks `minimal`, `xhigh`, and decimal reasoning levels. `make`, `make cpu`, the Inkling M0–M7 focused targets, and `./ds4_test --server` pass after this change on the Apple M4.
+
+This milestone does not enable inference. The engine still refuses normal Inkling generation until the model graph connects embeddings, visit-specific KV/shortconv state, attention, routed experts, loop message banks, output projection, and sampling. The 17.6 GB model is not local, so no token stream, full-model numeric comparison, or end-to-end benchmark has been measured.

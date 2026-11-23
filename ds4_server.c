@@ -1040,7 +1040,11 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high")) {
+    if (!strcmp(s, "xhigh")) {
+        *out = DS4_THINK_XHIGH;
+        return true;
+    }
+    if (!strcmp(s, "high")) {
         *out = DS4_THINK_HIGH;
         return true;
     }
@@ -1048,7 +1052,11 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         *out = DS4_THINK_MEDIUM;
         return true;
     }
-    if (!strcmp(s, "low") || !strcmp(s, "minimal")) {
+    if (!strcmp(s, "minimal")) {
+        *out = DS4_THINK_MINIMAL;
+        return true;
+    }
+    if (!strcmp(s, "low")) {
         /* "minimal" is the smallest non-zero level; callers that need *no*
          * reasoning must use "none" instead. */
         *out = DS4_THINK_LOW;
@@ -18225,16 +18233,30 @@ static void test_chat_ignore_eos_contract(void) {
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == DS4_THINK_LOW);
-    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == DS4_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == DS4_THINK_MINIMAL);
     TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == DS4_THINK_MEDIUM);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == DS4_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == DS4_THINK_XHIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == DS4_THINK_MAX);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
+    TEST_ASSERT(ds4_think_mode_parse_level("0.35", &mode) &&
+                ds4_think_mode_level(mode) == 35);
+    TEST_ASSERT(ds4_think_mode_parse_level("0.99", &mode) &&
+                ds4_think_mode_level(mode) == 99);
+    TEST_ASSERT(!ds4_think_mode_parse_level("1.0", &mode));
     TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_LOW) == DS4_THINK_LOW);
     TEST_ASSERT(think_mode_from_enabled(false, DS4_THINK_LOW) == DS4_THINK_NONE);
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_LOW), "Reasoning Effort: High"));
     TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_MEDIUM), "Reasoning Effort: High"));
+    TEST_ASSERT(!strcmp(ds4_glm_reasoning_effort_text(DS4_THINK_XHIGH),
+                        "Reasoning Effort: High"));
+    char xhigh_deepseek_text[128];
+    snprintf(xhigh_deepseek_text, sizeof(xhigh_deepseek_text), "%s",
+             ds4_deepseek41_reasoning_effort_text(DS4_THINK_XHIGH));
+    TEST_ASSERT(!strcmp(xhigh_deepseek_text,
+                        ds4_deepseek41_reasoning_effort_text(DS4_THINK_HIGH)));
+    TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_XHIGH, 32768) ==
+                DS4_THINK_XHIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX, 32768) == DS4_THINK_HIGH);
     TEST_ASSERT(ds4_think_mode_for_context(DS4_THINK_MAX,
                                            (int)ds4_think_max_min_context()) == DS4_THINK_MAX);
@@ -18277,7 +18299,7 @@ static void test_api_thinking_controls_parse(void) {
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
-    TEST_ASSERT(mode == DS4_THINK_HIGH);
+    TEST_ASSERT(mode == DS4_THINK_XHIGH);
 
     const int levels[] = {0, 1, 25, 50, 99, 100};
     for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {

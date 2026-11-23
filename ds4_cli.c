@@ -505,9 +505,15 @@ static void build_chat_prompt(ds4_engine *engine,
                               ds4_tokens *out) {
     const ds4_think_mode think_mode = cli_effective_think_mode(gen);
     ds4_chat_begin(engine, out);
-    ds4_chat_append_think_prefix(engine, out, think_mode);
-    if (gen->system && gen->system[0])
-        ds4_chat_append_message(engine, out, "system", gen->system);
+    if (ds4_engine_is_inkling2(engine)) {
+        if (gen->system && gen->system[0])
+            ds4_chat_append_message(engine, out, "system", gen->system);
+        ds4_chat_append_think_prefix(engine, out, think_mode);
+    } else {
+        ds4_chat_append_think_prefix(engine, out, think_mode);
+        if (gen->system && gen->system[0])
+            ds4_chat_append_message(engine, out, "system", gen->system);
+    }
     ds4_prompt_prefix_append(engine, out, &gen->prefix);
     ds4_chat_append_message(engine, out, "user", gen->prompt ? gen->prompt : "");
     ds4_chat_append_assistant_prefix(engine, out, think_mode);
@@ -1392,8 +1398,8 @@ static void repl_chat_build_think_prefix(ds4_engine *engine,
 }
 
 /* Insert/replace the model-family thinking prefix inside the existing
- * transcript.  It lives immediately after the BOS sequence and before any
- * user/system text, matching the GGUF chat templates. */
+ * transcript. Legacy protocols place it after BOS; Inkling places its
+ * effort message after the initial system messages. */
 static bool repl_chat_apply_think_prefix(ds4_engine *engine,
                                          repl_chat *chat,
                                          ds4_think_mode mode) {
@@ -1446,9 +1452,14 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     memset(chat, 0, sizeof(*chat));
     chat->initial_system_text = cfg->gen.system && cfg->gen.system[0];
     ds4_chat_begin(engine, &chat->transcript);
+    if (ds4_engine_is_inkling2(engine) &&
+        cfg->gen.system && cfg->gen.system[0]) {
+        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
+    }
     chat->think_prefix_pos = chat->transcript.len;
     repl_chat_apply_think_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
-    if (cfg->gen.system && cfg->gen.system[0]) {
+    if (!ds4_engine_is_inkling2(engine) &&
+        cfg->gen.system && cfg->gen.system[0]) {
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
     ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);

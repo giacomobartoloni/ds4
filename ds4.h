@@ -28,8 +28,11 @@ typedef enum {
     DS4_THINK_MAX,
     DS4_THINK_LOW,      /* Qwen3.8 reasoning_effort low/medium; other models render them as HIGH */
     DS4_THINK_MEDIUM,
+    DS4_THINK_MINIMAL,
+    DS4_THINK_XHIGH,
 } ds4_think_mode;
-/* Explicit numeric effort lives outside the stable named-mode values. */
+/* Explicit numeric effort uses percent/hundredths outside the named modes;
+ * parsers also accept a decimal string in [0.0, 0.99]. */
 #define DS4_THINK_LEVEL_BASE 1000
 
 typedef enum {
@@ -358,6 +361,7 @@ int ds4_dump_chat_tokenization(const char *model_path,
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_deepseek41(ds4_engine *e);
+bool ds4_engine_is_inkling2(ds4_engine *e);
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

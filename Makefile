@@ -1582,6 +1582,7 @@ clean:
 	rm -f tests/test_inkling2_state
 	rm -f tests/test_inkling2_model
 	rm -f tests/test_inkling2_gguf
+	rm -f tests/test_inkling2_tokenizer
 	rm -f ds4_inkling_moe.o
 	rm -f ds4_inkling_loop.o
 	rm -f speed-bench/inkling2_metal_quant_bench
@@ -1714,3 +1715,13 @@ tests/test_inkling2_gguf: tests/test_inkling2_gguf.o ds4_engram.c $(filter-out d
 .PHONY: test-inkling2-gguf
 test-inkling2-gguf: tests/test_inkling2_gguf
 	./tests/test_inkling2_gguf
+
+tests/test_inkling2_tokenizer.o: tests/test_inkling2_tokenizer.c ds4.c ds4.h ds4_gguf.h ds4_inkling.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_inkling2_tokenizer: tests/test_inkling2_tokenizer.o ds4_engram.c $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-inkling2-tokenizer
+test-inkling2-tokenizer: tests/test_inkling2_tokenizer
+	./tests/test_inkling2_tokenizer
