@@ -7,7 +7,6 @@
 
 #include "ds4_inkling.h"
 
-#define DS4_INKLING_CONTEXT 8192u
 #define DS4_INKLING_SLIDING_WINDOW 1024u
 #define DS4_INKLING_KV_HEADS 8u
 #define DS4_INKLING_KV_HEAD_DIM 128u

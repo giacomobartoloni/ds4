@@ -32,9 +32,11 @@ relative runtime files such as Metal kernels can be found.
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
 Inkling 2 Mini is exposed as `inkling-2-mini` when its IQ4_NL GGUF is loaded.
-On Apple Silicon it uses the native Metal backend, supports text and function
-tool calls, and currently runs one session at context 8192. Do not enable
-`--batched-session` for this model.
+On Apple Silicon it uses the native Metal backend and supports text and function
+tool calls. Set `--ctx` per session, up to the GGUF's 1,048,576-token limit;
+session creation also checks the estimated state against the device's recommended
+Metal working set. On an M4 with 32 GB, 131,072 tokens leave more memory headroom
+than 200,000. Only one session is supported; do not enable `--batched-session`.
 
 `GET /v1/models` and `GET /v1/models/{id}` include `architecture.input_modalities` and `architecture.output_modalities`. Input modalities are `["text", "image"]` when the loaded engine has vision enabled, otherwise `["text"]`; output modalities are always `["text"]`. Compatibility aliases report the same loaded-engine capabilities.
 

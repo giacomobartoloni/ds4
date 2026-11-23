@@ -1,6 +1,6 @@
 # Inkling 2 Mini on Apple Metal
 
-This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. The first supported model format is the mixed IQ4_NL GGUF, with an 8192-token context and FP16 key/value state. DS4 loads the GGUF directly through its mmap loader and executes operators in its native C and Metal paths; it does not use llama.cpp or MLX as a runtime dependency.
+This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. The first supported model format is the mixed IQ4_NL GGUF, with FP16 key/value state. Context length is selected per session, bounded by the GGUF metadata and Metal working-set budget. DS4 loads the GGUF directly through its mmap loader and executes operators in its native C and Metal paths; it does not use llama.cpp or MLX as a runtime dependency.
 
 ## Handoff gate status
 
@@ -32,7 +32,15 @@ The expert GEMV now uses an in-SIMD reduction followed by one threadgroup barrie
 
 The eight focused Inkling targets (`state`, `inspect`, `model`, `mapping`, `metal`, `gguf`, `session`, and `tokenizer`) pass on this M4 build; the focused Metal test also passes after the SIMD reduction. `make ds4 cpu ds4_test`, a forced native Metal `make -B ds4`, and `./ds4_test --server` pass. A non-Apple-macro syntax check of `ds4.c` passes after guarding the Metal-only session field. The latest `./ds4_test --metal-kernels` run exits non-zero with exactly the same 29 assertion records as the captured M0 baseline; the assertion lists compare equal. The context allocator reports 454,785,284 bytes (433.72 MiB) at context 8192. A 500 ms `footprint` sample during a 32-token run reported process `phys_footprint_peak=585,418,792` bytes (558.3 MiB); this is not a complete Metal/device working-set peak measurement. The CLI's generic `KV 0.06 GiB` estimate is a different model-family metric and does not include this Inkling session allocation. The repository's default `ds4flash.gguf` is absent, so the full existing-model and SSD-streaming regression paths were not run; no CUDA compiler/device is available on this Mac. Inkling explicitly rejects SSD streaming and non-Metal execution.
 
-The M4 reports a recommended Metal working set of 26,800.60 MB (24.96 GiB). The session allocator estimates 454,785,284 bytes (433.72 MiB) at context 8192, while DS4 reported 16,811.33 MiB mapped for the model. Those are allocation/mapping figures; peak resident memory was not measured. Prefill is still conservative and evaluates tokens incrementally. Long-context numerical parity, a stable TTFT/prompt-throughput benchmark, peak resident memory, real EOS completion, and speculative/interrupted rollback remain open.
+The local GGUF declares `inkling2_loop.context_length=1,048,576`, matching the 1M-token maximum in the official [Inkling 2 Mini model card at the pinned revision](https://huggingface.co/thinkingmachines/Inkling-2-Mini/blob/7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6/README.md). That is a model limit, not a promise that a local device can allocate the corresponding cache. The M4 reports a recommended Metal working set of 26,800.60 MB (24.96 GiB); with this 17,627,940,768-byte GGUF and DS4's 2 GiB runtime reserve, the allocator estimates about 4.17 GiB of session state at context 131,072, leaving about 2.54 GB below the recommended working set. Context 200,000 estimates 6.28 GiB of state and leaves about 285 MB; treat it as near the device budget. Context 1,048,576 would need about 32.17 GiB for session state alone and cannot fit alongside the model. These are allocation estimates, not measured resident peaks. The runtime checks the actual Metal recommendation before allocating a session.
+
+At the initial context 8192, the session allocator estimates 454,785,284 bytes (433.72 MiB), while DS4 reports 16,811.33 MiB mapped for the model. Peak resident memory was not measured. Prefill is still conservative and evaluates tokens incrementally. Long-context numerical parity, a stable TTFT/prompt-throughput benchmark, peak resident memory, real EOS completion, and speculative/interrupted rollback remain open.
+
+With the real GGUF on the M4, a session configured at `--ctx 131072` passed the
+Metal budget check and generated `,\n\nI am trying to use the` from the
+one-token raw prompt `Hello`. This verifies larger session capacity and normal
+decode at that configuration; the prompt itself did not exceed 8192 tokens, so
+it is not long-context numerical validation or a throughput benchmark.
 
 ## Conversational API and function tools — 2026-11-23
 
@@ -60,11 +68,13 @@ with the Codex-style `functions.exec` custom tool returned a
 `custom_tool_call` with JavaScript input and the expected delta/done events. A
 full-history follow-up with the caller-supplied tool result returned `TOOL_OK`.
 The generated JavaScript was not executed by this test. Codex CLI 0.171.0 did
-not complete with its full agent/tool prompt at context 8192; use a harness whose
-prompt and tool definitions fit that context.
+not complete with its full agent/tool prompt at context 8192. Larger session
+contexts are accepted up to the GGUF limit and available Metal memory, but
+Codex CLI has not yet been revalidated above 8192.
 
-Inkling remains text-only, batch size 1, context 8192, and one resident server
-session; do not use `--batched-session`. Responses IDs are not stored durably.
+Inkling remains text-only, batch size 1, and one resident server session; do not
+use `--batched-session`. Set `--ctx` within the GGUF limit and device memory
+budget. Responses IDs are not stored durably.
 Output-only tool continuation is bound by a `call_id` in the live server state;
 after a process restart, replay the complete input history instead. The
 OpenAI, Responses, and Anthropic Inkling SSE adapters and malformed-call
@@ -96,7 +106,7 @@ These source revisions were inspected as format and semantic references; DS4 doe
 
 - 24 physical layers, with loop core `[6,18)` executed in three passes. The resulting 48 logical visits reuse those 24 physical weight owners and each have an independent cache slot.
 - The pinned model's 24-entry sliding-window pattern identifies physical full-attention layers 5, 11, 17, and 23. Across the 48 visits this yields 8 full-attention and 40 sliding-window cache slots.
-- Initial inference scope: one text-only session, batch size 1, context 8192, IQ4_NL expert matrices, Q8_0 other matrices, F32 loop controller tensors, and FP16 KV. Unsupported model metadata must be rejected rather than silently assumed.
+- Initial inference scope: one text-only session, batch size 1, context 8192, IQ4_NL expert matrices, Q8_0 other matrices, F32 loop controller tensors, and FP16 KV. Context can now be selected per session up to the GGUF limit, subject to the Metal working-set check. Unsupported model metadata must be rejected rather than silently assumed.
 - A benchmark or numerical-parity claim requires the model file to be present and the exact tested file, prompt, context, and run count to be recorded.
 
 ## Decoder integration inventory and GPU session state

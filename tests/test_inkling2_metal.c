@@ -986,7 +986,7 @@ static int test_gpu_context_owns_independent_visit_state(void) {
     int ok = 1;
     ds4_inkling_plan plan;
     ds4_inkling_gpu_context context;
-    uint64_t bytes_2048 = 0, bytes_8192 = 0;
+    uint64_t bytes_2048 = 0, bytes_8192 = 0, bytes_65536 = 0, bytes_max = 0;
     memset(&context, 0, sizeof(context));
     make_small_plan(&plan);
 
@@ -994,7 +994,16 @@ static int test_gpu_context_owns_independent_visit_state(void) {
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 8192u, &bytes_8192));
     CHECK(bytes_8192 > bytes_2048);
     CHECK(bytes_8192 < 450u * 1024u * 1024u);
-    CHECK(!ds4_inkling_gpu_context_required_bytes(&plan, 8193u, &bytes_8192));
+    CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 65536u,
+                                                &bytes_65536));
+    CHECK(bytes_65536 > bytes_8192);
+    CHECK(bytes_65536 > (2ull << 30) && bytes_65536 < (3ull << 30));
+    CHECK(ds4_inkling_gpu_context_required_bytes(&plan,
+            DS4_INKLING_CONTEXT_MAX, &bytes_max));
+    CHECK(bytes_max > bytes_65536);
+    CHECK(bytes_max > (32ull << 30) && bytes_max < (33ull << 30));
+    CHECK(!ds4_inkling_gpu_context_required_bytes(&plan,
+            DS4_INKLING_CONTEXT_MAX + 1u, &bytes_max));
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 8192u, &bytes_8192));
     printf("Inkling2 8192-token GPU context allocation: %llu bytes (%.2f MiB)\n",
            (unsigned long long)bytes_8192,

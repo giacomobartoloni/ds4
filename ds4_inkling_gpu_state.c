@@ -123,7 +123,7 @@ static bool context_layout(const ds4_inkling_plan *plan,
                            uint32_t context_capacity,
                            ds4_inkling_gpu_layout *layout) {
     if (!layout || !plan_is_valid(plan) || context_capacity == 0 ||
-        context_capacity > DS4_INKLING_CONTEXT) return false;
+        context_capacity > DS4_INKLING_CONTEXT_MAX) return false;
     memset(layout, 0, sizeof(*layout));
 
     if (!parameter_storage_size(plan, &layout->weight_storage_bytes)) return false;

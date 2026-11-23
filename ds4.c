@@ -77751,11 +77751,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         uint64_t state_bytes = 0;
         const uint64_t recommended = ds4_gpu_recommended_working_set_size();
         if (e->backend != DS4_BACKEND_METAL || !e->metal_ready ||
-            ctx_size > (int)DS4_INKLING_CONTEXT || e->tp.active ||
-            e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            e->tp.active || e->distributed.role != DS4_DISTRIBUTED_NONE) {
             fprintf(stderr,
-                    "ds4: Inkling 2 Mini requires a local ready Metal engine, no tensor/distributed parallelism, and context <= %u\n",
-                    DS4_INKLING_CONTEXT);
+                    "ds4: Inkling 2 Mini requires a local ready Metal engine "
+                    "and no tensor/distributed parallelism\n");
+            return 1;
+        }
+        if ((uint64_t)ctx_size > g_ds4_inkling_model_config.context_length) {
+            fprintf(stderr,
+                    "ds4: requested context %d exceeds the GGUF context length of %" PRIu64 "\n",
+                    ctx_size, g_ds4_inkling_model_config.context_length);
             return 1;
         }
         if (e->inkling_session_live) {
@@ -77771,9 +77776,16 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             e->model.size + reserve_bytes > UINT64_MAX - state_bytes ||
             e->model.size + reserve_bytes + state_bytes > recommended) {
             fprintf(stderr,
-                    "ds4: Inkling 2 Mini model and session state exceed the Metal working-set budget\n");
+                    "ds4: Inkling 2 Mini context memory check failed "
+                    "(ctx=%d, estimated session state=%" PRIu64
+                    " bytes, Metal recommended working set=%" PRIu64 " bytes)\n",
+                    ctx_size, state_bytes, recommended);
             return 1;
         }
+        fprintf(stderr,
+                "ds4: Inkling 2 Mini session state estimate %.2f GiB "
+                "(ctx=%d, FP16 KV)\n",
+                (double)state_bytes / (1024.0 * 1024.0 * 1024.0), ctx_size);
 
         ds4_session *s = xcalloc(1, sizeof(*s));
         s->engine = e;

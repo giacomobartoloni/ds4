@@ -131,12 +131,11 @@ Select `ds4/deepseek-v4-flash` as the model.
 ## Codex CLI
 
 The Responses endpoint accepts Codex `additional_tools` namespaces and emits
-both `function_call` and `custom_tool_call` items. However, Codex CLI 0.171.0
-with its full agent/tool prompt did not complete at Inkling's 8192-token context:
-the client reported that the model context was full before a usable turn. The
-provider syntax below identifies the API connection, but this CLI setup is not
-verified as a working Inkling harness. Use a client whose initial instructions
-and tool schemas fit within the configured context.
+both `function_call` and `custom_tool_call` items. Codex CLI 0.171.0 with its
+full agent/tool prompt did not complete at Inkling's 8192-token context: the
+client reported that the model context was full before a usable turn. DS4 now
+accepts a larger `--ctx` up to the GGUF limit and Metal memory budget, but this
+Codex CLI setup has not yet been revalidated with a larger context.
 
 Use the Responses API. Add a provider to the Codex configuration:
 

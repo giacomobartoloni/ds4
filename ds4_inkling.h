@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define DS4_INKLING_CONTEXT_MIN 8192u
+#define DS4_INKLING_CONTEXT_MAX 1048576u
 #define DS4_INKLING_PHYSICAL_LAYERS 24u
 #define DS4_INKLING_LOOP_START 6u
 #define DS4_INKLING_LOOP_END 18u
@@ -115,7 +117,8 @@ static inline ds4_inkling_model_status ds4_inkling_model_validate(
         config->vocab_padded != 201024u || config->vocab_unpadded != 200058u ||
         config->head_dim != 128u || config->expert_count != 128u ||
         config->experts_used != 8u || config->expert_ffn_dim != 1152u ||
-        config->context_length < 8192u || config->context_length > 1048576u ||
+        config->context_length < DS4_INKLING_CONTEXT_MIN ||
+        config->context_length > DS4_INKLING_CONTEXT_MAX ||
         config->loop_start != 6u || config->loop_end != 18u ||
         config->loop_passes != 3u || config->gate_rank != 64u ||
         config->residual_block_size != 6u || config->sliding_window != 1024u ||

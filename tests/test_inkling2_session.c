@@ -80,7 +80,7 @@ static void make_test_config(void) {
     config->expert_count = 128u;
     config->experts_used = 8u;
     config->expert_ffn_dim = 1152u;
-    config->context_length = DS4_INKLING_CONTEXT;
+    config->context_length = DS4_INKLING_CONTEXT_MAX;
     config->loop_start = DS4_INKLING_LOOP_START;
     config->loop_end = DS4_INKLING_LOOP_END;
     config->loop_passes = DS4_INKLING_LOOP_PASSES;
@@ -304,8 +304,9 @@ int main(void) {
             TEST_MODEL_BYTES, TEST_MODEL_BYTES));
 
     ds4_session *session = NULL;
-    assert(ds4_session_create(&session, &engine, 8192) == 0);
+    assert(ds4_session_create(&session, &engine, 8193) == 0);
     assert(session && session->inkling_gpu_ready);
+    assert(session->ctx_size == 8193);
     assert(session->inkling_gpu.weight_owner_count ==
            DS4_INKLING_PHYSICAL_LAYERS);
     verify_residual_query_order(session);
