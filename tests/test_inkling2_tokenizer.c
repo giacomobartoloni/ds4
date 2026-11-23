@@ -74,6 +74,8 @@ int main(void) {
     add_piece_token(&vocab, "1", 34);
     add_piece_token(&vocab, "3", 35);
     add_piece_token(&vocab, "5", 36);
+    add_piece_token(&vocab, "Aé", 37);
+    add_piece_token(&vocab, "B", 38);
     table_put(&vocab.merge_rank, (ds4_str){"a b", 3}, 0);
 
     const int split_case[] = {10, 11, 12, 13, 14};
@@ -94,6 +96,9 @@ int main(void) {
     const int unicode_case[] = {21};
     expect_tokens(&vocab, "世界", unicode_case,
                   sizeof(unicode_case) / sizeof(unicode_case[0]));
+    const int unicode_case_boundary[] = {37, 38};
+    expect_tokens(&vocab, "AéB", unicode_case_boundary,
+                  sizeof(unicode_case_boundary) / sizeof(unicode_case_boundary[0]));
     const int punctuation_case[] = {22};
     expect_tokens(&vocab, "!/\n/", punctuation_case,
                   sizeof(punctuation_case) / sizeof(punctuation_case[0]));

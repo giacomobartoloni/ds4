@@ -45873,34 +45873,45 @@ static uint64_t gpt4o_letter_piece_end(const char *text, uint64_t len,
     }
 
     uint64_t run_end = letter_start;
-    uint64_t last_char_start = letter_start;
     while (run_end < len) {
         const qwen4_char_info ch = qwen4_char_at(text, len, run_end);
         if (!gpt4o_is_letter_mark(ch)) break;
-        last_char_start = run_end;
         run_end = ch.next;
     }
     if (run_end == letter_start) return start;
 
     /* Alternative 1: zero or more non-lowercase letters, then one or more
-     * non-uppercase letters. Greedy backtracking permits a Unicode-only run. */
-    uint64_t upperish_end = letter_start;
-    while (upperish_end < run_end) {
-        const qwen4_char_info ch = qwen4_char_at(text, len, upperish_end);
+     * non-uppercase letters. If the first group consumes the whole run, the
+     * regex backtracks to the last character that can start the second group. */
+    uint64_t first_lower = letter_start;
+    while (first_lower < run_end) {
+        const qwen4_char_info ch = qwen4_char_at(text, len, first_lower);
         if (gpt4o_ascii_lower(ch)) break;
-        upperish_end = ch.next;
+        first_lower = ch.next;
     }
     uint64_t end = start;
-    if (upperish_end < run_end) {
-        end = upperish_end;
+    if (first_lower < run_end) {
+        end = first_lower;
         while (end < run_end) {
             const qwen4_char_info ch = qwen4_char_at(text, len, end);
             if (gpt4o_ascii_upper(ch)) break;
             end = ch.next;
         }
-        if (end == upperish_end) end = start;
-    } else if (!gpt4o_ascii_upper(qwen4_char_at(text, len, last_char_start))) {
-        end = run_end;
+    } else {
+        uint64_t last_non_upper = run_end;
+        for (uint64_t scan = letter_start; scan < run_end;) {
+            const qwen4_char_info ch = qwen4_char_at(text, len, scan);
+            if (!gpt4o_ascii_upper(ch)) last_non_upper = scan;
+            scan = ch.next;
+        }
+        if (last_non_upper < run_end) {
+            end = last_non_upper;
+            while (end < run_end) {
+                const qwen4_char_info ch = qwen4_char_at(text, len, end);
+                if (gpt4o_ascii_upper(ch)) break;
+                end = ch.next;
+            }
+        }
     }
 
     /* Alternative 2: one or more non-lowercase letters, then any remaining
