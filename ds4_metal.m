@@ -23318,6 +23318,13 @@ typedef struct {
     float scalar;
 } ds4_gpu_inkling2_args;
 
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t blocks_per_row;
+    uint32_t pad;
+} ds4_gpu_inkling2_iq4_nl_args;
+
 static int ds4_gpu_inkling2_tensor_fits(
         const ds4_gpu_tensor *tensor, uint64_t bytes, const char *name) {
     if (!ds4_gpu_tensor_buffer(tensor) || ds4_gpu_tensor_bytes(tensor) < bytes) {
@@ -23503,6 +23510,108 @@ int ds4_gpu_inkling2_router_topk_tensor(
              threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 router top-k")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_gemv_iq4_nl_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x) {
+    if ((!g_initialized && !ds4_gpu_init()) || !out || !model_map || !x ||
+        in_dim == 0 || out_dim == 0 || (in_dim % 32u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    const uint64_t x_bytes = in_dim * sizeof(float);
+    const uint64_t out_bytes = out_dim * sizeof(float);
+    const uint64_t blocks_per_row = in_dim / 32u;
+    if (blocks_per_row > UINT64_MAX / 18u) return 0;
+    const uint64_t row_bytes = blocks_per_row * 18u;
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        !ds4_gpu_inkling2_tensor_fits(x, x_bytes, "IQ4_NL activation") ||
+        !ds4_gpu_inkling2_tensor_fits(out, out_bytes, "IQ4_NL output")) return 0;
+
+    @autoreleasepool {
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> weight_buffer = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        id<MTLBuffer> x_buffer = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> out_buffer = ds4_gpu_tensor_buffer(out);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_gemv_iq4_nl");
+        if (!weight_buffer || !x_buffer || !out_buffer || !pipeline) return 0;
+
+        ds4_gpu_inkling2_iq4_nl_args args = {
+            .in_dim = (uint32_t)in_dim,
+            .out_dim = (uint32_t)out_dim,
+            .blocks_per_row = (uint32_t)blocks_per_row,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight_buffer offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:x_buffer offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:out_buffer offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 IQ4_NL GEMV")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_expert_accumulate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *expert_outputs,
+        const ds4_gpu_tensor *weights,
+        uint32_t                out_dim,
+        uint32_t                n_used) {
+    if ((!g_initialized && !ds4_gpu_init()) || out_dim == 0 ||
+        n_used == 0 || n_used > 8u) return 0;
+    const uint64_t elements = (uint64_t)out_dim * n_used;
+    if (elements > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t expert_bytes = elements * sizeof(float);
+    const uint64_t weight_bytes = (uint64_t)n_used * sizeof(float);
+    if (!ds4_gpu_inkling2_tensor_fits(out, output_bytes, "expert sum output") ||
+        !ds4_gpu_inkling2_tensor_fits(expert_outputs, expert_bytes,
+                                      "expert vectors") ||
+        !ds4_gpu_inkling2_tensor_fits(weights, weight_bytes, "expert weights")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_expert_accumulate");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_args args = { .count = out_dim, .n_used = n_used };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(expert_outputs)
+                offset:ds4_gpu_tensor_offset(expert_outputs) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(weights)
+                offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        const NSUInteger groups = (NSUInteger)(((uint64_t)out_dim + 255u) / 256u);
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                          "Inkling2 expert accumulation")) return 0;
     }
     return 1;
 }

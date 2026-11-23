@@ -1299,6 +1299,23 @@ int ds4_gpu_inkling2_router_topk_tensor(
         uint32_t                n_experts,
         uint32_t                n_used,
         float                   routed_scale);
+
+int ds4_gpu_inkling2_gemv_iq4_nl_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x);
+
+/* `expert_outputs` is [n_used][out_dim], and `weights` is [n_used]. */
+int ds4_gpu_inkling2_expert_accumulate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *expert_outputs,
+        const ds4_gpu_tensor *weights,
+        uint32_t                out_dim,
+        uint32_t                n_used);
 #endif
 
 int ds4_gpu_rms_norm_weight_bf16_tensor(

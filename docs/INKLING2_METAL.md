@@ -9,7 +9,8 @@ This document tracks native DS4 support for the text-only Inkling 2 Mini GGUF. T
 | M0: repository, references, and host baseline | Complete | Build and server results below; Metal regression baseline captured before implementation. |
 | M1: GGUF inspector and 48-visit mapping | Complete for no-weight validation | Inspector and planner tests pass; live GGUF validation remains pending because weights are absent. |
 | M2: native Metal control operators | Complete for isolated no-weight tests | Focused scalar-oracle tests pass on Apple M4; model integration is not part of this milestone. |
-| M3+: quantized layers, attention/state, generation, parity, and performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
+| M3: quantized token-vector primitives | Complete for synthetic block tests | IQ4_NL decode/GEMV, existing Q8_0 GEMV reuse, and top-8 output accumulation pass scalar-oracle tests. The expert FFN is not yet integrated. |
+| M3+: full expert FFN, attention/state, generation, parity, and model performance | Not started | Model-dependent integration and validation require the GGUF to be available locally. |
 
 ## M0 baseline
 
@@ -67,3 +68,15 @@ Synthetic coverage: `make test-inkling2-inspect` passes 18 tests for valid descr
 After M2, `./ds4_test --metal-kernels` still reports exactly the 29 baseline assertion failures. Comparing captured assertion records against `/tmp/ds4-inkling2-metal-baseline.log` found no new or resolved records. Existing failures remain in compressor pair state-store and gathered KV staging/kernel-selection cases. No M2 throughput claim is made; the serial router and reductions have not been benchmarked or optimized.
 
 These operators are not yet connected to a model execution path. The live Inkling GGUF remains absent, so end-to-end generation and same-weight numerical parity remain unverified.
+
+## M3 quantized token-vector primitives
+
+The IQ4_NL Metal GEMV reads the canonical 18-byte block layout directly: a little-endian FP16 scale followed by 16 packed bytes for 32 values, using the GGML `kvalues_iq4nl` lookup table. Low nibbles address values 0–15 and high nibbles address values 16–31. The kernel decodes each selected weight inline, accumulates in FP32 across a cooperative threadgroup, and does not materialize a dequantized matrix. Rows are contiguous with `18 * (in_dim / 32)` bytes; partial blocks are rejected.
+
+`ds4_gpu_matmul_q8_0_tensor` is reused for Q8_0 rather than adding another copy of DS4's existing Metal GEMV. `ds4_gpu_inkling2_expert_accumulate_tensor` combines up to eight already-computed expert output vectors using routed weights; it does not dequantize or combine expert matrices. Full gate/up SiTU, down projection, and expert-layer orchestration remain unimplemented.
+
+The extended `make test-inkling2-metal` fixture checks 96-element inputs and five output rows, multiple block scales, low/high nibble order, non-four-byte row strides (54-byte IQ4_NL rows and 102-byte Q8_0 rows), and rejection of partial blocks. Its scalar C oracle passes on the Apple M4. No model bytes are used.
+
+The standalone `make inkling2-metal-quant-bench` was run on synthetic 1152 × 2304 matrices with three warmups and three serial runs of ten synchronous calls each. IQ4_NL took 537.6, 574.7, and 596.7 µs/op; reused Q8_0 took 331.5, 294.7, and 278.8 µs/op. These timings include DS4 dispatch and synchronization, use synthetic weights, and are not model throughput results.
+
+After M3, `./ds4_test --metal-kernels` still reports the same 29 assertion records as M0; comparison found no new or resolved records. The model is absent, so no real checkpoint block, MoE output, full-model memory, or text-generation parity has been measured.

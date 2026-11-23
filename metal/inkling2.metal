@@ -9,6 +9,19 @@ struct ds4_metal_args_inkling2 {
     float scalar;
 };
 
+struct ds4_metal_args_inkling2_iq4_nl {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t blocks_per_row;
+    uint32_t pad;
+};
+
+/* Canonical GGML IQ4_NL codebook from ggml-common.h (`kvalues_iq4nl`). */
+constant short ds4_inkling2_iq4_nl_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113,
+};
+
 kernel void kernel_inkling2_gate_update(
         constant ds4_metal_args_inkling2 &args [[buffer(0)]],
         device const float *current [[buffer(1)]],
@@ -121,4 +134,55 @@ kernel void kernel_inkling2_router_topk(
         weights[(uint64_t)token * args.n_used + rank] =
             args.scalar * raw_scores[rank] / denominator;
     }
+}
+
+/* IQ4_NL stores 32 values in 18 bytes: an fp16 block scale followed by 16
+ * bytes whose low nibbles encode values 0..15 and high nibbles encode 16..31.
+ * Each threadgroup owns one output row and decodes weights in place. */
+kernel void kernel_inkling2_gemv_iq4_nl(
+        constant ds4_metal_args_inkling2_iq4_nl &args [[buffer(0)]],
+        device const char *weights [[buffer(1)]],
+        device const float *x [[buffer(2)]],
+        device float *out [[buffer(3)]],
+        threadgroup float *partial [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    if (row >= args.out_dim) return;
+    const uint64_t row_bytes = (uint64_t)args.blocks_per_row * 18u;
+    device const char *row_weights = weights + (uint64_t)row * row_bytes;
+    float sum = 0.0f;
+    for (uint i = lane; i < args.in_dim; i += lanes) {
+        const uint block_index = i >> 5u;
+        const uint within = i & 31u;
+        device const char *block = row_weights + (uint64_t)block_index * 18u;
+        const float scale = float(*(device const half *)block);
+        device const uchar *packed = (device const uchar *)(block + 2);
+        const uchar byte = packed[within & 15u];
+        const uint code = within < 16u ? (uint)(byte & 0x0fu) : (uint)(byte >> 4u);
+        sum += scale * float(ds4_inkling2_iq4_nl_values[code]) * x[i];
+    }
+    partial[lane] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) partial[lane] += partial[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) out[row] = partial[0];
+}
+
+/* Accumulate already-computed, selected expert vectors without expanding the
+ * quantized expert matrices into a dense temporary. */
+kernel void kernel_inkling2_expert_accumulate(
+        constant ds4_metal_args_inkling2 &args [[buffer(0)]],
+        device const float *expert_outputs [[buffer(1)]],
+        device const float *weights [[buffer(2)]],
+        device float *out [[buffer(3)]],
+        uint row [[thread_position_in_grid]]) {
+    if (row >= args.count) return;
+    float sum = 0.0f;
+    for (uint expert = 0; expert < args.n_used; expert++) {
+        sum += weights[expert] * expert_outputs[(uint64_t)expert * args.count + row];
+    }
+    out[row] = sum;
 }
