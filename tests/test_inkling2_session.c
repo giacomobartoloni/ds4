@@ -297,6 +297,18 @@ typedef struct {
     bool requested;
     int calls;
     int last_current;
+    ds4_session *session;
+    const float *expected_logits;
+    float *observed_logits;
+    int observed_logits_count;
+    int observed_argmax;
+    bool observed_logits_match;
+    bool observed_raw_logits_stale;
+    int observed_sample;
+    int observed_top_logprobs;
+    int observed_token_logprob;
+    uint64_t observed_payload_bytes;
+    int observed_snapshot_save;
 } prefill_cancel_probe;
 
 static void request_cancel_after_first_prefill_group(
@@ -306,7 +318,30 @@ static void request_cancel_after_first_prefill_group(
     if (strcmp(event, "prefill_chunk") != 0) return;
     probe->calls++;
     probe->last_current = current;
-    if (probe->calls == 1) probe->requested = true;
+    if (probe->calls == 1) {
+        probe->observed_raw_logits_stale = probe->session->logits[0] == -1234.5f;
+        probe->observed_logits_count = ds4_session_copy_logits(
+            probe->session, probe->observed_logits, TEST_VOCAB);
+        probe->observed_argmax = ds4_session_argmax(probe->session);
+        probe->observed_logits_match = probe->observed_logits_count == TEST_VOCAB &&
+            memcmp(probe->expected_logits, probe->observed_logits,
+                   (size_t)TEST_VOCAB * sizeof(float)) == 0;
+        uint64_t rng = 1;
+        probe->observed_sample = ds4_session_sample(
+            probe->session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        ds4_token_score top = {0}, token = {0};
+        probe->observed_top_logprobs = ds4_session_top_logprobs(
+            probe->session, &top, 1);
+        probe->observed_token_logprob = ds4_session_token_logprob(
+            probe->session, 0, &token);
+        probe->observed_payload_bytes = ds4_session_payload_bytes(probe->session);
+        ds4_session_snapshot snapshot = {0};
+        char snapshot_error[128] = {0};
+        probe->observed_snapshot_save = ds4_session_save_snapshot(
+            probe->session, &snapshot, snapshot_error, sizeof(snapshot_error));
+        ds4_session_snapshot_free(&snapshot);
+        probe->requested = true;
+    }
 }
 
 static bool prefill_cancel_requested(void *ud) {
@@ -428,18 +463,32 @@ int main(void) {
 
     assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
     prefill_cancel_probe cancel_probe = {0};
+    cancel_probe.session = session;
+    cancel_probe.expected_logits = prefix_logits;
+    cancel_probe.observed_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
+    assert(cancel_probe.observed_logits);
+    for (uint32_t i = 0; i < TEST_VOCAB; i++) session->logits[i] = -1234.5f;
     ds4_session_set_progress(session, request_cancel_after_first_prefill_group,
                               &cancel_probe);
     ds4_session_set_cancel(session, prefill_cancel_requested, &cancel_probe);
     assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) ==
            DS4_SESSION_SYNC_INTERRUPTED);
     assert(cancel_probe.calls == 1 && cancel_probe.last_current == 8);
+    assert(cancel_probe.observed_raw_logits_stale);
+    assert(cancel_probe.observed_logits_count == 0);
+    assert(cancel_probe.observed_argmax == -1);
+    assert(cancel_probe.observed_sample == -1);
+    assert(cancel_probe.observed_top_logprobs == 0);
+    assert(cancel_probe.observed_token_logprob == 0);
+    assert(cancel_probe.observed_payload_bytes == 0);
+    assert(cancel_probe.observed_snapshot_save != 0);
     assert(ds4_session_pos(session) == 8);
     assert(ds4_session_checkpoint_valid(session));
     assert(memcmp(prefix_logits, session->logits,
                   (size_t)TEST_VOCAB * sizeof(float)) == 0);
     ds4_session_set_progress(session, NULL, NULL);
     ds4_session_set_cancel(session, NULL, NULL);
+    free(cancel_probe.observed_logits);
     assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) == 0);
     assert(ds4_session_pos(session) == long_prompt.len);
     assert(memcmp(tokenwise_logits, session->logits,

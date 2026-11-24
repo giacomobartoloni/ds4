@@ -63952,6 +63952,8 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* Inkling prefill has committed cache rows whose logits are deferred. */
+    bool inkling_logits_pending;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -64571,7 +64573,9 @@ static bool inkling_gpu_restore_prefill_logits(
                  projected ? "Metal command completion" : failed_stage);
         return false;
     }
-    return inkling_gpu_read_logits(session, error, error_capacity);
+    if (!inkling_gpu_read_logits(session, error, error_capacity)) return false;
+    session->inkling_logits_pending = false;
+    return true;
 }
 
 static bool inkling_gpu_eval_group(ds4_session *session, const int *tokens,
@@ -64832,6 +64836,9 @@ static int inkling_gpu_prefill(ds4_session *session,
             }
             if (profile) read_ms += (now_sec() - read_start) * 1000.0;
             logits_groups++;
+            session->inkling_logits_pending = false;
+        } else {
+            session->inkling_logits_pending = true;
         }
         logits_pending = !want_logits;
 
@@ -67113,7 +67120,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         return bytes;
 #endif
     }
-    if (!s || !s->checkpoint_valid) return 0;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending) return 0;
     if (s->distributed) return 0;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
@@ -67514,8 +67521,11 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    if (!s || !fp || !s->checkpoint_valid) {
-        payload_set_err(err, errlen, "session has no valid checkpoint to save");
+    if (!s || !fp || !s->checkpoint_valid || s->inkling_logits_pending) {
+        payload_set_err(err, errlen,
+                        s && s->inkling_logits_pending ?
+                            "session checkpoint logits are pending" :
+                            "session has no valid checkpoint to save");
         return 1;
     }
     if (s->distributed) {
@@ -80766,6 +80776,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds4_inkling_gpu_context_reset(context);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+            s->inkling_logits_pending = false;
         }
         const int prefill_rc = inkling_gpu_prefill(s, prompt, start,
                                                    err, errlen);
@@ -82043,12 +82054,12 @@ static uint32_t ds4_session_vocab_count(const ds4_session *s) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     return sample_argmax(s->logits, ds4_session_vocab_count(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     const uint32_t vocab = ds4_session_vocab_count(s);
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
@@ -82069,7 +82080,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     const uint32_t vocab = ds4_session_vocab_count(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -82099,7 +82110,7 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     const uint32_t vocab = ds4_session_vocab_count(s);
     return sample_top_p_min_p(s->logits, vocab, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
@@ -82114,6 +82125,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         out[i].logit = DS4_NEG_INF;
         out[i].logprob = DS4_NEG_INF;
     }
+    if (s->inkling_logits_pending) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < vocab; i++) {
@@ -82144,7 +82156,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 ||
+    if (!s || !out || s->inkling_logits_pending || token < 0 ||
         token >= (int)ds4_session_vocab_count(s)) return 0;
     const uint32_t vocab = ds4_session_vocab_count(s);
 
@@ -82168,7 +82180,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out) return 0;
+    if (!s || !out || s->inkling_logits_pending || !s->logits) return 0;
     const uint32_t vocab = ds4_session_vocab_count(s);
     if (cap < (int)vocab) return 0;
     memcpy(out, s->logits, (size_t)vocab * sizeof(out[0]));
@@ -91450,6 +91462,7 @@ void ds4_session_invalidate(ds4_session *s) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
     }
     s->checkpoint_valid = false;
+    s->inkling_logits_pending = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
