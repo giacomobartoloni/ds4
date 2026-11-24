@@ -82,6 +82,47 @@ does not change that estimate materially. The next optimization target is the
 remaining per-row attention and convolution dispatch work, measured against
 repeatable real-prompt samples.
 
+## Deferred logits and Q8_0 A/B instrumentation — candidate, M4 validation pending
+
+The native Inkling visit-major prefill evaluates groups of at most eight rows.
+Normal prefill now performs the full vocabulary projection and host logit
+readback **only for the last group**, rather than each intermediate group.
+The last row's final residual mix stays resident in Metal. If cancellation
+arrives after an intermediate group, DS4 projects and reads that group's logits
+before returning an interrupted, reusable checkpoint. The decoder and the
+logical-visit, per-row causal attention/shortconv execution are unchanged.
+
+Two optional environment switches provide controlled, same-prompt comparisons:
+
+```sh
+DS4_INKLING_PREFILL_PROFILE=1 <normal DS4 command>
+DS4_INKLING_PREFILL_PROFILE=1 DS4_INKLING_PREFILL_LOGITS_EVERY_GROUP=1 <same command>
+DS4_INKLING_PREFILL_PROFILE=1 DS4_METAL_Q8_MV_EXT_MAX_TOKENS=2 <same command>
+```
+
+The first is the new default (final-group logits), the second restores the
+previous every-group behavior, and the third tests the existing Metal
+Q8_0 kernel dispatch with the few-row `mul_mv_ext` threshold reduced from
+16 to 2; with eight rows it selects the generic matrix path instead. This
+third mode **does not** increase Inkling's batch to 32/64 and **does not**
+guarantee a faster kernel. Use identical prompts, warmups, settings and the
+same M4. Repeat each measurement and compare prefill tokens/s, elapsed time,
+generated IDs, memory and resumed-prefix logits.
+
+`DS4_INKLING_PREFILL_PROFILE=1` prints group counts, vocabulary-projection
+counts, total wall time, CPU queue/submission time, GPU command-completion
+wait and host logit-readback time. These are *wall-clock sections*, not an
+independent per-kernel GPU profiler; `queue_ms` may include blocking
+backend calls. Avoid enabling the existing `DS4_METAL_Q8_PREFILL_PROFILE`
+for throughput comparisons: it forces synchronization around individual
+projections and is not representative of normal execution.
+
+`make test-inkling2-session` now checks the old every-group path against
+the final-only path and keeps the interrupted-prefix byte-identical logit
+comparison. This is a synthetic Metal fixture; real GGUF correctness,
+interrupt/resume, actual kernel selection, and stable M4 performance
+are still unverified. Keep the split-K attention PR separate.
+
 ## Conversational API and function tools — 2026-11-23
 
 The native server recognizes the `inkling-2-mini` model ID and selects the

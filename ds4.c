@@ -63952,6 +63952,8 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* Inkling prefill has committed cache rows whose logits are deferred. */
+    bool inkling_logits_pending;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -64523,6 +64525,59 @@ static bool inkling_gpu_run_visit(
     return true;
 }
 
+/* The last row's residual mix remains resident in mix_output_rows[0].
+ * This lets an interrupted prompt publish a valid checkpoint without
+ * rerunning any of its 48 visits. */
+static bool inkling_gpu_project_final_logits(
+        ds4_session *session, const char **failed_stage) {
+    ds4_engine *engine = session->engine;
+    ds4_inkling_gpu_context *context = &session->inkling_gpu;
+    if (failed_stage) *failed_stage = "output normalization";
+    if (!ds4_gpu_rms_norm_weight_tensor(
+            context->layer.next, context->layer.mix_output_rows[0],
+            engine->model.map, engine->model.size,
+            engine->inkling_weights.output_norm->abs_offset,
+            INKLING_GPU_HIDDEN, g_ds4_inkling_model_config.rms_epsilon))
+        return false;
+    if (failed_stage) *failed_stage = "output projection";
+    if (!ds4_gpu_matmul_q8_0_tensor(
+            context->logits, engine->model.map, engine->model.size,
+            engine->inkling_weights.output->abs_offset,
+            INKLING_GPU_HIDDEN,
+            (uint32_t)engine->inkling_weights.output->dim[1],
+            context->layer.next, 1u))
+        return false;
+    if (failed_stage) *failed_stage = "logit softcap";
+    return ds4_gpu_inkling2_logit_softcap_tensor(
+            context->logits, context->logits,
+            (uint32_t)engine->inkling_weights.output->dim[1],
+            g_ds4_inkling_model_config.final_logit_softcap) != 0;
+}
+
+/* A cancelled prefix is a public, reusable checkpoint. Materialize its
+ * logits on demand from the saved final residual mix before returning. */
+static bool inkling_gpu_restore_prefill_logits(
+        ds4_session *session, char *error, size_t error_capacity) {
+    if (!ds4_gpu_begin_commands()) {
+        snprintf(error, error_capacity,
+                 "Inkling 2 Mini checkpoint logits could not begin a Metal batch");
+        return false;
+    }
+    const char *failed_stage = "Metal command completion";
+    const bool projected = inkling_gpu_project_final_logits(
+        session, &failed_stage);
+    const bool completed = ds4_gpu_end_commands() != 0;
+    if (!projected || !completed) {
+        snprintf(error, error_capacity,
+                 "Inkling 2 Mini checkpoint logits failed at %s",
+                 projected ? "Metal command completion" : failed_stage);
+        return false;
+    }
+    if (!inkling_gpu_read_logits(session, error, error_capacity)) return false;
+    session->inkling_logits_pending = false;
+    return true;
+}
+
 static bool inkling_gpu_eval_group(ds4_session *session, const int *tokens,
                                    uint32_t n_tokens, bool want_logits,
                                    inkling_gpu_command_mode command_mode,
@@ -64666,24 +64721,8 @@ static bool inkling_gpu_eval_group(ds4_session *session, const int *tokens,
                 context->layer.mix_output_rows[0]);
         if (!ok) failed_stage = "final residual mix";
     }
-    if (ok && want_logits) failed_stage = "output normalization";
-    if (ok && want_logits) ok = ds4_gpu_rms_norm_weight_tensor(
-            context->layer.next, context->layer.mix_output_rows[0],
-            engine->model.map, engine->model.size,
-            engine->inkling_weights.output_norm->abs_offset,
-            INKLING_GPU_HIDDEN, g_ds4_inkling_model_config.rms_epsilon);
-    if (ok && want_logits) failed_stage = "output projection";
-    if (ok && want_logits) ok = ds4_gpu_matmul_q8_0_tensor(
-            context->logits, engine->model.map, engine->model.size,
-            engine->inkling_weights.output->abs_offset,
-            INKLING_GPU_HIDDEN,
-            (uint32_t)engine->inkling_weights.output->dim[1],
-            context->layer.next, 1u);
-    if (ok && want_logits) failed_stage = "logit softcap";
-    if (ok && want_logits) ok = ds4_gpu_inkling2_logit_softcap_tensor(
-            context->logits, context->logits,
-            (uint32_t)engine->inkling_weights.output->dim[1],
-            g_ds4_inkling_model_config.final_logit_softcap);
+    if (ok && want_logits)
+        ok = inkling_gpu_project_final_logits(session, &failed_stage);
     const bool commands_ok = commands_started &&
         (shared_commands || ds4_gpu_end_commands() != 0);
     if (!commands_ok && ok) {
@@ -64718,10 +64757,42 @@ static bool inkling_gpu_eval_token(ds4_session *session, uint32_t token,
 static int inkling_gpu_prefill(ds4_session *session,
                                const ds4_tokens *prompt, int start,
                                char *error, size_t error_capacity) {
+    /* The normal prefill needs output logits only for the final group.
+     * Keep the old every-group policy available for exact A/B comparisons. */
+    const char *logits_env = getenv("DS4_INKLING_PREFILL_LOGITS_EVERY_GROUP");
+    const bool every_group_logits = logits_env && logits_env[0] &&
+                                    strcmp(logits_env, "0") != 0;
+    const char *profile_env = getenv("DS4_INKLING_PREFILL_PROFILE");
+    const bool profile = profile_env && profile_env[0] &&
+                         strcmp(profile_env, "0") != 0;
+    const double started = profile ? now_sec() : 0.0;
+    double queue_ms = 0.0, finish_ms = 0.0, read_ms = 0.0;
+    uint32_t groups = 0, logits_groups = 0;
+    bool logits_pending = false;
+
     /* Process each logical visit across a small ordered row group. KV and
      * convolution histories advance in token order while MoE uses row batches. */
     for (int group_start = start; group_start < prompt->len;) {
         if (ds4_session_cancelled(session)) {
+            /* The latest group is committed, but an interrupted checkpoint
+             * must expose the same logits as a standalone prompt prefix. */
+            if (logits_pending) {
+                const double t0 = profile ? now_sec() : 0.0;
+                if (!inkling_gpu_restore_prefill_logits(
+                        session, error, error_capacity)) {
+                    ds4_session_invalidate(session);
+                    return 1;
+                }
+                if (profile) read_ms += (now_sec() - t0) * 1000.0;
+                logits_groups++;
+            }
+            if (profile) {
+                fprintf(stderr, "ds4: Inkling prefill interrupted tokens=%d groups=%u "
+                        "logits_groups=%u elapsed_ms=%.3f queue_ms=%.3f "
+                        "finish_ms=%.3f read_and_restore_ms=%.3f\n",
+                        group_start - start, groups, logits_groups,
+                        (now_sec() - started) * 1000.0, queue_ms, finish_ms, read_ms);
+            }
             snprintf(error, error_capacity, "interrupted");
             session->checkpoint_valid = session->checkpoint.len > 0;
             return DS4_SESSION_SYNC_INTERRUPTED;
@@ -64738,24 +64809,39 @@ static int inkling_gpu_prefill(ds4_session *session,
         }
 
         const uint32_t group_tokens = (uint32_t)(group_end - group_start);
+        const bool want_logits = every_group_logits || group_end == prompt->len;
+        const double queue_start = profile ? now_sec() : 0.0;
         bool ok = inkling_gpu_eval_group(session, prompt->v + group_start,
-                group_tokens, true, INKLING_GPU_COMMANDS_SHARED,
+                group_tokens, want_logits, INKLING_GPU_COMMANDS_SHARED,
                 error, error_capacity);
+        if (profile) queue_ms += (now_sec() - queue_start) * 1000.0;
         if (!ok) {
             (void)ds4_gpu_end_commands();
             ds4_session_invalidate(session);
             return 1;
         }
+        const double finish_start = profile ? now_sec() : 0.0;
         if (!ds4_gpu_end_commands()) {
             snprintf(error, error_capacity,
                      "Inkling 2 Mini Metal prefill command batch failed");
             ds4_session_invalidate(session);
             return 1;
         }
-        if (!inkling_gpu_read_logits(session, error, error_capacity)) {
-            ds4_session_invalidate(session);
-            return 1;
+        if (profile) finish_ms += (now_sec() - finish_start) * 1000.0;
+        if (want_logits) {
+            const double read_start = profile ? now_sec() : 0.0;
+            if (!inkling_gpu_read_logits(session, error, error_capacity)) {
+                ds4_session_invalidate(session);
+                return 1;
+            }
+            if (profile) read_ms += (now_sec() - read_start) * 1000.0;
+            logits_groups++;
+            session->inkling_logits_pending = false;
+        } else {
+            session->inkling_logits_pending = true;
         }
+        logits_pending = !want_logits;
+
         for (int i = group_start; i < group_end; i++) {
             token_vec_push(&session->checkpoint, prompt->v[i]);
             session->mtp_draft_valid = false;
@@ -64764,12 +64850,23 @@ static int inkling_gpu_prefill(ds4_session *session,
         session->checkpoint_valid = true;
 
         group_start = group_end;
+        groups++;
         if (session->progress)
             session->progress(session->progress_ud, "prefill_chunk",
                               group_end, prompt->len);
     }
+    if (profile) {
+        fprintf(stderr, "ds4: Inkling prefill complete tokens=%d groups=%u "
+                "logits_groups=%u skipped_logits=%u elapsed_ms=%.3f "
+                "queue_ms=%.3f finish_ms=%.3f read_ms=%.3f "
+                "(wall times; finish includes GPU work)\n",
+                prompt->len - start, groups, logits_groups,
+                groups - logits_groups, (now_sec() - started) * 1000.0,
+                queue_ms, finish_ms, read_ms);
+    }
     return 0;
 }
+
 #undef INKLING_GPU_REQUIRE
 #endif
 
@@ -67023,7 +67120,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         return bytes;
 #endif
     }
-    if (!s || !s->checkpoint_valid) return 0;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending) return 0;
     if (s->distributed) return 0;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
@@ -67424,8 +67521,11 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    if (!s || !fp || !s->checkpoint_valid) {
-        payload_set_err(err, errlen, "session has no valid checkpoint to save");
+    if (!s || !fp || !s->checkpoint_valid || s->inkling_logits_pending) {
+        payload_set_err(err, errlen,
+                        s && s->inkling_logits_pending ?
+                            "session checkpoint logits are pending" :
+                            "session has no valid checkpoint to save");
         return 1;
     }
     if (s->distributed) {
@@ -80676,6 +80776,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds4_inkling_gpu_context_reset(context);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+            s->inkling_logits_pending = false;
         }
         const int prefill_rc = inkling_gpu_prefill(s, prompt, start,
                                                    err, errlen);
@@ -81953,12 +82054,12 @@ static uint32_t ds4_session_vocab_count(const ds4_session *s) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     return sample_argmax(s->logits, ds4_session_vocab_count(s));
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     const uint32_t vocab = ds4_session_vocab_count(s);
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
@@ -81979,7 +82080,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     const uint32_t vocab = ds4_session_vocab_count(s);
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -82009,7 +82110,7 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (!s || !s->checkpoint_valid || s->inkling_logits_pending || !s->logits) return -1;
     const uint32_t vocab = ds4_session_vocab_count(s);
     return sample_top_p_min_p(s->logits, vocab, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
@@ -82024,6 +82125,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
         out[i].logit = DS4_NEG_INF;
         out[i].logprob = DS4_NEG_INF;
     }
+    if (s->inkling_logits_pending) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < vocab; i++) {
@@ -82054,7 +82156,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 ||
+    if (!s || !out || s->inkling_logits_pending || token < 0 ||
         token >= (int)ds4_session_vocab_count(s)) return 0;
     const uint32_t vocab = ds4_session_vocab_count(s);
 
@@ -82078,7 +82180,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out) return 0;
+    if (!s || !out || s->inkling_logits_pending || !s->logits) return 0;
     const uint32_t vocab = ds4_session_vocab_count(s);
     if (cap < (int)vocab) return 0;
     memcpy(out, s->logits, (size_t)vocab * sizeof(out[0]));
@@ -91360,6 +91462,7 @@ void ds4_session_invalidate(ds4_session *s) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
     }
     s->checkpoint_valid = false;
+    s->inkling_logits_pending = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
