@@ -56,6 +56,8 @@ static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
+/* One Inkling session per device; long-attention scratch persists across visits. */
+static ds4_gpu_tensor *g_inkling_attention_scratch;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_encoder_concurrent;
 static BOOL g_batch_has_work;
@@ -11973,6 +11975,8 @@ void ds4_gpu_cleanup(void) {
             g_stream_expert_cache_batch_seq = 0;
         }
         (void)ds4_gpu_wait_pending_command_buffers("cleanup");
+        ds4_gpu_tensor_free(g_inkling_attention_scratch);
+        g_inkling_attention_scratch = NULL;
         if (ds4_gpu_stream_expert_timing_summary_enabled() &&
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
@@ -24262,9 +24266,35 @@ int ds4_gpu_inkling2_attention_decode_tensor(
         return 0;
     }
 
+    /* This backend admits one Inkling session per Metal device. Reuse a
+     * device-owned scratch buffer across full-attention visits, allocating
+     * enough for the configured capacity instead of growing every 256 keys. */
+    const uint64_t visible_end = query_position + 1u < oldest_position + count
+        ? query_position + 1u : oldest_position + count;
+    const uint64_t visible = visible_end > oldest_position
+        ? visible_end - oldest_position : 0u;
+    const int split = sliding_window == 0u && head_dim <= 128u &&
+                      visible >= 2048u;
+    const uint32_t tiles = split ? (uint32_t)((visible + 255u) / 256u) : 0u;
+    ds4_gpu_tensor *split_scratch = NULL;
+    if (split) {
+        const uint64_t scratch_bytes = (uint64_t)query_heads *
+            ((capacity + 255u) / 256u) * (head_dim + 2u) * sizeof(float);
+        if (!g_inkling_attention_scratch ||
+            ds4_gpu_tensor_bytes(g_inkling_attention_scratch) < scratch_bytes) {
+            ds4_gpu_tensor *next = ds4_gpu_tensor_alloc(scratch_bytes);
+            if (!next) return 0;
+            ds4_gpu_tensor_free(g_inkling_attention_scratch);
+            g_inkling_attention_scratch = next;
+        }
+        split_scratch = g_inkling_attention_scratch;
+    }
+
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_inkling2_attention_decode");
+            ds4_gpu_get_pipeline(split
+                ? "kernel_inkling2_attention_split_partial"
+                : "kernel_inkling2_attention_decode");
         if (!pipeline) return 0;
         ds4_gpu_inkling2_attention_args args = {
             .query_heads = query_heads,
@@ -24295,10 +24325,39 @@ int ds4_gpu_inkling2_attention_decode_tensor(
                 offset:ds4_gpu_tensor_offset(relative_bias) atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(sink_logits)
                 offset:ds4_gpu_tensor_offset(sink_logits) atIndex:5];
-        [enc setBuffer:ds4_gpu_tensor_buffer(out)
-                offset:ds4_gpu_tensor_offset(out) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(query_heads, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (split) {
+            /* The partial kernel uses buffer 5 for scratch instead of sink. */
+            [enc setBuffer:ds4_gpu_tensor_buffer(split_scratch)
+                    offset:ds4_gpu_tensor_offset(split_scratch) atIndex:5];
+            [enc setBytes:&tiles length:sizeof(tiles) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(tiles, query_heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            /* Normal DS4 batch encoders are reused across dispatches. */
+            if (!owned) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            else ds4_gpu_end_compute_encoder(cb, enc);
+
+            id<MTLComputePipelineState> merge =
+                ds4_gpu_get_pipeline("kernel_inkling2_attention_split_merge");
+            if (!merge) return 0;
+            enc = ds4_gpu_compute_encoder(cb);
+            if (!enc) return 0;
+            [enc setComputePipelineState:merge];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(split_scratch)
+                    offset:ds4_gpu_tensor_offset(split_scratch) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(sink_logits)
+                    offset:ds4_gpu_tensor_offset(sink_logits) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                    offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setBytes:&tiles length:sizeof(tiles) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(query_heads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                    offset:ds4_gpu_tensor_offset(out) atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(query_heads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned,
                                            "Inkling2 attention decode")) return 0;

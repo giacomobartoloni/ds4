@@ -1511,6 +1511,85 @@ static int test_attention_and_shortconv(void) {
     return ok;
 }
 
+
+/* Compare split-K global attention with the serial kernel forced to use a
+ * sliding window large enough to cover the exact same absolute key range. */
+static int test_attention_splitk_long(void) {
+    enum { QH = 4, KVH = 2, DIM = 128, EXTENT = 16,
+           CAPACITY = 2301, COUNT = 2057 };
+    const uint64_t oldest = 1024u;
+    const uint64_t last = oldest + COUNT - 1u;
+    const size_t n = (size_t)CAPACITY * KVH * DIM;
+    uint16_t *keys = calloc(n, sizeof(*keys));
+    uint16_t *values = calloc(n, sizeof(*values));
+    float query[QH * DIM], biases[QH * EXTENT];
+    const float sinks[QH] = { 0.25f, -0.5f, 0.75f, -0.125f };
+    float reference[QH * DIM], actual[QH * DIM];
+    int ok = keys && values;
+    if (!ok) goto done;
+
+    for (uint32_t t = 0; t < COUNT; ++t) {
+        const uint32_t ring = (uint32_t)((oldest + t) % CAPACITY);
+        for (uint32_t h = 0; h < KVH; ++h) {
+            for (uint32_t d = 0; d < DIM; ++d) {
+                const size_t at = ((size_t)ring * KVH + h) * DIM + d;
+                const uint32_t code = (t + 3u * h + 7u * d) % 4u;
+                keys[at] = code == 0u ? 0x3800u :
+                    code == 1u ? 0xb800u : code == 2u ? 0x3400u : 0xbc00u;
+                values[at] = code == 0u ? 0x3c00u :
+                    code == 1u ? 0xbc00u : code == 2u ? 0x3800u : 0xb800u;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < QH * DIM; ++i)
+        query[i] = (float)((int)(i % 17u) - 8) / 23.0f;
+    for (uint32_t i = 0; i < QH * EXTENT; ++i)
+        biases[i] = (float)((int)(i % 11u) - 5) / 17.0f;
+
+    ds4_gpu_tensor *tq = upload(query, sizeof(query));
+    ds4_gpu_tensor *tk = upload(keys, n * sizeof(*keys));
+    ds4_gpu_tensor *tv = upload(values, n * sizeof(*values));
+    ds4_gpu_tensor *tb = upload(biases, sizeof(biases));
+    ds4_gpu_tensor *ts = upload(sinks, sizeof(sinks));
+    ds4_gpu_tensor *tr = ds4_gpu_tensor_alloc(sizeof(reference));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(actual));
+    ok = tq && tk && tv && tb && ts && tr && to;
+    for (uint32_t mode = 0; ok && mode < 2u; ++mode) {
+        const ds4_gpu_tensor *bias = mode == 0u ? tb : NULL;
+        const ds4_gpu_tensor *sink = mode == 0u ? ts : NULL;
+        const uint32_t extent = mode == 0u ? EXTENT : 0u;
+        /* Sliding COUNT+1 has the same key range as global attention
+         * and takes the unmodified serial decoder kernel. */
+        ok = ds4_gpu_inkling2_attention_decode_tensor(
+                tr, tq, tk, tv, bias, sink, QH, KVH, DIM,
+                CAPACITY, COUNT, oldest, last, COUNT + 1u, extent) &&
+            ds4_gpu_inkling2_attention_decode_tensor(
+                to, tq, tk, tv, bias, sink, QH, KVH, DIM,
+                CAPACITY, COUNT, oldest, last, 0u, extent) &&
+            ds4_gpu_tensor_read(tr, 0, reference, sizeof(reference)) &&
+            ds4_gpu_tensor_read(to, 0, actual, sizeof(actual));
+        for (uint32_t i = 0; ok && i < QH * DIM; ++i) {
+            if (!near_record(actual[i], reference[i], 8e-5f,
+                             &g_m4_full_attention_max_error)) {
+                fprintf(stderr, "Inkling2 split-K mismatch mode=%u i=%u: %.8g vs %.8g\n",
+                        mode, i, actual[i], reference[i]);
+                ok = 0;
+            }
+        }
+    }
+    ds4_gpu_tensor_free(tq);
+    ds4_gpu_tensor_free(tk);
+    ds4_gpu_tensor_free(tv);
+    ds4_gpu_tensor_free(tb);
+    ds4_gpu_tensor_free(ts);
+    ds4_gpu_tensor_free(tr);
+    ds4_gpu_tensor_free(to);
+done:
+    free(keys);
+    free(values);
+    return ok;
+}
+
 int main(void) {
     int ok = 1;
     if (!ds4_gpu_init()) {
@@ -1535,6 +1614,7 @@ int main(void) {
     CHECK(test_qk_and_relative_bias());
     CHECK(test_attention_output_gate());
     CHECK(test_attention_and_shortconv());
+    CHECK(test_attention_splitk_long());
     CHECK(test_loop_mix_and_control_metal());
     CHECK(test_gpu_context_owns_independent_visit_state());
     fprintf(stderr,

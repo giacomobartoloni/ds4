@@ -283,3 +283,33 @@ The text-only prompt APIs render the model template's role markers and content b
 `make test-inkling2-tokenizer` checks GPT4O splitting for mixed/all-uppercase words, ASCII case boundaries around Unicode letters (`AéB`), contractions, Unicode letters, number groups, punctuation spanning newline/slash, direct-word lookup, ranked-merge fallback, exact effort strings, numeric-effort de-duplication, rendered special-token recognition, text chat message order, and the generation prefix. The `AéB` regression follows the backtracking behavior in the pinned llama.cpp GPT4O expression. `make test-inkling2-gguf` also opens the synthetic descriptor fixture in inspect-only mode and checks loaded marker IDs. The server regression suite additionally checks `minimal`, `xhigh`, and decimal reasoning levels. `make`, `make cpu`, the Inkling focused targets, and `./ds4_test --server` pass after this change on the Apple M4.
 
 This milestone does not enable inference. The session API now owns the per-visit Metal state, but eval still fails explicitly until the graph connects embeddings, attention, routed experts, loop message banks, output projection, and sampling. The 17.6 GB model is not local, so no token stream, full-model numeric comparison, or end-to-end benchmark has been measured.
+
+## Split-K global-attention candidate (independent review branch)
+
+To address the serial per-key barrier loop at long context, the Metal decode
+attention wrapper now chooses a specialized two-pass split-K path when a
+full-attention visit has at least 2048 visible keys and head dimension is at
+most 128. Each threadgroup processes up to 256 keys and writes its stable
+FP32 softmax maximum, denominator and unnormalized weighted-value vector.
+A second dispatch combines tiles and incorporates the learned attention sink
+only once. Causal masking, absolute KV ring indices, GQA and the
+1024-distance relative bias use the same semantics as the original kernel.
+
+Short and sliding attention retain the original shader. Scratch is held by
+the Metal device and reused across visits; it is lazily sized from the cache
+capacity, avoiding allocations per token. With a 127000-token context,
+24 query heads and 128 dimensions, that adds roughly 6.1 MiB to the device
+working set (outside the Inkling session-state allocation estimate).
+The existing device cleanup releases it. Only the already-supported single
+resident Inkling session is in scope.
+
+The focused Metal test compares serial and split attention on 2057 keys,
+four query heads, two KV heads, nonzero absolute cache positions, wrapped
+ring indices, relative bias, and attention sink; it also exercises the
+no-bias/no-sink case. The serial path is forced by a covering sliding window
+with the identical valid key set.
+
+**Validation status:** this candidate was authored remotely without Apple
+Metal execution. Metal compilation, numeric tests, same-GGUF parity and
+long-prompt performance must be run on the M4 before merging into the feature
+branch. The optimization is not yet a measured performance improvement.
