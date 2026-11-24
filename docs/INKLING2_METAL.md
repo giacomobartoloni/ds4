@@ -18,7 +18,7 @@ The numbered sections preserve implementation snapshots from each milestone. Sta
 | M7: integration hardening and user workflow | Partial | OpenAI Chat tool round-trip and streamed Responses tool continuation ran on the real GGUF. Long-context and model-backed Anthropic validation remain open. |
 | M8: post-release formats and optional features | Not started | NVFP4/MXFP8, low-precision KV, vision/audio, and speculative decoding remain out of scope for this IQ4_NL path. |
 
-## Current model-backed checkpoint — 2026-11-23
+## Current model-backed checkpoint — 2026-11-24
 
 The externally stored checkpoint is `/Users/gbartoloni/Models/Inkling-2-Mini/Inkling-2-Mini-IQ4_NL.gguf`, SHA-256 `cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4`. Its 704 tensor descriptors match the validated binder. No weights were downloaded or added to the repository. Numeric comparisons use llama.cpp commit [`212c547fe908b288f6659d48741e6ffac1ff409c`](https://github.com/ggml-org/llama.cpp/tree/212c547fe908b288f6659d48741e6ffac1ff409c), built locally with Metal; the reference is not a DS4 runtime dependency.
 
@@ -34,13 +34,42 @@ The eight focused Inkling targets (`state`, `inspect`, `model`, `mapping`, `meta
 
 The local GGUF declares `inkling2_loop.context_length=1,048,576`, matching the 1M-token maximum in the official [Inkling 2 Mini model card at the pinned revision](https://huggingface.co/thinkingmachines/Inkling-2-Mini/blob/7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6/README.md). That is a model limit, not a promise that a local device can allocate the corresponding cache. The M4 reports a recommended Metal working set of 26,800.60 MB (24.96 GiB); with this 17,627,940,768-byte GGUF and DS4's 2 GiB runtime reserve, the allocator estimates about 4.17 GiB of session state at context 131,072, leaving about 2.54 GB below the recommended working set. Context 200,000 estimates 6.28 GiB of state and leaves about 285 MB; treat it as near the device budget. Context 1,048,576 would need about 32.17 GiB for session state alone and cannot fit alongside the model. These are allocation estimates, not measured resident peaks. The runtime checks the actual Metal recommendation before allocating a session.
 
-At the initial context 8192, the session allocator estimates 454,785,284 bytes (433.72 MiB), while DS4 reports 16,811.33 MiB mapped for the model. Peak resident memory was not measured. Prefill is still conservative and evaluates tokens incrementally. Long-context numerical parity, a stable TTFT/prompt-throughput benchmark, peak resident memory, real EOS completion, and speculative/interrupted rollback remain open.
+At the initial context 8192, the session allocator estimates 454,785,284 bytes (433.72 MiB), while DS4 reports 16,811.33 MiB mapped for the model. Peak resident memory was not measured. Prefill remains token-major, but it now encodes up to eight causally ordered tokens into one Metal command buffer and computes/reads logits only at each group boundary. This amortizes command completion without changing the decoder math or exposing a checkpoint without matching logits. Long-context numerical parity, controlled prompt-throughput measurements, peak resident memory, real EOS completion, and speculative rollback remain open; interruption and resume are covered by the synthetic session test.
 
 With the real GGUF on the M4, a session configured at `--ctx 131072` passed the
 Metal budget check and generated `,\n\nI am trying to use the` from the
 one-token raw prompt `Hello`. This verifies larger session capacity and normal
 decode at that configuration; the prompt itself did not exceed 8192 tokens, so
 it is not long-context numerical validation or a throughput benchmark.
+
+## Bounded command-buffer prefill — 2026-11-24
+
+Inkling prompt evaluation still follows token-major causal order, but the
+session now encodes groups of up to eight sequential tokens into one Metal
+command buffer. KV and convolution state remain visit-specific and ordered.
+Only the final token in each group runs output normalization, vocabulary
+projection, softcap, and logits readback. Cancellation is observed between
+groups, after a group has a matching logits vector, so the completed prefix can
+be resumed safely. This reduces host wait/commit frequency; it is not batched
+decoder math or causal block attention.
+
+`make test-inkling2-session` compares grouped prefill against the public
+token-at-a-time decode path and requires byte-identical logits. It also cancels
+after the first eight-token group, compares that checkpoint's logits with an
+independent eight-token prefill, then resumes and checks the final logits.
+The test passes on Apple M4.
+
+On the M4 with the exact GGUF above, a raw 129-token prompt (`hello ` repeated
+128 times), context 8192, one generated token, and temperature 0 measured
+6.21–6.23 tokens/s at baseline commit `15a941f`; the grouped build measured
+6.42–6.47 tokens/s. The one sampled output token was byte-identical between
+the baseline and grouped builds. This short smoke comparison suggests a small
+gain, not a long-prompt result. `DS4_METAL_CB_TIMES=1` on a 17-token prompt
+showed about 1.19–1.21 s of GPU time for each eight-token command buffer,
+while host encoding took 18–26 ms; GPU work remains the dominant cost. The
+48,891-token OpenCode prompt was not rerun. Substantial prefill acceleration
+still requires visit-major multi-row projections, MoE, convolution, and causal
+attention, including correct sliding-window wrap handling.
 
 ## Conversational API and function tools — 2026-11-23
 

@@ -282,6 +282,27 @@ static int logits_argmax(const float *logits, uint32_t count) {
     return (int)best;
 }
 
+typedef struct {
+    bool requested;
+    int calls;
+    int last_current;
+} prefill_cancel_probe;
+
+static void request_cancel_after_first_prefill_group(
+        void *ud, const char *event, int current, int total) {
+    prefill_cancel_probe *probe = ud;
+    assert(total == 10);
+    if (strcmp(event, "prefill_chunk") != 0) return;
+    probe->calls++;
+    probe->last_current = current;
+    if (probe->calls == 1) probe->requested = true;
+}
+
+static bool prefill_cancel_requested(void *ud) {
+    const prefill_cancel_probe *probe = ud;
+    return probe->requested;
+}
+
 int main(void) {
     assert(ds4_gpu_init());
     g_ds4_shape = DS4_SHAPE_INKLING2;
@@ -354,6 +375,57 @@ int main(void) {
     assert(ds4_session_pos(session) == 5);
     assert(session->logits[TEST_VOCAB] == DS4_NEG_INF);
     assert(logits_argmax(session->logits, TEST_VOCAB) == 0);
+
+    const int long_prompt_tokens[] = { 42, 17, 9, 12, 3, 5, 7, 11, 13, 19 };
+    const ds4_tokens long_prompt = { .v = (int *)long_prompt_tokens,
+        .len = 10, .cap = 10 };
+    const ds4_tokens first_eight = { .v = (int *)long_prompt_tokens,
+        .len = 8, .cap = 8 };
+    float *tokenwise_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
+    float *prefix_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
+    assert(tokenwise_logits && prefix_logits);
+
+    assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
+    const ds4_tokens first_token = { .v = (int *)long_prompt_tokens,
+        .len = 1, .cap = 1 };
+    assert(ds4_session_sync(session, &first_token, error, sizeof(error)) == 0);
+    for (int i = 1; i < long_prompt.len; i++)
+        assert(ds4_session_eval(session, long_prompt_tokens[i],
+                                 error, sizeof(error)) == 0);
+    memcpy(tokenwise_logits, session->logits,
+           (size_t)TEST_VOCAB * sizeof(float));
+
+    assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
+    assert(ds4_session_sync(session, &first_eight, error, sizeof(error)) == 0);
+    memcpy(prefix_logits, session->logits,
+           (size_t)TEST_VOCAB * sizeof(float));
+
+    assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
+    assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) == 0);
+    assert(ds4_session_pos(session) == long_prompt.len);
+    assert(memcmp(tokenwise_logits, session->logits,
+                  (size_t)TEST_VOCAB * sizeof(float)) == 0);
+
+    assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
+    prefill_cancel_probe cancel_probe = {0};
+    ds4_session_set_progress(session, request_cancel_after_first_prefill_group,
+                              &cancel_probe);
+    ds4_session_set_cancel(session, prefill_cancel_requested, &cancel_probe);
+    assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) ==
+           DS4_SESSION_SYNC_INTERRUPTED);
+    assert(cancel_probe.calls == 1 && cancel_probe.last_current == 8);
+    assert(ds4_session_pos(session) == 8);
+    assert(ds4_session_checkpoint_valid(session));
+    assert(memcmp(prefix_logits, session->logits,
+                  (size_t)TEST_VOCAB * sizeof(float)) == 0);
+    ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_cancel(session, NULL, NULL);
+    assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) == 0);
+    assert(ds4_session_pos(session) == long_prompt.len);
+    assert(memcmp(tokenwise_logits, session->logits,
+                  (size_t)TEST_VOCAB * sizeof(float)) == 0);
+    free(tokenwise_logits);
+    free(prefix_logits);
 
     ds4_session_free(session);
     ds4_gpu_cleanup();
