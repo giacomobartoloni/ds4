@@ -417,6 +417,15 @@ int main(void) {
     assert(memcmp(tokenwise_logits, session->logits,
                   (size_t)TEST_VOCAB * sizeof(float)) == 0);
 
+    /* Compare the historical per-group vocabulary projection with the
+     * deferred final-only path, then exercise deferred checkpoint recovery. */
+    assert(setenv("DS4_INKLING_PREFILL_LOGITS_EVERY_GROUP", "1", 1) == 0);
+    assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
+    assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) == 0);
+    assert(memcmp(tokenwise_logits, session->logits,
+                  (size_t)TEST_VOCAB * sizeof(float)) == 0);
+    assert(unsetenv("DS4_INKLING_PREFILL_LOGITS_EVERY_GROUP") == 0);
+
     assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
     prefill_cancel_probe cancel_probe = {0};
     ds4_session_set_progress(session, request_cancel_after_first_prefill_group,
