@@ -633,6 +633,129 @@ kernel void kernel_inkling2_attention_decode(
     }
 }
 
+
+/* Split-K global attention. Each 256-key tile stores an unnormalized
+ * online-softmax (max, denominator, weighted value sum); the merge includes
+ * the learned attention sink exactly once. */
+kernel void kernel_inkling2_attention_split_partial(
+        constant ds4_metal_args_inkling2_attention &args [[buffer(0)]],
+        device const float *query [[buffer(1)]],
+        device const half *key_cache [[buffer(2)]],
+        device const half *value_cache [[buffer(3)]],
+        device const float *relative_bias [[buffer(4)]],
+        device float *scratch [[buffer(5)]],
+        constant uint &tile_count [[buffer(6)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    const uint tile = group.x;
+    const uint head = group.y;
+    if (tile >= tile_count || head >= args.query_heads) return;
+    threadgroup float dot_parts[128];
+    threadgroup float value_parts[128];
+    threadgroup float maximum;
+    threadgroup float denominator;
+    threadgroup float old_scale;
+    threadgroup float new_scale;
+
+    const uint kv_head = head / (args.query_heads / args.kv_heads);
+    const device float *q = query + (ulong)head * args.head_dim;
+    const ulong start = args.oldest_position + (ulong)tile * 256ul;
+    const ulong end = min(min(start + 256ul,
+                              args.oldest_position + (ulong)args.count),
+                          args.query_position + 1ul);
+    const float qk_scale = rsqrt((float)args.head_dim);
+    value_parts[lane] = 0.0f;
+    if (lane == 0u) {
+        maximum = -INFINITY;
+        denominator = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (ulong position = start; position < end; ++position) {
+        const uint ring = (uint)(position % args.capacity);
+        const ulong kv_row = ((ulong)ring * args.kv_heads + kv_head) *
+                             args.head_dim;
+        float dot = 0.0f;
+        for (uint d = lane; d < args.head_dim; d += lanes)
+            dot += q[d] * float(key_cache[kv_row + d]);
+        dot_parts[lane] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) dot_parts[lane] += dot_parts[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const ulong distance = args.query_position - position;
+        const float bias = distance < args.relative_extent
+            ? relative_bias[(ulong)head * args.relative_extent + distance]
+            : 0.0f;
+        if (lane == 0u) {
+            const float score = dot_parts[0] * qk_scale + bias;
+            const float next_max = max(maximum, score);
+            old_scale = denominator == 0.0f ? 0.0f : exp(maximum - next_max);
+            new_scale = exp(score - next_max);
+            denominator = denominator * old_scale + new_scale;
+            maximum = next_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float v = lane < args.head_dim
+            ? float(value_cache[kv_row + lane]) : 0.0f;
+        value_parts[lane] = value_parts[lane] * old_scale + new_scale * v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ulong offset = ((ulong)head * tile_count + tile) *
+                         (args.head_dim + 2u);
+    if (lane == 0u) {
+        scratch[offset] = maximum;
+        scratch[offset + 1u] = denominator;
+    }
+    if (lane < args.head_dim)
+        scratch[offset + 2u + lane] = value_parts[lane];
+}
+
+kernel void kernel_inkling2_attention_split_merge(
+        constant ds4_metal_args_inkling2_attention &args [[buffer(0)]],
+        device const float *scratch [[buffer(1)]],
+        device const float *sink_logits [[buffer(2)]],
+        device float *out [[buffer(3)]],
+        constant uint &tile_count [[buffer(4)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (head >= args.query_heads) return;
+    threadgroup float group_max;
+    threadgroup float group_denom;
+    if (lane == 0u) {
+        const float sink = args.has_sink ? sink_logits[head] : -INFINITY;
+        float peak = sink;
+        for (uint t = 0; t < tile_count; ++t) {
+            const ulong offset = ((ulong)head * tile_count + t) *
+                                 (args.head_dim + 2u);
+            peak = max(peak, scratch[offset]);
+        }
+        float denom = args.has_sink ? exp(sink - peak) : 0.0f;
+        for (uint t = 0; t < tile_count; ++t) {
+            const ulong offset = ((ulong)head * tile_count + t) *
+                                 (args.head_dim + 2u);
+            denom += exp(scratch[offset] - peak) * scratch[offset + 1u];
+        }
+        group_max = peak;
+        group_denom = denom;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < args.head_dim) {
+        float numerator = 0.0f;
+        for (uint t = 0; t < tile_count; ++t) {
+            const ulong offset = ((ulong)head * tile_count + t) *
+                                 (args.head_dim + 2u);
+            numerator += exp(scratch[offset] - group_max) *
+                         scratch[offset + 2u + lane];
+        }
+        out[(ulong)head * args.head_dim + lane] =
+            group_denom > 0.0f ? numerator / group_denom : 0.0f;
+    }
+}
+
 /* The attention gate is a sigmoid projection of the layer input, applied
  * before the output projection. */
 kernel void kernel_inkling2_attention_output_gate(
