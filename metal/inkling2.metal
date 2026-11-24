@@ -24,7 +24,7 @@ struct ds4_metal_args_inkling2_expert_gemv {
     uint32_t weight_type;
     uint32_t blocks_per_row;
     uint32_t input_per_expert;
-    uint32_t pad0;
+    uint32_t n_tokens;
     uint32_t simd_width;
     uint32_t pad1;
     ulong expert_bytes;
@@ -33,6 +33,8 @@ struct ds4_metal_args_inkling2_expert_gemv {
 struct ds4_metal_args_inkling2_situ {
     uint32_t n_used;
     uint32_t expert_dim;
+    uint32_t n_tokens;
+    uint32_t pad;
     float beta;
     float linear_beta;
 };
@@ -269,12 +271,16 @@ kernel void kernel_inkling2_expert_gemv(
         uint group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_threadgroup]],
         uint lanes [[threads_per_threadgroup]]) {
-    const uint slot = group / args.out_dim;
-    const uint row = group - slot * args.out_dim;
-    if (group >= args.out_dim * args.n_used || row >= args.out_dim || slot >= args.n_used) return;
-    const int32_t expert = expert_ids[slot];
+    const uint groups_per_token = args.out_dim * args.n_used;
+    const uint token = group / groups_per_token;
+    const uint token_group = group - token * groups_per_token;
+    const uint slot = token_group / args.out_dim;
+    const uint row = token_group - slot * args.out_dim;
+    if (token >= args.n_tokens || slot >= args.n_used || row >= args.out_dim) return;
+    const uint route = token * args.n_used + slot;
+    const int32_t expert = expert_ids[route];
     if (expert < 0 || (uint32_t)expert >= args.n_experts) {
-        if (lane == 0u) out[(ulong)slot * args.out_dim + row] = NAN;
+        if (lane == 0u) out[(ulong)route * args.out_dim + row] = NAN;
         return;
     }
     const uint block_bytes = args.weight_type == 20u ? 18u : 34u;
@@ -292,12 +298,12 @@ kernel void kernel_inkling2_expert_gemv(
             const uchar byte = packed[within & 15u];
             const uint code = within < 16u ? (uint)(byte & 0x0fu) : (uint)(byte >> 4u);
             const ulong x_offset = args.input_per_expert != 0u ?
-                (ulong)slot * args.in_dim : 0u;
+                (ulong)route * args.in_dim : (ulong)token * args.in_dim;
             sum += scale * float(ds4_inkling2_iq4_nl_values[code]) * x[x_offset + i];
         } else {
             const int8_t quant = *(device const int8_t *)(block + 2 + within);
             const ulong x_offset = args.input_per_expert != 0u ?
-                (ulong)slot * args.in_dim : 0u;
+                (ulong)route * args.in_dim : (ulong)token * args.in_dim;
             sum += scale * float(quant) * x[x_offset + i];
         }
     }
@@ -308,7 +314,7 @@ kernel void kernel_inkling2_expert_gemv(
     if (lane < args.simd_width) {
         const uint simd_groups = (lanes + args.simd_width - 1u) / args.simd_width;
         const float total = simd_sum(lane < simd_groups ? partial[lane] : 0.0f);
-        if (lane == 0u) out[(ulong)slot * args.out_dim + row] = total;
+        if (lane == 0u) out[(ulong)route * args.out_dim + row] = total;
     }
 }
 
@@ -444,11 +450,11 @@ kernel void kernel_inkling2_situ(
         device const float *gate_up [[buffer(1)]],
         device float *out [[buffer(2)]],
         uint index [[thread_position_in_grid]]) {
-    const uint count = args.n_used * args.expert_dim;
+    const uint count = args.n_tokens * args.n_used * args.expert_dim;
     if (index >= count) return;
-    const uint slot = index / args.expert_dim;
-    const uint row = index - slot * args.expert_dim;
-    const ulong base = (ulong)slot * 2u * args.expert_dim;
+    const uint route = index / args.expert_dim;
+    const uint row = index - route * args.expert_dim;
+    const ulong base = (ulong)route * 2u * args.expert_dim;
     const float gate = gate_up[base + row];
     const float up = gate_up[base + args.expert_dim + row];
     const float gate_act = args.beta * inkling2_tanh_saturating(gate / args.beta) *
@@ -467,9 +473,12 @@ kernel void kernel_inkling2_expert_accumulate(
         device float *out [[buffer(3)]],
         uint row [[thread_position_in_grid]]) {
     if (row >= args.count) return;
+    const uint token = row / args.n;
+    const uint column = row - token * args.n;
     float sum = 0.0f;
     for (uint expert = 0; expert < args.n_used; expert++) {
-        sum += weights[expert] * expert_outputs[(uint64_t)expert * args.count + row];
+        const uint route = token * args.n_used + expert;
+        sum += weights[route] * expert_outputs[(ulong)route * args.n + column];
     }
     out[row] = sum;
 }

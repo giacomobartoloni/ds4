@@ -23342,6 +23342,8 @@ typedef struct {
 typedef struct {
     uint32_t n_used;
     uint32_t expert_dim;
+    uint32_t n_tokens;
+    uint32_t pad;
     float beta;
     float linear_beta;
 } ds4_gpu_inkling2_situ_args;
@@ -23656,19 +23658,26 @@ int ds4_gpu_inkling2_gemv_iq4_nl_tensor(
     return 1;
 }
 
-int ds4_gpu_inkling2_expert_accumulate_tensor(
+int ds4_gpu_inkling2_expert_accumulate_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *expert_outputs,
         const ds4_gpu_tensor *weights,
         uint32_t                out_dim,
+        uint32_t                n_tokens,
         uint32_t                n_used) {
     if ((!g_initialized && !ds4_gpu_init()) || out_dim == 0 ||
+        n_tokens == 0 || n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS ||
         n_used == 0 || n_used > 8u) return 0;
-    const uint64_t elements = (uint64_t)out_dim * n_used;
-    if (elements > UINT64_MAX / sizeof(float)) return 0;
-    const uint64_t output_bytes = (uint64_t)out_dim * sizeof(float);
-    const uint64_t expert_bytes = elements * sizeof(float);
-    const uint64_t weight_bytes = (uint64_t)n_used * sizeof(float);
+    const uint64_t output_elements = (uint64_t)out_dim * n_tokens;
+    if (output_elements > UINT32_MAX ||
+        output_elements > UINT64_MAX / n_used) return 0;
+    const uint64_t expert_elements = output_elements * n_used;
+    const uint64_t route_elements = (uint64_t)n_tokens * n_used;
+    if (expert_elements > UINT64_MAX / sizeof(float) ||
+        route_elements > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t output_bytes = output_elements * sizeof(float);
+    const uint64_t expert_bytes = expert_elements * sizeof(float);
+    const uint64_t weight_bytes = route_elements * sizeof(float);
     if (!ds4_gpu_inkling2_tensor_fits(out, output_bytes, "expert sum output") ||
         !ds4_gpu_inkling2_tensor_fits(expert_outputs, expert_bytes,
                                       "expert vectors") ||
@@ -23678,7 +23687,12 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_pipeline("kernel_inkling2_expert_accumulate");
         if (!pipeline) return 0;
-        ds4_gpu_inkling2_args args = { .count = out_dim, .n_used = n_used };
+        ds4_gpu_inkling2_args args = {
+            .count = (uint32_t)output_elements,
+            .n = out_dim,
+            .rows = n_tokens,
+            .n_used = n_used,
+        };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -23692,7 +23706,8 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
                 offset:ds4_gpu_tensor_offset(weights) atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        const NSUInteger groups = (NSUInteger)(((uint64_t)out_dim + 255u) / 256u);
+        const NSUInteger groups =
+            (NSUInteger)((output_elements + 255u) / 256u);
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -23702,7 +23717,17 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
     return 1;
 }
 
-int ds4_gpu_inkling2_expert_gemv_tensor(
+int ds4_gpu_inkling2_expert_accumulate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *expert_outputs,
+        const ds4_gpu_tensor *weights,
+        uint32_t                out_dim,
+        uint32_t                n_used) {
+    return ds4_gpu_inkling2_expert_accumulate_rows_tensor(
+        out, expert_outputs, weights, out_dim, 1u, n_used);
+}
+
+int ds4_gpu_inkling2_expert_gemv_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -23712,15 +23737,20 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
         uint32_t              out_dim,
         uint32_t              n_experts,
         uint32_t              n_used,
+        uint32_t              n_tokens,
         int                   input_per_expert,
         const ds4_gpu_tensor *expert_ids,
         const ds4_gpu_tensor *x) {
     if ((!g_initialized && !ds4_gpu_init()) || !model_map || !out || !expert_ids || !x ||
         in_dim == 0 || (in_dim % 32u) != 0 || out_dim == 0 ||
         n_experts == 0 || n_experts > 128u || n_used == 0 || n_used > 8u ||
-        n_used > n_experts || out_dim > UINT32_MAX / n_used ||
+        n_tokens == 0 || n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS ||
+        n_used > n_experts ||
         (input_per_expert != 0 && input_per_expert != 1) ||
         (weight_type != 8u && weight_type != 20u)) return 0;
+    const uint64_t route_count = (uint64_t)n_tokens * n_used;
+    const uint64_t group_count = route_count * out_dim;
+    if (group_count > UINT32_MAX) return 0;
     const uint32_t block_bytes = weight_type == 20u ? 18u : 34u;
     const uint32_t blocks_per_row = in_dim / 32u;
     const uint64_t row_bytes = (uint64_t)blocks_per_row * block_bytes;
@@ -23728,15 +23758,15 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
     const uint64_t expert_bytes = (uint64_t)out_dim * row_bytes;
     if (n_experts > UINT64_MAX / expert_bytes) return 0;
     const uint64_t weight_bytes = (uint64_t)n_experts * expert_bytes;
-    const uint64_t input_rows = input_per_expert ? n_used : 1u;
+    const uint64_t input_rows = input_per_expert ? route_count : n_tokens;
     const uint64_t input_bytes = (uint64_t)in_dim * input_rows * sizeof(float);
-    const uint64_t output_elements = (uint64_t)n_used * out_dim;
+    const uint64_t output_elements = group_count;
     if (output_elements > UINT64_MAX / sizeof(float) ||
         weight_offset > model_size || weight_bytes > model_size - weight_offset ||
         !ds4_gpu_inkling2_tensor_fits(out, output_elements * sizeof(float),
                                       "selected expert GEMV output") ||
         !ds4_gpu_inkling2_tensor_fits(expert_ids,
-                                      (uint64_t)n_used * sizeof(int32_t),
+                                      route_count * sizeof(int32_t),
                                       "selected expert IDs") ||
         !ds4_gpu_inkling2_tensor_fits(x, input_bytes,
                                       "selected expert activation")) return 0;
@@ -23756,6 +23786,7 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
             .weight_type = weight_type,
             .blocks_per_row = blocks_per_row,
             .input_per_expert = input_per_expert != 0,
+            .pad0 = n_tokens,
             .simd_width = (uint32_t)pipeline.threadExecutionWidth,
             .pad1 = 0,
             .expert_bytes = expert_bytes,
@@ -23776,7 +23807,7 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim * n_used, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)group_count, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned,
@@ -23785,18 +23816,39 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
     return 1;
 }
 
-int ds4_gpu_inkling2_situ_tensor(
+int ds4_gpu_inkling2_expert_gemv_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x) {
+    return ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        out, model_map, model_size, weight_offset, weight_type, in_dim,
+        out_dim, n_experts, n_used, 1u, input_per_expert, expert_ids, x);
+}
+
+int ds4_gpu_inkling2_situ_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate_up,
+        uint32_t              n_tokens,
         uint32_t              n_used,
         uint32_t              expert_dim,
         float                 beta,
         float                 linear_beta) {
     if ((!g_initialized && !ds4_gpu_init()) || !out || !gate_up ||
+        n_tokens == 0 || n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS ||
         n_used == 0 || n_used > 8u || expert_dim == 0 ||
         !isfinite(beta) || beta <= 0.0f ||
         !isfinite(linear_beta) || linear_beta <= 0.0f) return 0;
-    const uint64_t count = (uint64_t)n_used * expert_dim;
+    const uint64_t count = (uint64_t)n_tokens * n_used * expert_dim;
+    if (count > UINT32_MAX) return 0;
     if (count > UINT64_MAX / (2u * sizeof(float))) return 0;
     const uint64_t out_bytes = count * sizeof(float);
     const uint64_t gate_up_bytes = count * 2u * sizeof(float);
@@ -23810,6 +23862,8 @@ int ds4_gpu_inkling2_situ_tensor(
         ds4_gpu_inkling2_situ_args args = {
             .n_used = n_used,
             .expert_dim = expert_dim,
+            .n_tokens = n_tokens,
+            .pad = 0,
             .beta = beta,
             .linear_beta = linear_beta,
         };
@@ -23824,13 +23878,24 @@ int ds4_gpu_inkling2_situ_tensor(
                 offset:ds4_gpu_tensor_offset(gate_up) atIndex:1];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:2];
-        const NSUInteger groups = (NSUInteger)(((uint64_t)n_used * expert_dim + 255u) / 256u);
+        const NSUInteger groups = (NSUInteger)((count + 255u) / 256u);
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 SiTU")) return 0;
     }
     return 1;
+}
+
+int ds4_gpu_inkling2_situ_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate_up,
+        uint32_t              n_used,
+        uint32_t              expert_dim,
+        float                 beta,
+        float                 linear_beta) {
+    return ds4_gpu_inkling2_situ_rows_tensor(
+        out, gate_up, 1u, n_used, expert_dim, beta, linear_beta);
 }
 
 int ds4_gpu_inkling2_mix_tensor(

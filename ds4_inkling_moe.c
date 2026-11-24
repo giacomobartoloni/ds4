@@ -23,7 +23,35 @@ int ds4_inkling_moe_situ_metal_with_workspace(
         float                 situ_beta,
         float                 situ_linear_beta,
         const ds4_inkling_gpu_moe_workspace *workspace) {
-    if (!out || !input || !model_map || hidden_dim == 0 || expert_dim == 0 ||
+    return ds4_inkling_moe_situ_metal_batch_with_workspace(
+        out, input, correction_bias, model_map, model_size, router_offset,
+        gate_up_offset, down_offset, hidden_dim, expert_dim, 1u, n_experts,
+        n_used, expert_weight_type, routed_scale, situ_beta,
+        situ_linear_beta, workspace);
+}
+
+int ds4_inkling_moe_situ_metal_batch_with_workspace(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *correction_bias,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              router_offset,
+        uint64_t              gate_up_offset,
+        uint64_t              down_offset,
+        uint32_t              hidden_dim,
+        uint32_t              expert_dim,
+        uint32_t              n_tokens,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              expert_weight_type,
+        float                 routed_scale,
+        float                 situ_beta,
+        float                 situ_linear_beta,
+        const ds4_inkling_gpu_moe_workspace *workspace) {
+    if (!out || !input || !model_map || n_tokens == 0 ||
+        n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS ||
+        hidden_dim == 0 || expert_dim == 0 ||
         n_experts == 0 || n_experts > 128u || n_used == 0 || n_used > 8u ||
         n_used > n_experts || (hidden_dim % 32u) != 0 ||
         expert_dim > UINT32_MAX / 2u || (expert_dim % 32u) != 0 ||
@@ -32,17 +60,22 @@ int ds4_inkling_moe_situ_metal_with_workspace(
         !isfinite(routed_scale) || !isfinite(situ_beta) || situ_beta <= 0.0f ||
         !isfinite(situ_linear_beta) || situ_linear_beta <= 0.0f) return 0;
 
-    const uint64_t expert_rows = (uint64_t)n_used * expert_dim;
-    const uint64_t expert_output_elements = (uint64_t)n_used * hidden_dim;
+    const uint64_t route_count = (uint64_t)n_tokens * n_used;
+    const uint64_t expert_rows = route_count * expert_dim;
+    const uint64_t expert_output_elements = route_count * hidden_dim;
+    const uint64_t input_bytes = (uint64_t)n_tokens * hidden_dim * sizeof(float);
+    const uint64_t output_bytes = input_bytes;
     if (expert_rows > UINT64_MAX / (2u * sizeof(float)) ||
         expert_output_elements > UINT64_MAX / sizeof(float) || !workspace ||
         !workspace->logits || !workspace->ids || !workspace->weights ||
         !workspace->gate_up || !workspace->activation ||
-        !workspace->expert_outputs || !workspace->zero_bias) return 0;
+        !workspace->expert_outputs || !workspace->zero_bias ||
+        ds4_gpu_tensor_bytes(out) < output_bytes ||
+        ds4_gpu_tensor_bytes(input) < input_bytes) return 0;
 
-    const uint64_t logits_bytes = (uint64_t)n_experts * sizeof(float);
-    const uint64_t ids_bytes = (uint64_t)n_used * sizeof(int32_t);
-    const uint64_t route_bytes = (uint64_t)n_used * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)n_tokens * n_experts * sizeof(float);
+    const uint64_t ids_bytes = route_count * sizeof(int32_t);
+    const uint64_t route_bytes = route_count * sizeof(float);
     const uint64_t gate_up_bytes = expert_rows * 2u * sizeof(float);
     const uint64_t activation_bytes = expert_rows * sizeof(float);
     const uint64_t expert_bytes = expert_output_elements * sizeof(float);
@@ -52,7 +85,8 @@ int ds4_inkling_moe_situ_metal_with_workspace(
         ds4_gpu_tensor_bytes(workspace->gate_up) < gate_up_bytes ||
         ds4_gpu_tensor_bytes(workspace->activation) < activation_bytes ||
         ds4_gpu_tensor_bytes(workspace->expert_outputs) < expert_bytes ||
-        (!correction_bias && ds4_gpu_tensor_bytes(workspace->zero_bias) < logits_bytes))
+        (!correction_bias && ds4_gpu_tensor_bytes(workspace->zero_bias) <
+            (uint64_t)n_experts * sizeof(float)))
         return 0;
 
     if (!correction_bias &&
@@ -62,42 +96,43 @@ int ds4_inkling_moe_situ_metal_with_workspace(
     const char *failed_stage = ok ? NULL : "scratch allocation";
     if (ok && !ds4_gpu_matmul_f32_tensor(workspace->logits, model_map,
                                           model_size, router_offset,
-                                          hidden_dim, n_experts, input, 1u)) {
+                                          hidden_dim, n_experts, input,
+                                          n_tokens)) {
         ok = 0;
         failed_stage = "router projection";
     }
     if (ok && !ds4_gpu_inkling2_router_topk_tensor(workspace->ids,
                                                    workspace->weights,
                                                    workspace->logits, bias,
-                                                   1u, n_experts, n_used,
+                                                   n_tokens, n_experts, n_used,
                                                    routed_scale)) {
         ok = 0;
         failed_stage = "router selection";
     }
-    if (ok && !ds4_gpu_inkling2_expert_gemv_tensor(
+    if (ok && !ds4_gpu_inkling2_expert_gemv_rows_tensor(
                   workspace->gate_up, model_map, model_size, gate_up_offset,
                   expert_weight_type, hidden_dim, 2u * expert_dim,
-                  n_experts, n_used, 0, workspace->ids, input)) {
+                  n_experts, n_used, n_tokens, 0, workspace->ids, input)) {
         ok = 0;
         failed_stage = "gate/up projection";
     }
-    if (ok && !ds4_gpu_inkling2_situ_tensor(workspace->activation,
-                                             workspace->gate_up, n_used,
-                                             expert_dim, situ_beta,
-                                             situ_linear_beta)) {
+    if (ok && !ds4_gpu_inkling2_situ_rows_tensor(
+                  workspace->activation, workspace->gate_up, n_tokens,
+                  n_used, expert_dim, situ_beta, situ_linear_beta)) {
         ok = 0;
         failed_stage = "SiTU activation";
     }
-    if (ok && !ds4_gpu_inkling2_expert_gemv_tensor(
+    if (ok && !ds4_gpu_inkling2_expert_gemv_rows_tensor(
                   workspace->expert_outputs, model_map, model_size, down_offset,
                   expert_weight_type, expert_dim, hidden_dim,
-                  n_experts, n_used, 1, workspace->ids, workspace->activation)) {
+                  n_experts, n_used, n_tokens, 1, workspace->ids,
+                  workspace->activation)) {
         ok = 0;
         failed_stage = "down projection";
     }
-    if (ok && !ds4_gpu_inkling2_expert_accumulate_tensor(
+    if (ok && !ds4_gpu_inkling2_expert_accumulate_rows_tensor(
                   out, workspace->expert_outputs, workspace->weights,
-                  hidden_dim, n_used)) {
+                  hidden_dim, n_tokens, n_used)) {
         ok = 0;
         failed_stage = "expert accumulation";
     }

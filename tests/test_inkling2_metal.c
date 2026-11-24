@@ -843,6 +843,121 @@ static int test_situ_moe_metal(void) {
     }
     if (!q8_ok) ok = 0;
     ds4_gpu_tensor_free(tq8_out);
+
+    enum { BATCH_TOKENS = 3 };
+    float batch_input[BATCH_TOKENS * HIDDEN];
+    float batch_logits[BATCH_TOKENS * EXPERTS];
+    int32_t expected_ids[BATCH_TOKENS * USED];
+    float expected_weights[BATCH_TOKENS * USED];
+    for (uint32_t token = 0; token < BATCH_TOKENS; token++) {
+        for (uint32_t i = 0; i < HIDDEN; i++) {
+            batch_input[(uint64_t)token * HIDDEN + i] =
+                i == 0 ? (float)((int32_t)token - 1) * 0.7f :
+                (float)((int32_t)((token * 13u + i * 7u) % 17u) - 8) / 32.0f;
+        }
+        for (uint32_t expert = 0; expert < EXPERTS; expert++) {
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < HIDDEN; i++)
+                sum += router[(uint64_t)expert * HIDDEN + i] *
+                    batch_input[(uint64_t)token * HIDDEN + i];
+            batch_logits[(uint64_t)token * EXPERTS + expert] = sum;
+        }
+    }
+    router_reference(batch_logits, bias, BATCH_TOKENS, EXPERTS, USED, 8.0f,
+                     expected_ids, expected_weights);
+    ds4_gpu_tensor *batch_x = upload(batch_input, sizeof(batch_input));
+    ds4_gpu_tensor *batch_out = ds4_gpu_tensor_alloc(sizeof(batch_input));
+    int batch_ok = ok && q8_ok && batch_x && batch_out;
+    const uint32_t weight_types[] = { 20u, 8u };
+    const uint64_t gate_offsets[] = { gate_up_offset, q8_gate_up_offset };
+    const uint64_t down_offsets[] = { down_offset, q8_down_offset };
+    for (uint32_t type = 0; batch_ok && type < 2u; type++) {
+        batch_ok = ds4_inkling_moe_situ_metal_batch_with_workspace(
+            batch_out, batch_x, tb, g_synthetic_moe_map, g_synthetic_moe_size,
+            router_offset, gate_offsets[type], down_offsets[type],
+            HIDDEN, EXPERT_DIM,
+            BATCH_TOKENS, EXPERTS, USED, weight_types[type], 8.0f,
+            beta, linear_beta, &g_operator_context.moe);
+        float batch_actual[BATCH_TOKENS * HIDDEN];
+        int32_t actual_ids[BATCH_TOKENS * USED];
+        float actual_weights[BATCH_TOKENS * USED];
+        batch_ok = batch_ok &&
+            ds4_gpu_tensor_read(batch_out, 0, batch_actual, sizeof(batch_actual)) &&
+            ds4_gpu_tensor_read(g_operator_context.moe.ids, 0,
+                                actual_ids, sizeof(actual_ids)) &&
+            ds4_gpu_tensor_read(g_operator_context.moe.weights, 0,
+                                actual_weights, sizeof(actual_weights));
+        for (uint32_t i = 0; batch_ok && i < BATCH_TOKENS * USED; i++) {
+            if (actual_ids[i] != expected_ids[i] ||
+                !near(actual_weights[i], expected_weights[i], 2e-6f)) {
+                fprintf(stderr,
+                        "Inkling2 batched router mismatch type=%u route=%u got=%d expected=%d\n",
+                        weight_types[type], i, actual_ids[i], expected_ids[i]);
+                batch_ok = 0;
+            }
+        }
+        for (uint32_t token = 0; batch_ok && token < BATCH_TOKENS; token++) {
+            ds4_gpu_tensor *token_x = upload(
+                batch_input + (uint64_t)token * HIDDEN,
+                (uint64_t)HIDDEN * sizeof(float));
+            ds4_gpu_tensor *token_out = ds4_gpu_tensor_alloc(
+                (uint64_t)HIDDEN * sizeof(float));
+            float token_actual[HIDDEN];
+            batch_ok = token_x && token_out &&
+                ds4_inkling_moe_situ_metal_with_workspace(
+                    token_out, token_x, tb, g_synthetic_moe_map,
+                    g_synthetic_moe_size, router_offset, gate_offsets[type],
+                    down_offsets[type], HIDDEN, EXPERT_DIM, EXPERTS, USED,
+                    weight_types[type], 8.0f, beta, linear_beta,
+                    &g_operator_context.moe) &&
+                ds4_gpu_tensor_read(token_out, 0, token_actual,
+                                    sizeof(token_actual));
+            for (uint32_t i = 0; batch_ok && i < HIDDEN; i++) {
+                const float expected_row = batch_actual[(uint64_t)token * HIDDEN + i];
+                if (!near(token_actual[i], expected_row,
+                          2e-4f * fmaxf(1.0f, fabsf(expected_row)))) {
+                    fprintf(stderr,
+                            "Inkling2 batched MoE mismatch type=%u token=%u row=%u got=%g expected=%g\n",
+                            weight_types[type], token, i, token_actual[i], expected_row);
+                    batch_ok = 0;
+                }
+            }
+            ds4_gpu_tensor_free(token_x);
+            ds4_gpu_tensor_free(token_out);
+        }
+    }
+    if (batch_ok) {
+        float no_bias[EXPERTS] = { 0 };
+        int32_t no_bias_expected_ids[BATCH_TOKENS * USED];
+        float no_bias_expected_weights[BATCH_TOKENS * USED];
+        int32_t no_bias_actual_ids[BATCH_TOKENS * USED];
+        float no_bias_actual_weights[BATCH_TOKENS * USED];
+        router_reference(batch_logits, no_bias, BATCH_TOKENS, EXPERTS,
+                         USED, 8.0f, no_bias_expected_ids,
+                         no_bias_expected_weights);
+        batch_ok = ds4_inkling_moe_situ_metal_batch_with_workspace(
+            batch_out, batch_x, NULL, g_synthetic_moe_map, g_synthetic_moe_size,
+            router_offset, gate_up_offset, down_offset, HIDDEN, EXPERT_DIM,
+            BATCH_TOKENS, EXPERTS, USED, 20u, 8.0f, beta, linear_beta,
+            &g_operator_context.moe) &&
+            ds4_gpu_tensor_read(g_operator_context.moe.ids, 0,
+                no_bias_actual_ids, sizeof(no_bias_actual_ids)) &&
+            ds4_gpu_tensor_read(g_operator_context.moe.weights, 0,
+                no_bias_actual_weights, sizeof(no_bias_actual_weights));
+        for (uint32_t i = 0; batch_ok && i < BATCH_TOKENS * USED; i++) {
+            if (no_bias_actual_ids[i] != no_bias_expected_ids[i] ||
+                !near(no_bias_actual_weights[i], no_bias_expected_weights[i],
+                      2e-6f)) {
+                fprintf(stderr,
+                        "Inkling2 biasless batched router mismatch route=%u got=%d expected=%d\n",
+                        i, no_bias_actual_ids[i], no_bias_expected_ids[i]);
+                batch_ok = 0;
+            }
+        }
+    }
+    if (!batch_ok) ok = 0;
+    ds4_gpu_tensor_free(batch_x);
+    ds4_gpu_tensor_free(batch_out);
     ds4_gpu_tensor_free(tx);
     ds4_gpu_tensor_free(tb);
     ds4_gpu_tensor_free(to);

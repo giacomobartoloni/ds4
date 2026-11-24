@@ -86,6 +86,47 @@ typedef struct {
     ds4_gpu_tensor *dynamic_v;
 } ds4_inkling_gpu_layer_workspace;
 
+typedef struct {
+    ds4_gpu_tensor *current_storage;
+    ds4_gpu_tensor *next_storage;
+    ds4_gpu_tensor *prelude_storage;
+    ds4_gpu_tensor *current_blocks_storage;
+    ds4_gpu_tensor *previous_blocks_storage;
+    ds4_gpu_tensor *ffn_input_storage;
+    ds4_gpu_tensor *moe_input_storage;
+    ds4_gpu_tensor *moe_output_storage;
+    ds4_gpu_tensor *attn_norm_storage[3];
+    ds4_gpu_tensor *query_storage;
+    ds4_gpu_tensor *key_storage;
+    ds4_gpu_tensor *value_storage;
+    ds4_gpu_tensor *relative_storage;
+    ds4_gpu_tensor *dynamic_k_storage;
+    ds4_gpu_tensor *dynamic_v_storage;
+    ds4_gpu_tensor *sink_logits_storage;
+    ds4_gpu_tensor *attention_gate_storage;
+    ds4_gpu_tensor *attention_gated_storage;
+    ds4_gpu_tensor *attention_output_storage;
+    ds4_gpu_tensor *attn_norm[3][DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *query[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *key[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *value[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *relative[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *dynamic_k[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *dynamic_v[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *sink_logits[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *attention_gate[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *attention_gated[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *attention_output[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *current[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *next[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *prelude[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *current_blocks[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *previous_blocks[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *ffn_input[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *moe_input[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+    ds4_gpu_tensor *moe_output[DS4_INKLING_GPU_MOE_MAX_TOKENS];
+} ds4_inkling_gpu_batch_workspace;
+
 /* Per-session Metal state. Weight owners refer to the engine's 24 bound
  * physical layers; every visit has its own KV and convolution views. */
 typedef struct {
@@ -112,6 +153,7 @@ typedef struct {
     ds4_inkling_gpu_control_workspace control;
     ds4_inkling_gpu_moe_workspace moe;
     ds4_inkling_gpu_layer_workspace layer;
+    ds4_inkling_gpu_batch_workspace batch;
     ds4_inkling_gpu_slot slots[DS4_INKLING_CACHE_SLOTS];
 } ds4_inkling_gpu_context;
 

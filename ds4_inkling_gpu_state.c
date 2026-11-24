@@ -263,6 +263,53 @@ static void free_moe_workspace(ds4_inkling_gpu_moe_workspace *workspace) {
     memset(workspace, 0, sizeof(*workspace));
 }
 
+static void free_batch_workspace(ds4_inkling_gpu_batch_workspace *workspace) {
+    if (!workspace) return;
+    for (uint32_t row = 0; row < DS4_INKLING_GPU_MOE_MAX_TOKENS; row++) {
+        ds4_gpu_tensor_free(workspace->current[row]);
+        ds4_gpu_tensor_free(workspace->next[row]);
+        ds4_gpu_tensor_free(workspace->prelude[row]);
+        ds4_gpu_tensor_free(workspace->current_blocks[row]);
+        ds4_gpu_tensor_free(workspace->previous_blocks[row]);
+        ds4_gpu_tensor_free(workspace->ffn_input[row]);
+        ds4_gpu_tensor_free(workspace->moe_input[row]);
+        ds4_gpu_tensor_free(workspace->moe_output[row]);
+        for (uint32_t input = 0; input < 3u; input++)
+            ds4_gpu_tensor_free(workspace->attn_norm[input][row]);
+        ds4_gpu_tensor_free(workspace->query[row]);
+        ds4_gpu_tensor_free(workspace->key[row]);
+        ds4_gpu_tensor_free(workspace->value[row]);
+        ds4_gpu_tensor_free(workspace->relative[row]);
+        ds4_gpu_tensor_free(workspace->dynamic_k[row]);
+        ds4_gpu_tensor_free(workspace->dynamic_v[row]);
+        ds4_gpu_tensor_free(workspace->sink_logits[row]);
+        ds4_gpu_tensor_free(workspace->attention_gate[row]);
+        ds4_gpu_tensor_free(workspace->attention_gated[row]);
+        ds4_gpu_tensor_free(workspace->attention_output[row]);
+    }
+    ds4_gpu_tensor_free(workspace->current_storage);
+    ds4_gpu_tensor_free(workspace->next_storage);
+    ds4_gpu_tensor_free(workspace->prelude_storage);
+    ds4_gpu_tensor_free(workspace->current_blocks_storage);
+    ds4_gpu_tensor_free(workspace->previous_blocks_storage);
+    ds4_gpu_tensor_free(workspace->ffn_input_storage);
+    ds4_gpu_tensor_free(workspace->moe_input_storage);
+    ds4_gpu_tensor_free(workspace->moe_output_storage);
+    for (uint32_t input = 0; input < 3u; input++)
+        ds4_gpu_tensor_free(workspace->attn_norm_storage[input]);
+    ds4_gpu_tensor_free(workspace->query_storage);
+    ds4_gpu_tensor_free(workspace->key_storage);
+    ds4_gpu_tensor_free(workspace->value_storage);
+    ds4_gpu_tensor_free(workspace->relative_storage);
+    ds4_gpu_tensor_free(workspace->dynamic_k_storage);
+    ds4_gpu_tensor_free(workspace->dynamic_v_storage);
+    ds4_gpu_tensor_free(workspace->sink_logits_storage);
+    ds4_gpu_tensor_free(workspace->attention_gate_storage);
+    ds4_gpu_tensor_free(workspace->attention_gated_storage);
+    ds4_gpu_tensor_free(workspace->attention_output_storage);
+    memset(workspace, 0, sizeof(*workspace));
+}
+
 static ds4_gpu_tensor *take_view(ds4_gpu_tensor *base, uint64_t base_bytes,
                                  uint64_t *cursor, uint64_t bytes) {
     if (!base || !cursor || bytes == 0 ||
@@ -360,19 +407,71 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
 
     ds4_inkling_gpu_moe_workspace *moe = &context->moe;
     moe->logits = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_EXPERTS);
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_EXPERTS);
     moe->ids = take_view(context->scratch, scratch_bytes, &cursor,
-        8u * sizeof(int32_t));
+        DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u * sizeof(int32_t));
     moe->weights = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 8u);
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u);
     moe->gate_up = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 8u * 2u * DS4_INKLING_GPU_EXPERT_DIM);
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u *
+            2u * DS4_INKLING_GPU_EXPERT_DIM);
     moe->activation = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 8u * DS4_INKLING_GPU_EXPERT_DIM);
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u *
+            DS4_INKLING_GPU_EXPERT_DIM);
     moe->expert_outputs = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 8u * DS4_INKLING_GPU_HIDDEN);
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u *
+            DS4_INKLING_GPU_HIDDEN);
     moe->zero_bias = take_float_view(context->scratch, scratch_bytes,
         &cursor, DS4_INKLING_GPU_EXPERTS);
+
+    ds4_inkling_gpu_batch_workspace *batch = &context->batch;
+    batch->current_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    batch->next_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    batch->prelude_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    batch->current_blocks_storage = take_float_view(context->scratch,
+        scratch_bytes, &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
+            4u * DS4_INKLING_GPU_HIDDEN);
+    batch->previous_blocks_storage = take_float_view(context->scratch,
+        scratch_bytes, &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
+            2u * DS4_INKLING_GPU_HIDDEN);
+    batch->ffn_input_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    batch->moe_input_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    batch->moe_output_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    for (uint32_t input = 0; input < 3u; input++) {
+        batch->attn_norm_storage[input] = take_float_view(context->scratch,
+            scratch_bytes, &cursor,
+            DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
+    }
+    batch->query_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_QUERY_WIDTH);
+    batch->key_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_KV_WIDTH);
+    batch->value_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_KV_WIDTH);
+    batch->relative_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
+            DS4_INKLING_GPU_RELATIVE_WIDTH);
+    batch->dynamic_k_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 32u);
+    batch->dynamic_v_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 32u);
+    batch->sink_logits_storage = take_float_view(context->scratch, scratch_bytes,
+        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 24u);
+    batch->attention_gate_storage = take_float_view(context->scratch,
+        scratch_bytes, &cursor,
+        DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_QUERY_WIDTH);
+    batch->attention_gated_storage = take_float_view(context->scratch,
+        scratch_bytes, &cursor,
+        DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_QUERY_WIDTH);
+    batch->attention_output_storage = take_float_view(context->scratch,
+        scratch_bytes, &cursor,
+        DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
 
     ds4_inkling_gpu_layer_workspace *layer = &context->layer;
     layer->current = context->activation;
@@ -427,6 +526,63 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
 
     const uint64_t hidden_bytes =
         (uint64_t)DS4_INKLING_GPU_HIDDEN * sizeof(float);
+    const uint64_t query_bytes =
+        (uint64_t)DS4_INKLING_GPU_QUERY_WIDTH * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)DS4_INKLING_KV_WIDTH * sizeof(float);
+    const uint64_t relative_bytes =
+        (uint64_t)DS4_INKLING_GPU_RELATIVE_WIDTH * sizeof(float);
+    const uint64_t dynamic_bytes = 32u * sizeof(float);
+    const uint64_t sink_bytes = 24u * sizeof(float);
+    for (uint32_t row = 0; row < DS4_INKLING_GPU_MOE_MAX_TOKENS; row++) {
+        const uint64_t row_offset = (uint64_t)row * hidden_bytes;
+        const uint64_t block_offset = (uint64_t)row * 4u * hidden_bytes;
+        const uint64_t previous_offset = (uint64_t)row * 2u * hidden_bytes;
+        batch->current[row] = ds4_gpu_tensor_view(batch->current_storage,
+                                                   row_offset, hidden_bytes);
+        batch->next[row] = ds4_gpu_tensor_view(batch->next_storage,
+                                                row_offset, hidden_bytes);
+        batch->prelude[row] = ds4_gpu_tensor_view(batch->prelude_storage,
+                                                   row_offset, hidden_bytes);
+        batch->current_blocks[row] = ds4_gpu_tensor_view(
+            batch->current_blocks_storage, block_offset, 4u * hidden_bytes);
+        batch->previous_blocks[row] = ds4_gpu_tensor_view(
+            batch->previous_blocks_storage, previous_offset, 2u * hidden_bytes);
+        batch->ffn_input[row] = ds4_gpu_tensor_view(batch->ffn_input_storage,
+                                                    row_offset, hidden_bytes);
+        batch->moe_input[row] = ds4_gpu_tensor_view(batch->moe_input_storage,
+                                                    row_offset, hidden_bytes);
+        batch->moe_output[row] = ds4_gpu_tensor_view(batch->moe_output_storage,
+                                                     row_offset, hidden_bytes);
+        for (uint32_t input = 0; input < 3u; input++) {
+            batch->attn_norm[input][row] = ds4_gpu_tensor_view(
+                batch->attn_norm_storage[input], row_offset, hidden_bytes);
+        }
+        batch->query[row] = ds4_gpu_tensor_view(batch->query_storage,
+                                                (uint64_t)row * query_bytes,
+                                                query_bytes);
+        batch->key[row] = ds4_gpu_tensor_view(batch->key_storage,
+                                              (uint64_t)row * kv_bytes,
+                                              kv_bytes);
+        batch->value[row] = ds4_gpu_tensor_view(batch->value_storage,
+                                                (uint64_t)row * kv_bytes,
+                                                kv_bytes);
+        batch->relative[row] = ds4_gpu_tensor_view(batch->relative_storage,
+            (uint64_t)row * relative_bytes, relative_bytes);
+        batch->dynamic_k[row] = ds4_gpu_tensor_view(batch->dynamic_k_storage,
+            (uint64_t)row * dynamic_bytes, dynamic_bytes);
+        batch->dynamic_v[row] = ds4_gpu_tensor_view(batch->dynamic_v_storage,
+            (uint64_t)row * dynamic_bytes, dynamic_bytes);
+        batch->sink_logits[row] = ds4_gpu_tensor_view(batch->sink_logits_storage,
+            (uint64_t)row * sink_bytes, sink_bytes);
+        batch->attention_gate[row] = ds4_gpu_tensor_view(
+            batch->attention_gate_storage, (uint64_t)row * query_bytes,
+            query_bytes);
+        batch->attention_gated[row] = ds4_gpu_tensor_view(
+            batch->attention_gated_storage, (uint64_t)row * query_bytes,
+            query_bytes);
+        batch->attention_output[row] = ds4_gpu_tensor_view(
+            batch->attention_output_storage, row_offset, hidden_bytes);
+    }
     for (uint32_t i = 0; i < 4u; i++) {
         layer->mix_output_rows[i] = ds4_gpu_tensor_view(
             layer->mix_outputs, (uint64_t)i * hidden_bytes, hidden_bytes);
@@ -443,7 +599,16 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
     if (!control->normalized || !control->bottleneck || !control->gain ||
         !control->forget || !moe->logits || !moe->ids || !moe->weights ||
         !moe->gate_up || !moe->activation || !moe->expert_outputs ||
-        !moe->zero_bias || !layer->next || !layer->mix_states ||
+        !moe->zero_bias || !batch->current_storage || !batch->next_storage ||
+        !batch->prelude_storage || !batch->current_blocks_storage ||
+        !batch->previous_blocks_storage || !batch->ffn_input_storage ||
+        !batch->moe_input_storage || !batch->moe_output_storage ||
+        !batch->query_storage || !batch->key_storage || !batch->value_storage ||
+        !batch->relative_storage || !batch->dynamic_k_storage ||
+        !batch->dynamic_v_storage || !batch->sink_logits_storage ||
+        !batch->attention_gate_storage || !batch->attention_gated_storage ||
+        !batch->attention_output_storage ||
+        !layer->next || !layer->mix_states ||
         !layer->mix_outputs || !layer->controlled_inputs || !layer->query ||
         !layer->prepared_query || !layer->key || !layer->prepared_key ||
         !layer->value || !layer->prepared_value || !layer->relative ||
@@ -461,6 +626,21 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
     for (uint32_t i = 0; i < 3u; i++) {
         if (!layer->controlled_input_rows[i]) return false;
     }
+    for (uint32_t row = 0; row < DS4_INKLING_GPU_MOE_MAX_TOKENS; row++) {
+        if (!batch->current[row] || !batch->next[row] || !batch->prelude[row] ||
+            !batch->current_blocks[row] || !batch->previous_blocks[row] ||
+            !batch->ffn_input[row] || !batch->moe_input[row] ||
+            !batch->moe_output[row]) return false;
+        for (uint32_t input = 0; input < 3u; input++) {
+            if (!batch->attn_norm_storage[input] ||
+                !batch->attn_norm[input][row]) return false;
+        }
+        if (!batch->query[row] || !batch->key[row] || !batch->value[row] ||
+            !batch->relative[row] || !batch->dynamic_k[row] ||
+            !batch->dynamic_v[row] || !batch->sink_logits[row] ||
+            !batch->attention_gate[row] || !batch->attention_gated[row] ||
+            !batch->attention_output[row]) return false;
+    }
 
     int64_t distances[1024];
     for (uint32_t i = 0; i < 1024u; i++) distances[i] = (int64_t)i;
@@ -476,6 +656,7 @@ void ds4_inkling_gpu_context_free(ds4_inkling_gpu_context *context) {
         free_slot_views(&context->slots[slot]);
     free_control_workspace(&context->control);
     free_moe_workspace(&context->moe);
+    free_batch_workspace(&context->batch);
     free_layer_workspace(&context->layer);
     ds4_gpu_tensor_free(context->parameters.output_res_query);
     for (uint32_t layer = 0; layer < DS4_INKLING_PHYSICAL_LAYERS; layer++)

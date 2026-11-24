@@ -52,4 +52,26 @@ int ds4_inkling_moe_situ_metal_with_workspace(
         float                 situ_linear_beta,
         const struct ds4_inkling_gpu_moe_workspace *workspace);
 
+/* Execute the same routed SITU FFN for contiguous [n_tokens][hidden_dim] rows.
+ * Router selections, weights and expert activations remain on Metal. */
+int ds4_inkling_moe_situ_metal_batch_with_workspace(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *correction_bias,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              router_offset,
+        uint64_t              gate_up_offset,
+        uint64_t              down_offset,
+        uint32_t              hidden_dim,
+        uint32_t              expert_dim,
+        uint32_t              n_tokens,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              expert_weight_type,
+        float                 routed_scale,
+        float                 situ_beta,
+        float                 situ_linear_beta,
+        const struct ds4_inkling_gpu_moe_workspace *workspace);
+
 #endif /* DS4_INKLING_MOE_H */

@@ -186,15 +186,16 @@ static void verify_residual_query_order(ds4_session *session) {
         states[2u * TEST_HIDDEN + i] = current[i];
     }
     ds4_inkling_gpu_context *context = &session->inkling_gpu;
-    assert(ds4_gpu_tensor_write(context->current_blocks, 0, banks,
+    assert(ds4_gpu_tensor_write(context->batch.current_blocks[0], 0, banks,
                                 2u * row_bytes));
-    assert(ds4_gpu_tensor_write(context->prelude_output, 0, current, row_bytes));
+    assert(ds4_gpu_tensor_write(context->batch.prelude[0], 0, current, row_bytes));
     assert(ds4_gpu_tensor_write(context->parameters.output_res_query, 0,
                                 query, row_bytes));
     assert(ds4_inkling_mix_ref(expected, states, query, 3u,
                                TEST_HIDDEN, 1u, 1.0e-6f));
     assert(ds4_gpu_begin_commands());
-    assert(inkling_gpu_mix(context, context->prelude_output, 2u,
+    assert(inkling_gpu_mix(context, context->batch.prelude[0],
+            context->batch.current_blocks[0], 2u,
             context->parameters.output_res_query, 1u,
             context->layer.mix_output_rows[0]));
     assert(ds4_gpu_end_commands());
@@ -229,9 +230,9 @@ static void verify_previous_loop_message_states(ds4_session *session) {
         previous_states[i] = cosf((float)i * 0.011f - 0.2f);
         previous_states[TEST_HIDDEN + i] = sinf((float)i * 0.023f - 0.8f);
     }
-    assert(ds4_gpu_tensor_write(context->current_blocks, 0,
+    assert(ds4_gpu_tensor_write(context->batch.current_blocks[0], 0,
                                 current_block, row_bytes));
-    assert(ds4_gpu_tensor_write(context->layer.previous_loop_states, 0,
+    assert(ds4_gpu_tensor_write(context->batch.previous_blocks[0], 0,
                                 previous_states, 2u * row_bytes));
     assert(ds4_gpu_tensor_write(context->parameters.layer[6].loop_msg_query, 0,
                                 queries, messages_bytes));
@@ -248,11 +249,21 @@ static void verify_previous_loop_message_states(ds4_session *session) {
     }
     assert(visit);
     assert(ds4_gpu_begin_commands());
-    ds4_gpu_tensor *out = NULL;
+    inkling_gpu_row_state row = {
+        .row_index = 0u,
+        .activation_a = context->batch.current[0],
+        .activation_b = context->batch.next[0],
+        .current_blocks = context->batch.current_blocks[0],
+        .previous_blocks = context->batch.previous_blocks[0],
+        .prelude = context->batch.prelude[0],
+        .ffn_input = context->batch.ffn_input[0],
+        .moe_input = context->batch.moe_input[0],
+        .moe_output = context->batch.moe_output[0],
+        .current = context->batch.prelude[0],
+    };
     const char *failed_stage = NULL;
-    const bool evaluated = inkling_gpu_decoder_layer(
-        session, visit, 6u, 1u, context->prelude_output,
-        &out, &failed_stage);
+    const bool evaluated = inkling_gpu_run_visit(
+        session, visit, 6u, 0u, 1u, 1u, &row, &failed_stage);
     assert(ds4_gpu_end_commands());
     if (!evaluated)
         fprintf(stderr, "loop message integration failed at %s\n",

@@ -1269,6 +1269,8 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
 #ifdef __APPLE__
 /* Inkling 2 controller and routing operators. Tensors are contiguous f32
  * except `selected`, which contains int32 expert IDs in token-major order. */
+enum { DS4_INKLING_GPU_MOE_MAX_TOKENS = 8u };
+
 int ds4_gpu_inkling2_gate_update_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *current,
@@ -1317,6 +1319,16 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         uint32_t                out_dim,
         uint32_t                n_used);
 
+/* Batched form: expert_outputs is [n_tokens][n_used][out_dim] and weights is
+ * [n_tokens][n_used], both contiguous in token-major order. */
+int ds4_gpu_inkling2_expert_accumulate_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *expert_outputs,
+        const ds4_gpu_tensor *weights,
+        uint32_t                out_dim,
+        uint32_t                n_tokens,
+        uint32_t                n_used);
+
 /* Quantized expert GEMV selected by device-resident int32 expert IDs. `out`
  * is [n_used][out_dim], weights are [expert][row][quantized input block].
  * `weight_type` accepts GGML Q8_0 (8) or IQ4_NL (20). */
@@ -1334,10 +1346,38 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
         const ds4_gpu_tensor *expert_ids,
         const ds4_gpu_tensor *x);
 
+/* Batched form of selected expert GEMV. IDs and outputs use
+ * [n_tokens][n_used] row-major order; `x` is [n_tokens][in_dim] when
+ * input_per_expert is false and [n_tokens][n_used][in_dim] otherwise. */
+int ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              n_tokens,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x);
+
 /* SiTU over concatenated [gate, up] expert vectors in [expert][2*ffn] order. */
 int ds4_gpu_inkling2_situ_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *gate_up,
+        uint32_t              n_used,
+        uint32_t              expert_dim,
+        float                 beta,
+        float                 linear_beta);
+
+/* Batched form with token-major [n_tokens][n_used][2*expert_dim] gate/up rows. */
+int ds4_gpu_inkling2_situ_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate_up,
+        uint32_t              n_tokens,
         uint32_t              n_used,
         uint32_t              expert_dim,
         float                 beta,
