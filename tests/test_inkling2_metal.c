@@ -25,6 +25,7 @@ static void *g_synthetic_model_map;
 static uint64_t g_synthetic_model_size;
 static void *g_synthetic_moe_map;
 static uint64_t g_synthetic_moe_size;
+static void *g_full_shape_iq4_map;
 static void *g_synthetic_loop_map;
 static ds4_inkling_gpu_context g_operator_context;
 static float g_m4_qk_relative_max_error;
@@ -1000,6 +1001,7 @@ static int test_expert_grouped_iq4(void) {
     uint32_t counts[EXPERTS];
     uint32_t routes[EXPERTS * ROUTES];
     uint8_t seen[ROUTES];
+    ds4_gpu_tensor *small = NULL, *small_counts = NULL;
     CHECK(tid && tx && gate_ref && gate_gemm && act && down_ref && down_gemm);
     CHECK(ds4_gpu_inkling2_expert_grouped_available());
 
@@ -1017,7 +1019,10 @@ static int test_expert_grouped_iq4(void) {
             routes, (uint64_t)EXPERTS * nr * sizeof(uint32_t)));
         memset(seen, 0, sizeof(seen));
         uint32_t sum = 0;
+        int saw_one = 0, saw_many = 0;
         for (uint32_t expert = 0; expert < EXPERTS; expert++) {
+            if (counts[expert] == 1u) saw_one = 1;
+            else if (counts[expert] > 1u) saw_many = 1;
             uint32_t prev = 0;
             for (uint32_t j = 0; j < counts[expert]; j++) {
                 const uint32_t route = routes[expert * nr + j];
@@ -1032,6 +1037,7 @@ static int test_expert_grouped_iq4(void) {
         }
         CHECK(sum == nr);
         for (uint32_t r = 0; r < nr; r++) CHECK(seen[r] == 1u);
+        if (j == 2u) CHECK(saw_one && saw_many);
     }
     /* Exercise full-count and unused-expert map behavior, even when the
      * repeated IDs would not arise from the production top-8 selector. */
@@ -1049,14 +1055,35 @@ static int test_expert_grouped_iq4(void) {
     CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(
         g_operator_context.moe.route_map,
         g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED));
-    ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(4u);
-    CHECK(small);
+    small = ds4_gpu_tensor_alloc(4u);
+    small_counts = ds4_gpu_tensor_alloc(4u);
+    CHECK(small && small_counts);
     CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
         small, g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED));
     CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map, small_counts, tid,
+        TOKENS, EXPERTS, USED));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
         g_operator_context.moe.route_map,
         g_operator_context.moe.route_counts, tid, TOKENS + 1u, EXPERTS, USED));
-    ds4_gpu_tensor_free(small);
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, 0u, EXPERTS, USED));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, 0u, USED));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS + 1u, USED));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, 0u));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED + 1u));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, USED - 1u, USED));
 
     CHECK(ds4_gpu_inkling2_expert_gemv_rows_tensor(
         gate_ref, g_synthetic_moe_map, g_synthetic_moe_size, gate_offset,
@@ -1091,6 +1118,8 @@ static int test_expert_grouped_iq4(void) {
                    6e-4f * fmaxf(1.0f, fabsf(down_a[i]))));
 
 cleanup:
+    ds4_gpu_tensor_free(small);
+    ds4_gpu_tensor_free(small_counts);
     ds4_gpu_tensor_free(tid);
     ds4_gpu_tensor_free(tx);
     ds4_gpu_tensor_free(gate_ref);
@@ -1098,6 +1127,213 @@ cleanup:
     ds4_gpu_tensor_free(act);
     ds4_gpu_tensor_free(down_ref);
     ds4_gpu_tensor_free(down_gemm);
+    return ok;
+}
+
+static int report_expert_iq4_parity(const char *label,
+                                    const float *gemv,
+                                    const float *gemm,
+                                    size_t count) {
+    double max_abs = 0.0, max_rel = 0.0;
+    uint64_t out_of_tolerance = 0, nonfinite = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!isfinite(gemv[i]) || !isfinite(gemm[i])) {
+            nonfinite++;
+            out_of_tolerance++;
+            continue;
+        }
+        const double abs_ref = fabs((double)gemv[i]);
+        const double diff = fabs((double)gemm[i] - (double)gemv[i]);
+        const double rel = diff / fmax(abs_ref, 1e-6);
+        if (diff > max_abs) max_abs = diff;
+        if (rel > max_rel) max_rel = rel;
+        if (diff > 6e-4 * fmax(1.0, abs_ref)) out_of_tolerance++;
+    }
+    fprintf(stderr,
+            "Inkling2 full-shape IQ4_NL %s GEMV/GEMM: max_abs=%.9g "
+            "max_rel=%.9g out_of_tolerance=%llu/%zu nonfinite=%llu\n",
+            label, max_abs, max_rel,
+            (unsigned long long)out_of_tolerance, count,
+            (unsigned long long)nonfinite);
+    return out_of_tolerance == 0 && nonfinite == 0;
+}
+
+/* Compare the legacy GEMV and grouped GEMM at the model's real MoE shapes.
+ * Only experts 0..7 have routes, so the remaining weight pages stay zero while
+ * the buffer still describes the complete 128-expert tensor layout. */
+static int test_expert_grouped_iq4_full_shape(void) {
+    enum { TOKENS = 32, EXPERTS = 128, USED = 8,
+           HIDDEN = 2304, FFN = 1152, ROUTES = TOKENS * USED };
+    const uint32_t gate_out_dim = 2u * FFN;
+    const uint32_t gate_row_bytes = HIDDEN / 32u * 18u;
+    const uint32_t down_row_bytes = FFN / 32u * 18u;
+    const uint64_t gate_offset = 64u;
+    const uint64_t gate_expert_bytes = (uint64_t)gate_out_dim * gate_row_bytes;
+    const uint64_t gate_bytes = (uint64_t)EXPERTS * gate_expert_bytes;
+    const uint64_t down_offset = align_up_u64(gate_offset + gate_bytes, 64u);
+    const uint64_t down_expert_bytes = (uint64_t)HIDDEN * down_row_bytes;
+    const uint64_t down_bytes = (uint64_t)EXPERTS * down_expert_bytes;
+    const uint64_t model_size = down_offset + down_bytes;
+    const uint64_t output_count = (uint64_t)ROUTES * HIDDEN;
+    const uint64_t output_bytes = output_count * sizeof(float);
+    const uint64_t input_bytes = (uint64_t)TOKENS * HIDDEN * sizeof(float);
+    const long page = sysconf(_SC_PAGESIZE);
+    uint64_t allocation = 0;
+    int ok = 0, model_map_set = 0;
+    void *input = NULL, *gate_a = NULL, *gate_b = NULL;
+    void *down_a = NULL, *down_b = NULL, *stale = NULL;
+    uint32_t *stale_route_map = NULL, *stale_route_counts = NULL;
+    ds4_gpu_tensor *tid = NULL, *tx = NULL, *gate_ref = NULL;
+    ds4_gpu_tensor *gate_gemm = NULL, *activation = NULL;
+    ds4_gpu_tensor *down_ref = NULL, *down_gemm = NULL;
+
+    if (page <= 0 || model_size > SIZE_MAX || output_bytes > SIZE_MAX ||
+        input_bytes > SIZE_MAX) {
+        fprintf(stderr, "Inkling2 full-shape GEMM fixture size invalid\n");
+        return 0;
+    }
+    allocation = align_up_u64(model_size, (uint64_t)page);
+    if (allocation > SIZE_MAX || posix_memalign(&g_full_shape_iq4_map,
+            (size_t)page, (size_t)allocation) != 0) {
+        g_full_shape_iq4_map = NULL;
+        fprintf(stderr, "Inkling2 full-shape GEMM model map allocation failed\n");
+        return 0;
+    }
+    memset(g_full_shape_iq4_map, 0, (size_t)allocation);
+    pack_synthetic_iq4_experts((uint8_t *)g_full_shape_iq4_map + gate_offset,
+                               USED, gate_out_dim, HIDDEN, 37u);
+    pack_synthetic_iq4_experts((uint8_t *)g_full_shape_iq4_map + down_offset,
+                               USED, HIDDEN, FFN, 53u);
+    if (!ds4_gpu_set_model_map(g_full_shape_iq4_map, allocation)) {
+        fprintf(stderr, "Inkling2 full-shape GEMM model map registration failed\n");
+        goto cleanup;
+    }
+    model_map_set = 1;
+
+    input = malloc((size_t)input_bytes);
+    gate_a = malloc((size_t)output_bytes);
+    gate_b = malloc((size_t)output_bytes);
+    down_a = malloc((size_t)output_bytes);
+    down_b = malloc((size_t)output_bytes);
+    stale = malloc((size_t)output_bytes);
+    const uint64_t route_map_bytes =
+        ds4_gpu_tensor_bytes(g_operator_context.moe.route_map);
+    const uint64_t route_counts_bytes =
+        ds4_gpu_tensor_bytes(g_operator_context.moe.route_counts);
+    if (route_map_bytes < (uint64_t)EXPERTS * ROUTES * sizeof(uint32_t) ||
+        route_counts_bytes < (uint64_t)EXPERTS * sizeof(uint32_t) ||
+        route_map_bytes > SIZE_MAX || route_counts_bytes > SIZE_MAX) {
+        fprintf(stderr, "Inkling2 full-shape route-map workspace is undersized\n");
+        goto cleanup;
+    }
+    stale_route_map = malloc((size_t)route_map_bytes);
+    stale_route_counts = malloc((size_t)route_counts_bytes);
+    if (!input || !gate_a || !gate_b || !down_a || !down_b || !stale ||
+        !stale_route_map || !stale_route_counts) {
+        fprintf(stderr, "Inkling2 full-shape GEMM host allocation failed\n");
+        goto cleanup;
+    }
+
+    int32_t ids[ROUTES];
+    for (uint32_t token = 0; token < TOKENS; token++) {
+        for (uint32_t col = 0; col < HIDDEN; col++) {
+            const int32_t q = (int32_t)((token * 31u + col * 17u) % 251u) - 125;
+            ((float *)input)[(uint64_t)token * HIDDEN + col] = (float)q / 2048.0f;
+        }
+        for (uint32_t slot = 0; slot < USED; slot++)
+            ids[token * USED + slot] = (int32_t)slot;
+    }
+    memset(stale_route_map, 0xa5, (size_t)route_map_bytes);
+    memset(stale_route_counts, 0xa5, (size_t)route_counts_bytes);
+    for (uint64_t i = 0; i < output_count; i++) ((float *)stale)[i] = NAN;
+
+    tid = upload(ids, sizeof(ids));
+    tx = upload(input, input_bytes);
+    gate_ref = ds4_gpu_tensor_alloc(output_bytes);
+    gate_gemm = ds4_gpu_tensor_alloc(output_bytes);
+    activation = ds4_gpu_tensor_alloc((uint64_t)ROUTES * FFN * sizeof(float));
+    down_ref = ds4_gpu_tensor_alloc(output_bytes);
+    down_gemm = ds4_gpu_tensor_alloc(output_bytes);
+    if (!tid || !tx || !gate_ref || !gate_gemm || !activation ||
+        !down_ref || !down_gemm) {
+        fprintf(stderr, "Inkling2 full-shape GEMM tensor allocation failed\n");
+        goto cleanup;
+    }
+
+    CHECK(ds4_gpu_tensor_write(g_operator_context.moe.route_map, 0,
+                               stale_route_map, route_map_bytes));
+    CHECK(ds4_gpu_tensor_write(g_operator_context.moe.route_counts, 0,
+                               stale_route_counts, route_counts_bytes));
+    CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map, g_operator_context.moe.route_counts,
+        tid, TOKENS, EXPERTS, USED));
+    uint32_t counts[EXPERTS];
+    uint32_t mapped_routes[EXPERTS * ROUTES];
+    CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_counts, 0,
+                              counts, sizeof(counts)));
+    CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_map, 0,
+                              mapped_routes, sizeof(mapped_routes)));
+    for (uint32_t expert = 0; expert < EXPERTS; expert++) {
+        const uint32_t expected_count = expert < USED ? TOKENS : 0u;
+        CHECK(counts[expert] == expected_count);
+        for (uint32_t rank = 0; rank < expected_count; rank++)
+            CHECK(mapped_routes[expert * ROUTES + rank] == rank * USED + expert);
+    }
+
+    CHECK(ds4_gpu_tensor_write(gate_ref, 0, stale, output_bytes));
+    CHECK(ds4_gpu_tensor_write(gate_gemm, 0, stale, output_bytes));
+    CHECK(ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        gate_ref, g_full_shape_iq4_map, allocation, gate_offset, 20u,
+        HIDDEN, gate_out_dim, EXPERTS, USED, TOKENS, 0, tid, tx));
+    CHECK(ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        gate_gemm, g_full_shape_iq4_map, allocation, gate_offset,
+        HIDDEN, gate_out_dim, EXPERTS, USED, TOKENS, 0,
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tx));
+    CHECK(ds4_gpu_inkling2_situ_rows_tensor(
+        activation, gate_ref, TOKENS, USED, FFN, 1.25f, 0.75f));
+
+    CHECK(ds4_gpu_tensor_write(down_ref, 0, stale, output_bytes));
+    CHECK(ds4_gpu_tensor_write(down_gemm, 0, stale, output_bytes));
+    CHECK(ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        down_ref, g_full_shape_iq4_map, allocation, down_offset, 20u,
+        FFN, HIDDEN, EXPERTS, USED, TOKENS, 1, tid, activation));
+    CHECK(ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        down_gemm, g_full_shape_iq4_map, allocation, down_offset,
+        FFN, HIDDEN, EXPERTS, USED, TOKENS, 1,
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, activation));
+    CHECK(ds4_gpu_tensor_read(gate_ref, 0, gate_a, output_bytes));
+    CHECK(ds4_gpu_tensor_read(gate_gemm, 0, gate_b, output_bytes));
+    CHECK(ds4_gpu_tensor_read(down_ref, 0, down_a, output_bytes));
+    CHECK(ds4_gpu_tensor_read(down_gemm, 0, down_b, output_bytes));
+    CHECK(report_expert_iq4_parity("gate/up", gate_a, gate_b,
+                                  (size_t)output_count));
+    CHECK(report_expert_iq4_parity("down", down_a, down_b,
+                                  (size_t)output_count));
+    ok = 1;
+
+cleanup:
+    if (model_map_set &&
+        !ds4_gpu_set_model_map(g_synthetic_moe_map, g_synthetic_moe_size)) {
+        fprintf(stderr, "Inkling2 full-shape GEMM model map restore failed\n");
+        ok = 0;
+    }
+    ds4_gpu_tensor_free(tid);
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(gate_ref);
+    ds4_gpu_tensor_free(gate_gemm);
+    ds4_gpu_tensor_free(activation);
+    ds4_gpu_tensor_free(down_ref);
+    ds4_gpu_tensor_free(down_gemm);
+    free(input);
+    free(gate_a);
+    free(gate_b);
+    free(down_a);
+    free(down_b);
+    free(stale);
+    free(stale_route_map);
+    free(stale_route_counts);
     return ok;
 }
 
@@ -1670,6 +1906,7 @@ int main(void) {
     CHECK(test_expert_accumulation());
     CHECK(test_situ_moe_metal());
     CHECK(test_expert_grouped_iq4());
+    CHECK(test_expert_grouped_iq4_full_shape());
     CHECK(test_qk_and_relative_bias());
     CHECK(test_attention_output_gate());
     CHECK(test_attention_and_shortconv());
@@ -1689,6 +1926,7 @@ cleanup:
     ds4_gpu_cleanup();
     free(g_synthetic_model_map);
     free(g_synthetic_moe_map);
+    free(g_full_shape_iq4_map);
     free(g_synthetic_loop_map);
     return ok ? 0 : 1;
 }

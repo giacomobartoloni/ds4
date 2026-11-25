@@ -375,8 +375,12 @@ kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
         threadgroup float *weight_row [[threadgroup(0)]],
         threadgroup float *partial [[threadgroup(1)]],
         uint2 group [[threadgroup_position_in_grid]],
-        uint lane [[thread_index_in_threadgroup]],
-        uint lanes [[threads_per_threadgroup]]) {
+        uint2 thread_position [[thread_position_in_threadgroup]],
+        uint2 threads_per_threadgroup [[threads_per_threadgroup]]) {
+    const uint lane = thread_position.x +
+        thread_position.y * threads_per_threadgroup.x;
+    const uint lanes = threads_per_threadgroup.x *
+        threads_per_threadgroup.y;
     const uint row = group.x;
     const uint expert = group.y;
     if (row >= args.out_dim || expert >= args.n_experts) return;

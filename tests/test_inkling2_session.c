@@ -314,7 +314,7 @@ typedef struct {
 static void request_cancel_after_first_prefill_group(
         void *ud, const char *event, int current, int total) {
     prefill_cancel_probe *probe = ud;
-    assert(total == 10);
+    assert(total == DS4_INKLING_GPU_MOE_MAX_TOKENS + 2);
     if (strcmp(event, "prefill_chunk") != 0) return;
     probe->calls++;
     probe->last_current = current;
