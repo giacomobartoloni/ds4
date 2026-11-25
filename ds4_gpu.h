@@ -1269,7 +1269,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
 #ifdef __APPLE__
 /* Inkling 2 controller and routing operators. Tensors are contiguous f32
  * except `selected`, which contains int32 expert IDs in token-major order. */
-enum { DS4_INKLING_GPU_MOE_MAX_TOKENS = 8u };
+enum { DS4_INKLING_GPU_MOE_MAX_TOKENS = 32u };
 
 int ds4_gpu_inkling2_gate_update_tensor(
         ds4_gpu_tensor       *out,
@@ -1344,6 +1344,31 @@ int ds4_gpu_inkling2_expert_gemv_tensor(
         uint32_t              n_used,
         int                   input_per_expert,
         const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x);
+
+/* Selected-expert IQ4_NL grouped path. The map is [expert][rank] with a
+ * stride of n_tokens*n_used routes and all route IDs stay on the GPU.
+ * The high-level Inkling dispatcher alone decides whether to use this path;
+ * the low-level routines also allow smaller fixtures for oracle tests. */
+int ds4_gpu_inkling2_expert_grouped_available(void);
+int ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        ds4_gpu_tensor       *route_map,
+        ds4_gpu_tensor       *route_counts,
+        const ds4_gpu_tensor *expert_ids,
+        uint32_t n_tokens, uint32_t n_experts, uint32_t n_used);
+int ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              n_tokens,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *route_map,
+        const ds4_gpu_tensor *route_counts,
         const ds4_gpu_tensor *x);
 
 /* Batched form of selected expert GEMV. IDs and outputs use

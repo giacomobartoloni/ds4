@@ -109,10 +109,32 @@ int ds4_inkling_moe_situ_metal_batch_with_workspace(
         ok = 0;
         failed_stage = "router selection";
     }
-    if (ok && !ds4_gpu_inkling2_expert_gemv_rows_tensor(
-                  workspace->gate_up, model_map, model_size, gate_up_offset,
-                  expert_weight_type, hidden_dim, 2u * expert_dim,
-                  n_experts, n_used, n_tokens, 0, workspace->ids, input)) {
+    /* The first experiment is deliberately limited to the real Inkling
+     * IQ4_NL group-32 shape. Other shapes retain the existing GEMV route. */
+    const int grouped = n_tokens == 32u && n_experts == 128u &&
+        n_used == 8u && hidden_dim == 2304u && expert_dim == 1152u &&
+        expert_weight_type == DS4_INKLING_GGML_TYPE_IQ4_NL &&
+        workspace->route_map && workspace->route_counts &&
+        ds4_gpu_tensor_bytes(workspace->route_map) >=
+            (uint64_t)n_experts * route_count * sizeof(uint32_t) &&
+        ds4_gpu_tensor_bytes(workspace->route_counts) >=
+            (uint64_t)n_experts * sizeof(uint32_t) &&
+        ds4_gpu_inkling2_expert_grouped_available();
+    if (ok && grouped && !ds4_gpu_inkling2_expert_route_map_rows_tensor(
+            workspace->route_map, workspace->route_counts, workspace->ids,
+            n_tokens, n_experts, n_used)) {
+        ok = 0;
+        failed_stage = "expert route map";
+    }
+    if (ok && !(grouped ?
+          ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+              workspace->gate_up, model_map, model_size, gate_up_offset,
+              hidden_dim, 2u * expert_dim, n_experts, n_used, n_tokens, 0,
+              workspace->route_map, workspace->route_counts, input) :
+          ds4_gpu_inkling2_expert_gemv_rows_tensor(
+              workspace->gate_up, model_map, model_size, gate_up_offset,
+              expert_weight_type, hidden_dim, 2u * expert_dim,
+              n_experts, n_used, n_tokens, 0, workspace->ids, input))) {
         ok = 0;
         failed_stage = "gate/up projection";
     }
@@ -122,11 +144,17 @@ int ds4_inkling_moe_situ_metal_batch_with_workspace(
         ok = 0;
         failed_stage = "SiTU activation";
     }
-    if (ok && !ds4_gpu_inkling2_expert_gemv_rows_tensor(
-                  workspace->expert_outputs, model_map, model_size, down_offset,
-                  expert_weight_type, expert_dim, hidden_dim,
-                  n_experts, n_used, n_tokens, 1, workspace->ids,
-                  workspace->activation)) {
+    if (ok && !(grouped ?
+          ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+              workspace->expert_outputs, model_map, model_size, down_offset,
+              expert_dim, hidden_dim, n_experts, n_used, n_tokens, 1,
+              workspace->route_map, workspace->route_counts,
+              workspace->activation) :
+          ds4_gpu_inkling2_expert_gemv_rows_tensor(
+              workspace->expert_outputs, model_map, model_size, down_offset,
+              expert_weight_type, expert_dim, hidden_dim,
+              n_experts, n_used, n_tokens, 1, workspace->ids,
+              workspace->activation))) {
         ok = 0;
         failed_stage = "down projection";
     }

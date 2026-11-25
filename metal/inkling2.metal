@@ -30,6 +30,27 @@ struct ds4_metal_args_inkling2_expert_gemv {
     ulong expert_bytes;
 };
 
+/* Expert-bucketed route and matrix arguments have matching C structures in
+ * ds4_metal.m. The map stride is n_tokens*n_used (max 256). */
+struct ds4_metal_args_inkling2_route_map {
+    uint32_t n_tokens;
+    uint32_t n_experts;
+    uint32_t n_used;
+    uint32_t route_stride;
+};
+
+struct ds4_metal_args_inkling2_expert_gemm {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_experts;
+    uint32_t n_used;
+    uint32_t n_tokens;
+    uint32_t blocks_per_row;
+    uint32_t input_per_expert;
+    uint32_t route_stride;
+    ulong expert_bytes;
+};
+
 struct ds4_metal_args_inkling2_situ {
     uint32_t n_used;
     uint32_t expert_dim;
@@ -179,6 +200,18 @@ static inline float inkling2_sigmoid(float x) {
     return e / (1.0f + e);
 }
 
+static inline float inkling2_iq4_nl_weight(
+        device const char *row_weights, uint feature) {
+    const uint block_index = feature >> 5u;
+    const uint within = feature & 31u;
+    device const char *block = row_weights + (ulong)block_index * 18u;
+    const float scale = float(*(device const half *)block);
+    device const uchar *packed = (device const uchar *)(block + 2);
+    const uchar byte = packed[within & 15u];
+    const uint code = within < 16u ? (uint)(byte & 0x0fu) : (uint)(byte >> 4u);
+    return scale * float(ds4_inkling2_iq4_nl_values[code]);
+}
+
 /* One lane owns one token. The fixed 128-way scan is small, deterministic,
  * and keeps tie handling and normalization identical across GPU families. */
 kernel void kernel_inkling2_router_topk(
@@ -241,14 +274,7 @@ kernel void kernel_inkling2_gemv_iq4_nl(
     device const char *row_weights = weights + (uint64_t)row * row_bytes;
     float sum = 0.0f;
     for (uint i = lane; i < args.in_dim; i += lanes) {
-        const uint block_index = i >> 5u;
-        const uint within = i & 31u;
-        device const char *block = row_weights + (uint64_t)block_index * 18u;
-        const float scale = float(*(device const half *)block);
-        device const uchar *packed = (device const uchar *)(block + 2);
-        const uchar byte = packed[within & 15u];
-        const uint code = within < 16u ? (uint)(byte & 0x0fu) : (uint)(byte >> 4u);
-        sum += scale * float(ds4_inkling2_iq4_nl_values[code]) * x[i];
+        sum += inkling2_iq4_nl_weight(row_weights, i) * x[i];
     }
     partial[lane] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -294,12 +320,9 @@ kernel void kernel_inkling2_expert_gemv(
         device const char *block = row_weights + (ulong)block_index * block_bytes;
         const float scale = float(*(device const half *)block);
         if (args.weight_type == 20u) {
-            device const uchar *packed = (device const uchar *)(block + 2);
-            const uchar byte = packed[within & 15u];
-            const uint code = within < 16u ? (uint)(byte & 0x0fu) : (uint)(byte >> 4u);
             const ulong x_offset = args.input_per_expert != 0u ?
                 (ulong)route * args.in_dim : (ulong)token * args.in_dim;
-            sum += scale * float(ds4_inkling2_iq4_nl_values[code]) * x[x_offset + i];
+            sum += inkling2_iq4_nl_weight(row_weights, i) * x[x_offset + i];
         } else {
             const int8_t quant = *(device const int8_t *)(block + 2 + within);
             const ulong x_offset = args.input_per_expert != 0u ?
@@ -315,6 +338,75 @@ kernel void kernel_inkling2_expert_gemv(
         const uint simd_groups = (lanes + args.simd_width - 1u) / args.simd_width;
         const float total = simd_sum(lane < simd_groups ? partial[lane] : 0.0f);
         if (lane == 0u) out[(ulong)route * args.out_dim + row] = total;
+    }
+}
+
+/* One workgroup per expert. Lane zero makes a stable scan of the small
+ * token-major route list; no host sorting or readback is performed. The
+ * dense stride covers repeated IDs even in adversarial unit fixtures. */
+kernel void kernel_inkling2_expert_route_map(
+        constant ds4_metal_args_inkling2_route_map &args [[buffer(0)]],
+        device const int32_t *ids [[buffer(1)]],
+        device uint *route_map [[buffer(2)]],
+        device uint *route_counts [[buffer(3)]],
+        uint expert [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (expert >= args.n_experts || lane != 0u) return;
+    const uint routes = args.n_tokens * args.n_used;
+    uint count = 0;
+    for (uint route = 0; route < routes; route++) {
+        if (ids[route] == (int32_t)expert)
+            route_map[(ulong)expert * args.route_stride + count++] = route;
+    }
+    route_counts[expert] = count;
+}
+
+/* Group all routes of one expert into a single output-row matrix operation.
+ * The dequantized IQ4 row is staged ONCE per group in threadgroup memory;
+ * each route is then multiplied against the shared row and scattered back
+ * to its original route-major position. No dequantized expert bank exists. */
+kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
+        constant ds4_metal_args_inkling2_expert_gemm &args [[buffer(0)]],
+        device const char *weights [[buffer(1)]],
+        device const uint *route_map [[buffer(2)]],
+        device const uint *route_counts [[buffer(3)]],
+        device const float *x [[buffer(4)]],
+        device float *out [[buffer(5)]],
+        threadgroup float *weight_row [[threadgroup(0)]],
+        threadgroup float *partial [[threadgroup(1)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    const uint row = group.x;
+    const uint expert = group.y;
+    if (row >= args.out_dim || expert >= args.n_experts) return;
+    const uint count = route_counts[expert];
+    if (count == 0u) return;
+    const ulong row_bytes = (ulong)args.blocks_per_row * 18u;
+    device const char *row_weights = weights +
+        (ulong)expert * args.expert_bytes + (ulong)row * row_bytes;
+    for (uint i = lane; i < args.in_dim; i += lanes)
+        weight_row[i] = inkling2_iq4_nl_weight(row_weights, i);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint simd_width = 32u;
+    const uint simd_groups = (lanes + simd_width - 1u) / simd_width;
+    for (uint rank = 0; rank < count; rank++) {
+        const uint route = route_map[(ulong)expert * args.route_stride + rank];
+        const ulong input_row = args.input_per_expert != 0u ?
+            (ulong)route : (ulong)(route / args.n_used);
+        float sum = 0.0f;
+        for (uint i = lane; i < args.in_dim; i += lanes)
+            sum += weight_row[i] * x[input_row * args.in_dim + i];
+        const float group_sum = simd_sum(sum);
+        if ((lane % simd_width) == 0u) partial[lane / simd_width] = group_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0u) {
+            float value = 0.0f;
+            for (uint simd = 0u; simd < simd_groups; simd++) value += partial[simd];
+            out[(ulong)route * args.out_dim + row] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

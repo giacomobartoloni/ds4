@@ -23727,6 +23727,158 @@ int ds4_gpu_inkling2_expert_accumulate_tensor(
         out, expert_outputs, weights, out_dim, 1u, n_used);
 }
 
+/* Inkling 2 expert-ID matrix experiment. This is intentionally separate
+ * from general matmul dispatch: only the high-level MoE path opts in. */
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t n_experts;
+    uint32_t n_used;
+    uint32_t route_stride;
+} ds4_gpu_inkling2_route_map_args;
+
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_experts;
+    uint32_t n_used;
+    uint32_t n_tokens;
+    uint32_t blocks_per_row;
+    uint32_t input_per_expert;
+    uint32_t route_stride;
+    uint64_t expert_bytes;
+} ds4_gpu_inkling2_expert_gemm_args;
+
+int ds4_gpu_inkling2_expert_grouped_available(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_get_pipeline("kernel_inkling2_expert_route_map") &&
+        ds4_gpu_get_pipeline("kernel_inkling2_expert_gemm_id_iq4_nl");
+}
+
+int ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        ds4_gpu_tensor       *route_map,
+        ds4_gpu_tensor       *route_counts,
+        const ds4_gpu_tensor *expert_ids,
+        uint32_t n_tokens, uint32_t n_experts, uint32_t n_used) {
+    if ((!g_initialized && !ds4_gpu_init()) || !route_map || !route_counts ||
+        !expert_ids || n_tokens == 0u || n_tokens > 32u ||
+        n_experts == 0u || n_experts > 128u || n_used == 0u ||
+        n_used > 8u || n_used > n_experts) return 0;
+    const uint64_t routes = (uint64_t)n_tokens * n_used;
+    const uint64_t map_bytes = (uint64_t)n_experts * routes * sizeof(uint32_t);
+    const uint64_t count_bytes = (uint64_t)n_experts * sizeof(uint32_t);
+    if (!ds4_gpu_inkling2_tensor_fits(expert_ids, routes * sizeof(int32_t),
+                                      "expert IDs") ||
+        !ds4_gpu_inkling2_tensor_fits(route_map, map_bytes, "expert route map") ||
+        !ds4_gpu_inkling2_tensor_fits(route_counts, count_bytes,
+                                      "expert route counts")) return 0;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_expert_route_map");
+        if (!pipeline) return 0;
+        ds4_gpu_inkling2_route_map_args args = {
+            .n_tokens = n_tokens, .n_experts = n_experts,
+            .n_used = n_used, .route_stride = (uint32_t)routes,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(expert_ids)
+                offset:ds4_gpu_tensor_offset(expert_ids) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(route_map)
+                offset:ds4_gpu_tensor_offset(route_map) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(route_counts)
+                offset:ds4_gpu_tensor_offset(route_counts) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(n_experts, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                            "Inkling2 expert route map")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              n_tokens,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *route_map,
+        const ds4_gpu_tensor *route_counts,
+        const ds4_gpu_tensor *x) {
+    if ((!g_initialized && !ds4_gpu_init()) || !out || !model_map ||
+        !route_map || !route_counts || !x ||
+        in_dim == 0u || in_dim > 2304u || (in_dim % 32u) != 0u ||
+        out_dim == 0u || n_experts == 0u || n_experts > 128u ||
+        n_tokens == 0u || n_tokens > 32u || n_used == 0u ||
+        n_used > 8u || n_used > n_experts ||
+        (input_per_expert != 0 && input_per_expert != 1)) return 0;
+    const uint64_t routes = (uint64_t)n_tokens * n_used;
+    const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 18u;
+    const uint64_t expert_bytes = (uint64_t)out_dim * row_bytes;
+    const uint64_t weight_bytes = (uint64_t)n_experts * expert_bytes;
+    const uint64_t x_rows = input_per_expert ? routes : n_tokens;
+    const uint64_t output_bytes = routes * out_dim * sizeof(float);
+    const uint64_t input_bytes = x_rows * in_dim * sizeof(float);
+    const uint64_t map_bytes = (uint64_t)n_experts * routes * sizeof(uint32_t);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        !ds4_gpu_inkling2_tensor_fits(out, output_bytes, "expert GEMM output") ||
+        !ds4_gpu_inkling2_tensor_fits(x, input_bytes, "expert GEMM input") ||
+        !ds4_gpu_inkling2_tensor_fits(route_map, map_bytes, "expert GEMM route map") ||
+        !ds4_gpu_inkling2_tensor_fits(route_counts,
+                (uint64_t)n_experts * sizeof(uint32_t), "expert GEMM counts")) return 0;
+
+    @autoreleasepool {
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_inkling2_expert_gemm_id_iq4_nl");
+        if (!wbuf || !pipeline) return 0;
+        ds4_gpu_inkling2_expert_gemm_args args = {
+            .in_dim = in_dim, .out_dim = out_dim,
+            .n_experts = n_experts, .n_used = n_used, .n_tokens = n_tokens,
+            .blocks_per_row = in_dim / 32u, .input_per_expert = input_per_expert,
+            .route_stride = (uint32_t)routes, .expert_bytes = expert_bytes,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(route_map)
+                offset:ds4_gpu_tensor_offset(route_map) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(route_counts)
+                offset:ds4_gpu_tensor_offset(route_counts) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:5];
+        [enc setThreadgroupMemoryLength:(NSUInteger)in_dim * sizeof(float)
+                                 atIndex:0];
+        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(out_dim, n_experts, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned,
+                                            "Inkling2 expert grouped IQ4_NL")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_inkling2_expert_gemv_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

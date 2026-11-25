@@ -964,6 +964,143 @@ static int test_situ_moe_metal(void) {
     return ok;
 }
 
+/* The grouped IQ4_NL operator uses a stable per-expert route map.
+ * This fixture reuses the small synthetic weights from test_situ_moe_metal,
+ * while the high-level path is gated to the real 2304/1152 Inkling shape. */
+static int test_expert_grouped_iq4(void) {
+    enum { TOKENS = 32, EXPERTS = 128, USED = 8,
+           HIDDEN = 32, FFN = 32, ROUTES = TOKENS * USED };
+    int ok = 1;
+    const uint64_t gate_offset = align_up_u64(
+        64u + (uint64_t)HIDDEN * EXPERTS * sizeof(float), 64u);
+    const uint64_t gate_bytes =
+        (uint64_t)EXPERTS * 2u * FFN * (HIDDEN / 32u * 18u);
+    const uint64_t down_offset = align_up_u64(gate_offset + gate_bytes, 64u);
+    int32_t ids[ROUTES];
+    float input[TOKENS * HIDDEN];
+    for (uint32_t token = 0; token < TOKENS; token++) {
+        for (uint32_t col = 0; col < HIDDEN; col++)
+            input[token * HIDDEN + col] =
+                (float)((int32_t)((token * 17u + col * 3u) % 31u) - 15) / 64.0f;
+        for (uint32_t slot = 0; slot < USED; slot++)
+            ids[token * USED + slot] = (int32_t)((token * 7u + slot * 13u) % EXPERTS);
+    }
+    ds4_gpu_tensor *tid = upload(ids, sizeof(ids));
+    ds4_gpu_tensor *tx = upload(input, sizeof(input));
+    ds4_gpu_tensor *gate_ref = ds4_gpu_tensor_alloc(
+        (uint64_t)ROUTES * 2u * FFN * sizeof(float));
+    ds4_gpu_tensor *gate_gemm = ds4_gpu_tensor_alloc(
+        (uint64_t)ROUTES * 2u * FFN * sizeof(float));
+    ds4_gpu_tensor *act = ds4_gpu_tensor_alloc(
+        (uint64_t)ROUTES * FFN * sizeof(float));
+    ds4_gpu_tensor *down_ref = ds4_gpu_tensor_alloc(
+        (uint64_t)ROUTES * HIDDEN * sizeof(float));
+    ds4_gpu_tensor *down_gemm = ds4_gpu_tensor_alloc(
+        (uint64_t)ROUTES * HIDDEN * sizeof(float));
+    uint32_t counts[EXPERTS];
+    uint32_t routes[EXPERTS * ROUTES];
+    uint8_t seen[ROUTES];
+    CHECK(tid && tx && gate_ref && gate_gemm && act && down_ref && down_gemm);
+    CHECK(ds4_gpu_inkling2_expert_grouped_available());
+
+    /* Validate the mapper at 1, 8 and 32 tokens, including stable ordering. */
+    const uint32_t tested_sizes[] = {1u, 8u, 32u};
+    for (uint32_t j = 0; j < 3u; j++) {
+        const uint32_t n = tested_sizes[j];
+        const uint32_t nr = n * USED;
+        CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(
+            g_operator_context.moe.route_map,
+            g_operator_context.moe.route_counts, tid, n, EXPERTS, USED));
+        CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_counts, 0,
+                                  counts, sizeof(counts)));
+        CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_map, 0,
+            routes, (uint64_t)EXPERTS * nr * sizeof(uint32_t)));
+        memset(seen, 0, sizeof(seen));
+        uint32_t sum = 0;
+        for (uint32_t expert = 0; expert < EXPERTS; expert++) {
+            uint32_t prev = 0;
+            for (uint32_t j = 0; j < counts[expert]; j++) {
+                const uint32_t route = routes[expert * nr + j];
+                CHECK(route < nr);
+                CHECK(ids[route] == (int32_t)expert);
+                CHECK(j == 0u || route > prev);
+                CHECK(!seen[route]);
+                seen[route] = 1;
+                prev = route;
+                sum++;
+            }
+        }
+        CHECK(sum == nr);
+        for (uint32_t r = 0; r < nr; r++) CHECK(seen[r] == 1u);
+    }
+    /* Exercise full-count and unused-expert map behavior, even when the
+     * repeated IDs would not arise from the production top-8 selector. */
+    for (uint32_t r = 0; r < ROUTES; r++) ids[r] = 17;
+    CHECK(ds4_gpu_tensor_write(tid, 0, ids, sizeof(ids)));
+    CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED));
+    CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_counts, 0,
+                              counts, sizeof(counts)));
+    CHECK(counts[17] == ROUTES && counts[0] == 0u && counts[127] == 0u);
+    for (uint32_t r = 0; r < ROUTES; r++)
+        ids[r] = (int32_t)(((r / USED) * 7u + (r % USED) * 13u) % EXPERTS);
+    CHECK(ds4_gpu_tensor_write(tid, 0, ids, sizeof(ids)));
+    CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED));
+    ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(4u);
+    CHECK(small);
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        small, g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED));
+    CHECK(!ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS + 1u, EXPERTS, USED));
+    ds4_gpu_tensor_free(small);
+
+    CHECK(ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        gate_ref, g_synthetic_moe_map, g_synthetic_moe_size, gate_offset,
+        20u, HIDDEN, 2u * FFN, EXPERTS, USED, TOKENS, 0, tid, tx));
+    CHECK(ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        gate_gemm, g_synthetic_moe_map, g_synthetic_moe_size, gate_offset,
+        HIDDEN, 2u * FFN, EXPERTS, USED, TOKENS, 0,
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tx));
+    float gate_a[ROUTES * 2u * FFN], gate_b[ROUTES * 2u * FFN];
+    CHECK(ds4_gpu_tensor_read(gate_ref, 0, gate_a, sizeof(gate_a)));
+    CHECK(ds4_gpu_tensor_read(gate_gemm, 0, gate_b, sizeof(gate_b)));
+    for (uint32_t i = 0; i < ROUTES * 2u * FFN; i++)
+        CHECK(near(gate_a[i], gate_b[i],
+                   6e-4f * fmaxf(1.0f, fabsf(gate_a[i]))));
+
+    CHECK(ds4_gpu_inkling2_situ_rows_tensor(
+        act, gate_ref, TOKENS, USED, FFN, 1.25f, 0.75f));
+    CHECK(ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        down_ref, g_synthetic_moe_map, g_synthetic_moe_size, down_offset,
+        20u, FFN, HIDDEN, EXPERTS, USED, TOKENS, 1, tid, act));
+    CHECK(ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        down_gemm, g_synthetic_moe_map, g_synthetic_moe_size, down_offset,
+        FFN, HIDDEN, EXPERTS, USED, TOKENS, 1,
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, act));
+    float down_a[ROUTES * HIDDEN], down_b[ROUTES * HIDDEN];
+    CHECK(ds4_gpu_tensor_read(down_ref, 0, down_a, sizeof(down_a)));
+    CHECK(ds4_gpu_tensor_read(down_gemm, 0, down_b, sizeof(down_b)));
+    for (uint32_t i = 0; i < ROUTES * HIDDEN; i++)
+        CHECK(near(down_a[i], down_b[i],
+                   6e-4f * fmaxf(1.0f, fabsf(down_a[i]))));
+
+cleanup:
+    ds4_gpu_tensor_free(tid);
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(gate_ref);
+    ds4_gpu_tensor_free(gate_gemm);
+    ds4_gpu_tensor_free(act);
+    ds4_gpu_tensor_free(down_ref);
+    ds4_gpu_tensor_free(down_gemm);
+    return ok;
+}
+
 static int test_loop_mix_and_control_metal(void) {
     enum { HIDDEN = 2304, STATES = 5, QUERIES = 4, RANK = 64 };
     const uint64_t down_offset = 64u;
@@ -1532,6 +1669,7 @@ int main(void) {
     CHECK(test_quantized_matvec());
     CHECK(test_expert_accumulation());
     CHECK(test_situ_moe_metal());
+    CHECK(test_expert_grouped_iq4());
     CHECK(test_qk_and_relative_bias());
     CHECK(test_attention_output_gate());
     CHECK(test_attention_and_shortconv());

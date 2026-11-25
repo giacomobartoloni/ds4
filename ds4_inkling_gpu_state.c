@@ -10,7 +10,7 @@
 #define DS4_INKLING_GPU_EXPERTS 128u
 #define DS4_INKLING_GPU_EXPERT_DIM 1152u
 #define DS4_INKLING_GPU_WEIGHT_ALIGNMENT 256u
-#define DS4_INKLING_GPU_WORK_BYTES (8u * 1024u * 1024u)
+#define DS4_INKLING_GPU_WORK_BYTES (16u * 1024u * 1024u)
 
 static const uint32_t g_conv_width[DS4_INKLING_CONV_GROUP_COUNT] = {
     DS4_INKLING_KV_WIDTH,
@@ -260,6 +260,8 @@ static void free_moe_workspace(ds4_inkling_gpu_moe_workspace *workspace) {
     ds4_gpu_tensor_free(workspace->activation);
     ds4_gpu_tensor_free(workspace->expert_outputs);
     ds4_gpu_tensor_free(workspace->zero_bias);
+    ds4_gpu_tensor_free(workspace->route_map);
+    ds4_gpu_tensor_free(workspace->route_counts);
     memset(workspace, 0, sizeof(*workspace));
 }
 
@@ -423,6 +425,13 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
             DS4_INKLING_GPU_HIDDEN);
     moe->zero_bias = take_float_view(context->scratch, scratch_bytes,
         &cursor, DS4_INKLING_GPU_EXPERTS);
+    /* GPU-only map: per-expert stable route indices plus counts. Worst
+     * case holds every route for one expert, not just one per token. */
+    moe->route_map = take_view(context->scratch, scratch_bytes, &cursor,
+        (uint64_t)DS4_INKLING_GPU_EXPERTS *
+        (DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u) * sizeof(uint32_t));
+    moe->route_counts = take_view(context->scratch, scratch_bytes, &cursor,
+        (uint64_t)DS4_INKLING_GPU_EXPERTS * sizeof(uint32_t));
 
     ds4_inkling_gpu_batch_workspace *batch = &context->batch;
     batch->current_storage = take_float_view(context->scratch, scratch_bytes,
@@ -599,7 +608,8 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
     if (!control->normalized || !control->bottleneck || !control->gain ||
         !control->forget || !moe->logits || !moe->ids || !moe->weights ||
         !moe->gate_up || !moe->activation || !moe->expert_outputs ||
-        !moe->zero_bias || !batch->current_storage || !batch->next_storage ||
+        !moe->zero_bias || !moe->route_map || !moe->route_counts ||
+        !batch->current_storage || !batch->next_storage ||
         !batch->prelude_storage || !batch->current_blocks_storage ||
         !batch->previous_blocks_storage || !batch->ffn_input_storage ||
         !batch->moe_input_storage || !batch->moe_output_storage ||

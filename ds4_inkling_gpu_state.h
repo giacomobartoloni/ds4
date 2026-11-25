@@ -32,6 +32,8 @@ typedef struct ds4_inkling_gpu_moe_workspace {
     ds4_gpu_tensor *activation;
     ds4_gpu_tensor *expert_outputs;
     ds4_gpu_tensor *zero_bias;
+    ds4_gpu_tensor *route_map;
+    ds4_gpu_tensor *route_counts;
 } ds4_inkling_gpu_moe_workspace;
 
 typedef struct {

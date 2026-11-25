@@ -422,11 +422,18 @@ int main(void) {
     assert(session->logits[TEST_VOCAB] == DS4_NEG_INF);
     assert(logits_argmax(session->logits, TEST_VOCAB) == 0);
 
-    const int long_prompt_tokens[] = { 42, 17, 9, 12, 3, 5, 7, 11, 13, 19 };
-    const ds4_tokens long_prompt = { .v = (int *)long_prompt_tokens,
-        .len = 10, .cap = 10 };
-    const ds4_tokens first_eight = { .v = (int *)long_prompt_tokens,
-        .len = 8, .cap = 8 };
+    int long_prompt_tokens[DS4_INKLING_GPU_MOE_MAX_TOKENS + 2] =
+        { 42, 17, 9, 12, 3, 5, 7, 11, 13, 19 };
+    for (int i = 10; i < (int)(sizeof(long_prompt_tokens) /
+                               sizeof(long_prompt_tokens[0])); i++)
+        long_prompt_tokens[i] = (i * 7) % TEST_VOCAB;
+    const int prompt_len = (int)(sizeof(long_prompt_tokens) /
+                                 sizeof(long_prompt_tokens[0]));
+    const ds4_tokens long_prompt = { .v = long_prompt_tokens,
+        .len = prompt_len, .cap = prompt_len };
+    const ds4_tokens first_group = { .v = long_prompt_tokens,
+        .len = DS4_INKLING_GPU_MOE_MAX_TOKENS,
+        .cap = DS4_INKLING_GPU_MOE_MAX_TOKENS };
     float *tokenwise_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
     float *prefix_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
     assert(tokenwise_logits && prefix_logits);
@@ -442,7 +449,7 @@ int main(void) {
            (size_t)TEST_VOCAB * sizeof(float));
 
     assert(ds4_session_layer_slice_reset(session, error, sizeof(error)) == 0);
-    assert(ds4_session_sync(session, &first_eight, error, sizeof(error)) == 0);
+    assert(ds4_session_sync(session, &first_group, error, sizeof(error)) == 0);
     memcpy(prefix_logits, session->logits,
            (size_t)TEST_VOCAB * sizeof(float));
 
@@ -473,7 +480,7 @@ int main(void) {
     ds4_session_set_cancel(session, prefill_cancel_requested, &cancel_probe);
     assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) ==
            DS4_SESSION_SYNC_INTERRUPTED);
-    assert(cancel_probe.calls == 1 && cancel_probe.last_current == 8);
+    assert(cancel_probe.calls == 1 && cancel_probe.last_current == DS4_INKLING_GPU_MOE_MAX_TOKENS);
     assert(cancel_probe.observed_raw_logits_stale);
     assert(cancel_probe.observed_logits_count == 0);
     assert(cancel_probe.observed_argmax == -1);
@@ -482,7 +489,7 @@ int main(void) {
     assert(cancel_probe.observed_token_logprob == 0);
     assert(cancel_probe.observed_payload_bytes == 0);
     assert(cancel_probe.observed_snapshot_save != 0);
-    assert(ds4_session_pos(session) == 8);
+    assert(ds4_session_pos(session) == DS4_INKLING_GPU_MOE_MAX_TOKENS);
     assert(ds4_session_checkpoint_valid(session));
     assert(memcmp(prefix_logits, session->logits,
                   (size_t)TEST_VOCAB * sizeof(float)) == 0);
