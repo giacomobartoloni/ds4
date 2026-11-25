@@ -10,7 +10,7 @@
 #define DS4_INKLING_GPU_EXPERTS 128u
 #define DS4_INKLING_GPU_EXPERT_DIM 1152u
 #define DS4_INKLING_GPU_WEIGHT_ALIGNMENT 256u
-#define DS4_INKLING_GPU_WORK_BYTES (16u * 1024u * 1024u)
+#define DS4_INKLING_GPU_MIN_WORK_BYTES (16u * 1024u * 1024u)
 
 static const uint32_t g_conv_width[DS4_INKLING_CONV_GROUP_COUNT] = {
     DS4_INKLING_KV_WIDTH,
@@ -26,6 +26,8 @@ typedef struct {
     uint64_t prelude_bytes;
     uint64_t logits_bytes;
     uint64_t weight_storage_bytes;
+    uint64_t work_storage_bytes;
+    uint32_t batch_capacity;
     uint64_t total_bytes;
 } ds4_inkling_gpu_layout;
 
@@ -119,6 +121,10 @@ static uint32_t slot_capacity(const ds4_inkling_visit *visit,
     return context_capacity;
 }
 
+static bool compute_workspace_views(ds4_inkling_gpu_context *context,
+                                    uint32_t batch_capacity,
+                                    uint64_t *used_bytes);
+
 static bool context_layout(const ds4_inkling_plan *plan,
                            uint32_t context_capacity,
                            ds4_inkling_gpu_layout *layout) {
@@ -126,7 +132,17 @@ static bool context_layout(const ds4_inkling_plan *plan,
         context_capacity > DS4_INKLING_CONTEXT_MAX) return false;
     memset(layout, 0, sizeof(*layout));
 
-    if (!parameter_storage_size(plan, &layout->weight_storage_bytes)) return false;
+    layout->batch_capacity = context_capacity < DS4_INKLING_GPU_MOE_MAX_TOKENS ?
+        context_capacity : DS4_INKLING_GPU_MOE_MAX_TOKENS;
+    uint64_t scratch_bytes = 0;
+    if (!parameter_storage_size(plan, &layout->weight_storage_bytes) ||
+        !compute_workspace_views(NULL, layout->batch_capacity, &scratch_bytes) ||
+        !checked_add_u64(scratch_bytes,
+            2u * DS4_INKLING_GPU_HIDDEN * sizeof(float),
+            &layout->work_storage_bytes)) return false;
+    /* Keep the historical minimum for the decode and small-context paths. */
+    if (layout->work_storage_bytes < DS4_INKLING_GPU_MIN_WORK_BYTES)
+        layout->work_storage_bytes = DS4_INKLING_GPU_MIN_WORK_BYTES;
 
     uint64_t total_capacity_rows = 0;
     uint64_t conv_slot_bytes = 0;
@@ -161,7 +177,7 @@ static bool context_layout(const ds4_inkling_plan *plan,
     return checked_add_bytes(&layout->total_bytes, layout->kv_storage_bytes) &&
         checked_add_bytes(&layout->total_bytes, layout->kv_storage_bytes) &&
         checked_add_bytes(&layout->total_bytes, layout->conv_storage_bytes) &&
-        checked_add_bytes(&layout->total_bytes, DS4_INKLING_GPU_WORK_BYTES) &&
+        checked_add_bytes(&layout->total_bytes, layout->work_storage_bytes) &&
         checked_add_bytes(&layout->total_bytes, layout->residual_bank_bytes) &&
         checked_add_bytes(&layout->total_bytes, layout->residual_bank_bytes) &&
         checked_add_bytes(&layout->total_bytes, layout->prelude_bytes) &&
@@ -394,145 +410,121 @@ static bool allocate_parameter_views(ds4_inkling_gpu_context *context) {
     return cursor <= ds4_gpu_tensor_bytes(context->weight_storage);
 }
 
+/* Share the exact aligned layout between the memory estimator and
+ * allocation. With no context, this pass only advances the byte cursor. */
+static bool workspace_reserve(ds4_gpu_tensor *base, uint64_t base_bytes,
+                              uint64_t *cursor, uint64_t bytes,
+                              ds4_gpu_tensor **out) {
+    if (!out) return aligned_parameter_bytes(cursor, bytes);
+    *out = take_view(base, base_bytes, cursor, bytes);
+    return *out != NULL;
+}
+
+static bool compute_workspace_views(ds4_inkling_gpu_context *context,
+                                    uint32_t batch_capacity,
+                                    uint64_t *used_bytes) {
+    ds4_gpu_tensor *base = context ? context->scratch : NULL;
+    const uint64_t scratch_bytes = context ? ds4_gpu_tensor_bytes(base) : 0;
+    uint64_t cursor = 0;
+#define WORK_BYTES(field, bytes) \
+    do { \
+        if (!workspace_reserve(base, scratch_bytes, &cursor, (bytes), \
+                               context ? &context->field : NULL)) return false; \
+    } while (0)
+#define WORK_FLOAT(field, elements) \
+    do { \
+        uint64_t view_bytes = 0; \
+        if (!checked_mul_u64((elements), sizeof(float), &view_bytes)) return false; \
+        WORK_BYTES(field, view_bytes); \
+    } while (0)
+    WORK_FLOAT(control.normalized, 2u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(control.bottleneck, 64u);
+    WORK_FLOAT(control.gain, DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(control.forget, DS4_INKLING_GPU_HIDDEN);
+
+    WORK_FLOAT(moe.logits, batch_capacity * DS4_INKLING_GPU_EXPERTS);
+    WORK_BYTES(moe.ids, batch_capacity * 8u * sizeof(int32_t));
+    WORK_FLOAT(moe.weights, batch_capacity * 8u);
+    WORK_FLOAT(moe.gate_up, batch_capacity * 8u *
+            2u * DS4_INKLING_GPU_EXPERT_DIM);
+    WORK_FLOAT(moe.activation, batch_capacity * 8u *
+            DS4_INKLING_GPU_EXPERT_DIM);
+    WORK_FLOAT(moe.expert_outputs, batch_capacity * 8u *
+            DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(moe.zero_bias, DS4_INKLING_GPU_EXPERTS);
+    /* GPU-only map: per-expert stable route indices plus counts. Worst
+     * case holds every route for one expert, not just one per token. */
+    WORK_BYTES(moe.route_map, (uint64_t)DS4_INKLING_GPU_EXPERTS *
+        (batch_capacity * 8u) * sizeof(uint32_t));
+    WORK_BYTES(moe.route_counts, (uint64_t)DS4_INKLING_GPU_EXPERTS * sizeof(uint32_t));
+
+    WORK_FLOAT(batch.current_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.next_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.prelude_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.current_blocks_storage, batch_capacity *
+            4u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.previous_blocks_storage, batch_capacity *
+            2u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.ffn_input_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.moe_input_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(batch.moe_output_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    for (uint32_t input = 0; input < 3u; input++) {
+        WORK_FLOAT(batch.attn_norm_storage[input], batch_capacity * DS4_INKLING_GPU_HIDDEN);
+    }
+    WORK_FLOAT(batch.query_storage, batch_capacity * DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(batch.key_storage, batch_capacity * DS4_INKLING_KV_WIDTH);
+    WORK_FLOAT(batch.value_storage, batch_capacity * DS4_INKLING_KV_WIDTH);
+    WORK_FLOAT(batch.relative_storage, batch_capacity *
+            DS4_INKLING_GPU_RELATIVE_WIDTH);
+    WORK_FLOAT(batch.dynamic_k_storage, batch_capacity * 32u);
+    WORK_FLOAT(batch.dynamic_v_storage, batch_capacity * 32u);
+    WORK_FLOAT(batch.sink_logits_storage, batch_capacity * 24u);
+    WORK_FLOAT(batch.attention_gate_storage, batch_capacity * DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(batch.attention_gated_storage, batch_capacity * DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(batch.attention_output_storage, batch_capacity * DS4_INKLING_GPU_HIDDEN);
+
+    if (context) context->layer.current = context->activation;
+    WORK_FLOAT(layer.next, DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.mix_states, 6u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.mix_outputs, 4u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.controlled_inputs, 3u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.query, DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(layer.prepared_query, DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(layer.key, DS4_INKLING_KV_WIDTH);
+    WORK_FLOAT(layer.prepared_key, DS4_INKLING_KV_WIDTH);
+    WORK_FLOAT(layer.value, DS4_INKLING_KV_WIDTH);
+    WORK_FLOAT(layer.prepared_value, DS4_INKLING_KV_WIDTH);
+    WORK_FLOAT(layer.relative, DS4_INKLING_GPU_RELATIVE_WIDTH);
+    WORK_FLOAT(layer.prepared_relative, DS4_INKLING_GPU_RELATIVE_WIDTH);
+    WORK_FLOAT(layer.sink_logits, 24u);
+    WORK_FLOAT(layer.relative_bias, 24u * 1024u);
+    WORK_BYTES(layer.relative_distances, 1024u * sizeof(int64_t));
+    WORK_FLOAT(layer.attention_gate, DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(layer.attention_context, DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(layer.attention_gated, DS4_INKLING_GPU_QUERY_WIDTH);
+    WORK_FLOAT(layer.attention_output, DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.ffn_input, DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.ffn_mixed, DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.messages, 4u * DS4_INKLING_GPU_HIDDEN);
+    WORK_FLOAT(layer.dynamic_k, 32u);
+    WORK_FLOAT(layer.dynamic_v, 32u);
+
+
+#undef WORK_FLOAT
+#undef WORK_BYTES
+    *used_bytes = cursor;
+    return true;
+}
+
 static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
     const uint64_t scratch_bytes = ds4_gpu_tensor_bytes(context->scratch);
     uint64_t cursor = 0;
+    if (!compute_workspace_views(context, context->batch_capacity, &cursor))
+        return false;
     ds4_inkling_gpu_control_workspace *control = &context->control;
-    control->normalized = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 2u * DS4_INKLING_GPU_HIDDEN);
-    control->bottleneck = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 64u);
-    control->gain = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_HIDDEN);
-    control->forget = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_HIDDEN);
-
     ds4_inkling_gpu_moe_workspace *moe = &context->moe;
-    moe->logits = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_EXPERTS);
-    moe->ids = take_view(context->scratch, scratch_bytes, &cursor,
-        DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u * sizeof(int32_t));
-    moe->weights = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u);
-    moe->gate_up = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u *
-            2u * DS4_INKLING_GPU_EXPERT_DIM);
-    moe->activation = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u *
-            DS4_INKLING_GPU_EXPERT_DIM);
-    moe->expert_outputs = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u *
-            DS4_INKLING_GPU_HIDDEN);
-    moe->zero_bias = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_EXPERTS);
-    /* GPU-only map: per-expert stable route indices plus counts. Worst
-     * case holds every route for one expert, not just one per token. */
-    moe->route_map = take_view(context->scratch, scratch_bytes, &cursor,
-        (uint64_t)DS4_INKLING_GPU_EXPERTS *
-        (DS4_INKLING_GPU_MOE_MAX_TOKENS * 8u) * sizeof(uint32_t));
-    moe->route_counts = take_view(context->scratch, scratch_bytes, &cursor,
-        (uint64_t)DS4_INKLING_GPU_EXPERTS * sizeof(uint32_t));
-
     ds4_inkling_gpu_batch_workspace *batch = &context->batch;
-    batch->current_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    batch->next_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    batch->prelude_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    batch->current_blocks_storage = take_float_view(context->scratch,
-        scratch_bytes, &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
-            4u * DS4_INKLING_GPU_HIDDEN);
-    batch->previous_blocks_storage = take_float_view(context->scratch,
-        scratch_bytes, &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
-            2u * DS4_INKLING_GPU_HIDDEN);
-    batch->ffn_input_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    batch->moe_input_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    batch->moe_output_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    for (uint32_t input = 0; input < 3u; input++) {
-        batch->attn_norm_storage[input] = take_float_view(context->scratch,
-            scratch_bytes, &cursor,
-            DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-    }
-    batch->query_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_QUERY_WIDTH);
-    batch->key_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_KV_WIDTH);
-    batch->value_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_KV_WIDTH);
-    batch->relative_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
-            DS4_INKLING_GPU_RELATIVE_WIDTH);
-    batch->dynamic_k_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 32u);
-    batch->dynamic_v_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 32u);
-    batch->sink_logits_storage = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * 24u);
-    batch->attention_gate_storage = take_float_view(context->scratch,
-        scratch_bytes, &cursor,
-        DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_QUERY_WIDTH);
-    batch->attention_gated_storage = take_float_view(context->scratch,
-        scratch_bytes, &cursor,
-        DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_QUERY_WIDTH);
-    batch->attention_output_storage = take_float_view(context->scratch,
-        scratch_bytes, &cursor,
-        DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_GPU_HIDDEN);
-
     ds4_inkling_gpu_layer_workspace *layer = &context->layer;
-    layer->current = context->activation;
-    layer->next = take_float_view(context->scratch, scratch_bytes, &cursor,
-        DS4_INKLING_GPU_HIDDEN);
-    layer->mix_states = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 6u * DS4_INKLING_GPU_HIDDEN);
-    layer->mix_outputs = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 4u * DS4_INKLING_GPU_HIDDEN);
-    layer->controlled_inputs = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 3u * DS4_INKLING_GPU_HIDDEN);
-    layer->query = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_QUERY_WIDTH);
-    layer->prepared_query = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_QUERY_WIDTH);
-    layer->key = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_KV_WIDTH);
-    layer->prepared_key = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_KV_WIDTH);
-    layer->value = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_KV_WIDTH);
-    layer->prepared_value = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_KV_WIDTH);
-    layer->relative = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_RELATIVE_WIDTH);
-    layer->prepared_relative = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_RELATIVE_WIDTH);
-    layer->sink_logits = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 24u);
-    layer->relative_bias = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 24u * 1024u);
-    layer->relative_distances = take_view(context->scratch, scratch_bytes,
-        &cursor, 1024u * sizeof(int64_t));
-    layer->attention_gate = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_QUERY_WIDTH);
-    layer->attention_context = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_QUERY_WIDTH);
-    layer->attention_gated = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_QUERY_WIDTH);
-    layer->attention_output = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_HIDDEN);
-    layer->ffn_input = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_HIDDEN);
-    layer->ffn_mixed = take_float_view(context->scratch, scratch_bytes,
-        &cursor, DS4_INKLING_GPU_HIDDEN);
-    layer->messages = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 4u * DS4_INKLING_GPU_HIDDEN);
-    layer->dynamic_k = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 32u);
-    layer->dynamic_v = take_float_view(context->scratch, scratch_bytes,
-        &cursor, 32u);
-
     const uint64_t hidden_bytes =
         (uint64_t)DS4_INKLING_GPU_HIDDEN * sizeof(float);
     const uint64_t query_bytes =
@@ -542,7 +534,7 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
         (uint64_t)DS4_INKLING_GPU_RELATIVE_WIDTH * sizeof(float);
     const uint64_t dynamic_bytes = 32u * sizeof(float);
     const uint64_t sink_bytes = 24u * sizeof(float);
-    for (uint32_t row = 0; row < DS4_INKLING_GPU_MOE_MAX_TOKENS; row++) {
+    for (uint32_t row = 0; row < context->batch_capacity; row++) {
         const uint64_t row_offset = (uint64_t)row * hidden_bytes;
         const uint64_t block_offset = (uint64_t)row * 4u * hidden_bytes;
         const uint64_t previous_offset = (uint64_t)row * 2u * hidden_bytes;
@@ -636,7 +628,7 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
     for (uint32_t i = 0; i < 3u; i++) {
         if (!layer->controlled_input_rows[i]) return false;
     }
-    for (uint32_t row = 0; row < DS4_INKLING_GPU_MOE_MAX_TOKENS; row++) {
+    for (uint32_t row = 0; row < context->batch_capacity; row++) {
         if (!batch->current[row] || !batch->next[row] || !batch->prelude[row] ||
             !batch->current_blocks[row] || !batch->previous_blocks[row] ||
             !batch->ffn_input[row] || !batch->moe_input[row] ||
@@ -708,6 +700,7 @@ bool ds4_inkling_gpu_context_init(
     context->plan = *plan;
     context->weight_owner_count = DS4_INKLING_PHYSICAL_LAYERS;
     context->context_capacity = context_capacity;
+    context->batch_capacity = layout.batch_capacity;
     context->allocated_bytes = layout.total_bytes;
     for (uint32_t layer = 0; layer < DS4_INKLING_PHYSICAL_LAYERS; layer++)
         context->weight_owner[layer] = layer;
@@ -715,7 +708,7 @@ bool ds4_inkling_gpu_context_init(
     context->key_storage = ds4_gpu_tensor_alloc(kv_storage_bytes);
     context->value_storage = ds4_gpu_tensor_alloc(kv_storage_bytes);
     context->conv_storage = ds4_gpu_tensor_alloc(conv_storage_bytes);
-    context->work_storage = ds4_gpu_tensor_alloc(DS4_INKLING_GPU_WORK_BYTES);
+    context->work_storage = ds4_gpu_tensor_alloc(layout.work_storage_bytes);
     context->current_blocks = ds4_gpu_tensor_alloc(layout.residual_bank_bytes);
     context->previous_blocks = ds4_gpu_tensor_alloc(layout.residual_bank_bytes);
     context->prelude_output = ds4_gpu_tensor_alloc(layout.prelude_bytes);
@@ -737,7 +730,7 @@ bool ds4_inkling_gpu_context_init(
                                                embedding_bytes);
     context->scratch = ds4_gpu_tensor_view(
         context->work_storage, 2u * embedding_bytes,
-        DS4_INKLING_GPU_WORK_BYTES - 2u * embedding_bytes);
+        layout.work_storage_bytes - 2u * embedding_bytes);
     if (!context->embedding || !context->activation || !context->scratch ||
         !allocate_parameter_views(context) ||
         !allocate_compute_workspaces(context))

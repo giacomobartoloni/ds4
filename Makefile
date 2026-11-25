@@ -25,6 +25,10 @@ DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
+# Use a clean rebuild when changing the Inkling batch capacity.
+INKLING2_MAX_BATCH ?= 512
+override CFLAGS += -DDS4_INKLING_GPU_MOE_MAX_TOKENS=$(INKLING2_MAX_BATCH)
+override OBJCFLAGS += -DDS4_INKLING_GPU_MOE_MAX_TOKENS=$(INKLING2_MAX_BATCH)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o ds4_inkling_state.o ds4_inkling_moe.o ds4_inkling_loop.o ds4_inkling_gpu_state.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o

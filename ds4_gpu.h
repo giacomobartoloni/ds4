@@ -1269,7 +1269,14 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
 #ifdef __APPLE__
 /* Inkling 2 controller and routing operators. Tensors are contiguous f32
  * except `selected`, which contains int32 expert IDs in token-major order. */
-enum { DS4_INKLING_GPU_MOE_MAX_TOKENS = 32u };
+/* All Inkling prefill row arrays and Metal dispatch limits share this cap.
+ * Keep a build-time override for exact A/B against the 32-token baseline. */
+#ifndef DS4_INKLING_GPU_MOE_MAX_TOKENS
+#define DS4_INKLING_GPU_MOE_MAX_TOKENS 512u
+#endif
+#if DS4_INKLING_GPU_MOE_MAX_TOKENS < 32 || DS4_INKLING_GPU_MOE_MAX_TOKENS > 512
+#error "Inkling 2 prefill batch must be between 32 and 512 tokens"
+#endif
 
 int ds4_gpu_inkling2_gate_update_tensor(
         ds4_gpu_tensor       *out,

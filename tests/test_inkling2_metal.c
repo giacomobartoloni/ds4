@@ -1475,21 +1475,19 @@ static int test_gpu_context_owns_independent_visit_state(void) {
     ds4_inkling_plan plan;
     ds4_inkling_gpu_context context;
     uint64_t bytes_2048 = 0, bytes_8192 = 0, bytes_65536 = 0, bytes_max = 0;
+    ds4_gpu_tensor *large_ids = NULL;
     memset(&context, 0, sizeof(context));
     make_small_plan(&plan);
 
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 2048u, &bytes_2048));
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 8192u, &bytes_8192));
     CHECK(bytes_8192 > bytes_2048);
-    CHECK(bytes_8192 < 450u * 1024u * 1024u);
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 65536u,
                                                 &bytes_65536));
     CHECK(bytes_65536 > bytes_8192);
-    CHECK(bytes_65536 > (2ull << 30) && bytes_65536 < (3ull << 30));
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan,
             DS4_INKLING_CONTEXT_MAX, &bytes_max));
     CHECK(bytes_max > bytes_65536);
-    CHECK(bytes_max > (32ull << 30) && bytes_max < (33ull << 30));
     CHECK(!ds4_inkling_gpu_context_required_bytes(&plan,
             DS4_INKLING_CONTEXT_MAX + 1u, &bytes_max));
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 8192u, &bytes_8192));
@@ -1497,6 +1495,17 @@ static int test_gpu_context_owns_independent_visit_state(void) {
            (unsigned long long)bytes_8192,
            (double)bytes_8192 / (1024.0 * 1024.0));
     CHECK(ds4_inkling_gpu_context_init(&context, &plan, 2048u));
+    CHECK(context.allocated_bytes == bytes_2048);
+    CHECK(context.batch_capacity == DS4_INKLING_GPU_MOE_MAX_TOKENS);
+    const uint64_t work_bytes = ds4_gpu_tensor_bytes(context.work_storage);
+    CHECK(work_bytes >= 16u * 1024u * 1024u);
+    const uint64_t extra = work_bytes - 16u * 1024u * 1024u;
+    /* Preserve the old KV/parameter memory bounds independently of batch. */
+    CHECK(bytes_8192 - extra < 450u * 1024u * 1024u);
+    CHECK(bytes_65536 - extra > (2ull << 30) &&
+          bytes_65536 - extra < (3ull << 30));
+    CHECK(bytes_max - extra > (32ull << 30) &&
+          bytes_max - extra < (33ull << 30));
     CHECK(context.plan.visit_count == DS4_INKLING_VISITS);
     CHECK(context.weight_owner_count == DS4_INKLING_PHYSICAL_LAYERS);
     CHECK(context.slots[6].capacity == DS4_INKLING_SLIDING_WINDOW);
@@ -1541,7 +1550,29 @@ static int test_gpu_context_owns_independent_visit_state(void) {
         }
     }
 
+    /* Validate the final row and worst-case route-map capacity. */
+    enum { BATCH = DS4_INKLING_GPU_MOE_MAX_TOKENS, ROUTES = BATCH * 8u };
+    CHECK(context.batch.current[BATCH - 1] &&
+          context.batch.attention_output[BATCH - 1]);
+    CHECK(ds4_gpu_tensor_bytes(context.moe.gate_up) ==
+        (uint64_t)BATCH * 8u * 2u * 1152u * sizeof(float));
+    CHECK(ds4_gpu_tensor_bytes(context.moe.route_map) ==
+        128ull * ROUTES * sizeof(uint32_t));
+    int32_t ids[ROUTES];
+    uint32_t route_indices[ROUTES], counts[128u];
+    for (uint32_t i = 0; i < ROUTES; i++) ids[i] = 17;
+    large_ids = upload(ids, sizeof(ids));
+    CHECK(large_ids);
+    CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(context.moe.route_map,
+        context.moe.route_counts, large_ids, BATCH, 128u, 8u));
+    CHECK(ds4_gpu_tensor_read(context.moe.route_counts, 0, counts, sizeof(counts)));
+    CHECK(counts[17] == ROUTES && counts[0] == 0u && counts[127] == 0u);
+    CHECK(ds4_gpu_tensor_read(context.moe.route_map,
+        17ull * sizeof(route_indices), route_indices, sizeof(route_indices)));
+    for (uint32_t i = 0; i < ROUTES; i++) CHECK(route_indices[i] == i);
+
 cleanup:
+    ds4_gpu_tensor_free(large_ids);
     ds4_inkling_gpu_context_free(&context);
     return ok;
 }

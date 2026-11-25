@@ -136,6 +136,7 @@ typedef struct {
     uint32_t weight_owner_count;
     uint32_t weight_owner[DS4_INKLING_PHYSICAL_LAYERS];
     uint32_t context_capacity;
+    uint32_t batch_capacity;
     uint32_t position;
     uint64_t allocated_bytes;
     ds4_gpu_tensor *key_storage;

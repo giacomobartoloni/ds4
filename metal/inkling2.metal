@@ -31,7 +31,7 @@ struct ds4_metal_args_inkling2_expert_gemv {
 };
 
 /* Expert-bucketed route and matrix arguments have matching C structures in
- * ds4_metal.m. The map stride is n_tokens*n_used (max 256). */
+ * ds4_metal.m. The map stride is n_tokens*n_used (up to 4096). */
 struct ds4_metal_args_inkling2_route_map {
     uint32_t n_tokens;
     uint32_t n_experts;

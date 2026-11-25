@@ -23766,7 +23766,7 @@ int ds4_gpu_inkling2_expert_route_map_rows_tensor(
         const ds4_gpu_tensor *expert_ids,
         uint32_t n_tokens, uint32_t n_experts, uint32_t n_used) {
     if ((!g_initialized && !ds4_gpu_init()) || !route_map || !route_counts ||
-        !expert_ids || n_tokens == 0u || n_tokens > 32u ||
+        !expert_ids || n_tokens == 0u || n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS ||
         n_experts == 0u || n_experts > 128u || n_used == 0u ||
         n_used > 8u || n_used > n_experts) return 0;
     const uint64_t routes = (uint64_t)n_tokens * n_used;
@@ -23826,7 +23826,7 @@ int ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
         !route_map || !route_counts || !x ||
         in_dim == 0u || in_dim > 2304u || (in_dim % 32u) != 0u ||
         out_dim == 0u || n_experts == 0u || n_experts > 128u ||
-        n_tokens == 0u || n_tokens > 32u || n_used == 0u ||
+        n_tokens == 0u || n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS || n_used == 0u ||
         n_used > 8u || n_used > n_experts ||
         (input_per_expert != 0 && input_per_expert != 1)) return 0;
     const uint64_t routes = (uint64_t)n_tokens * n_used;

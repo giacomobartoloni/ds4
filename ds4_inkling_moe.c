@@ -109,9 +109,9 @@ int ds4_inkling_moe_situ_metal_batch_with_workspace(
         ok = 0;
         failed_stage = "router selection";
     }
-    /* The first experiment is deliberately limited to the real Inkling
-     * IQ4_NL group-32 shape. Other shapes retain the existing GEMV route. */
-    const int grouped = n_tokens == 32u && n_experts == 128u &&
+    /* Reuse each expert row across the full bucket for larger prefills.
+     * Preserve the previous GEMV path for decode and batches below 32. */
+    const int grouped = n_tokens >= 32u && n_experts == 128u &&
         n_used == 8u && hidden_dim == 2304u && expert_dim == 1152u &&
         expert_weight_type == DS4_INKLING_GGML_TYPE_IQ4_NL &&
         workspace->route_map && workspace->route_counts &&
