@@ -7,6 +7,23 @@ the 256 lane finals, the eight first-stage SIMD sums, output bits, ULP distance,
 maximum absolute error and nonfinite values. A/A, repeat-trace and
 plain-versus-traced checks reject nondeterminism or instrumentation effects.
 
+Full-model runs used `Inkling-2-Mini-IQ4_NL.gguf` (IQ4_NL, 17,627,940,768
+bytes, SHA-256
+`cbdf3fa9dc50a4124977980f37da4f1fa764b0cfe800d275cd43d26ce2a81af4`) on
+Apple M4 / Metal, with the prompt `speed-bench/promessi_sposi.txt`. Set
+`INKLING_MODEL` to a local copy of that exact GGUF to replay the checks:
+
+    INKLING_MODEL=/path/to/Inkling-2-Mini-IQ4_NL.gguf
+    INKLING_PROMPT=speed-bench/promessi_sposi.txt
+    ./ds4-bench -m "$INKLING_MODEL" --prompt-file "$INKLING_PROMPT" --backend metal --threads 4 --ctx-start 32 --ctx-max 34 --ctx-alloc 8192 --step-incr 2 --prefill-chunk 512 --gen-tokens 0 --warm-weights --dump-frontier-logits-dir /tmp/inkling2-iq4-logits
+
+For the prefill measurements below, run the same command three times at each
+frontier, changing both `--ctx-start` and `--ctx-max` to 128 (then 512), and
+using `--step-incr` 128 (then 512) plus a distinct `--csv` output path. Runs
+were sequential, with no other model process active. The GEMV control was a
+clean worktree at `9c54c4bc7bd2b7e8deba03f3b55c9a481db3cc1c` with the documented
+group-32 batching patch; the pre-fix grouped GEMM was built at `cfc4e6a`.
+
 Run from the repository root:
 
     xcrun clang -O2 -fobjc-arc -Wall -Wextra \

@@ -140,8 +140,7 @@ static uint32_t ordered_bits(uint32_t bits) {
 }
 
 static uint64_t ulp_distance(uint32_t a, uint32_t b) {
-    float x = fp32(a), y = fp32(b);
-    if (x == y) return 0;
+    if (a == b) return 0;
     uint32_t ox = ordered_bits(a), oy = ordered_bits(b);
     return ox > oy ? (uint64_t)ox - oy : (uint64_t)oy - ox;
 }
@@ -232,9 +231,9 @@ static int replay(id<MTLDevice> device, NSString *source, NSData *w, NSData *x,
             invalid += compare_trace(&bt, &btt, routes, dim);
             puts("  GEMV/GEMM plain:");
             unsigned diff = compare("output", a.out, b.out, routes, 1, 0, 1);
-            if (simd) production_bad += diff;
             puts("  GEMV/GEMM traced:");
-            compare_trace(&at, &bt, routes, dim);
+            unsigned trace_diff = compare_trace(&at, &bt, routes, dim);
+            if (simd) production_bad += diff + trace_diff;
         }
     }
     if (invalid) {
@@ -267,6 +266,11 @@ static int synthetic(id<MTLDevice> device, NSString *source, uint32_t dim, BOOL 
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (ulp_distance(0x00000000u, 0x80000000u) != 1u ||
+            ulp_distance(0x3f800000u, 0x3f800001u) != 1u) {
+            fputs("ULP ordering self-check failed\n", stderr);
+            return 1;
+        }
         BOOL safe = argc > 1 && strcmp(argv[1], "--safe") == 0;
         int pos = safe ? 2 : 1;
         if (argc != pos && argc != pos + 2) {
