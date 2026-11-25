@@ -293,6 +293,9 @@ kernel void kernel_inkling2_expert_gemv(
         device const int32_t *expert_ids [[buffer(2)]],
         device const float *x [[buffer(3)]],
         device float *out [[buffer(4)]],
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        device uint *trace [[buffer(5)]],
+#endif
         threadgroup float *partial [[threadgroup(0)]],
         uint group [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_threadgroup]],
@@ -330,8 +333,18 @@ kernel void kernel_inkling2_expert_gemv(
             sum += scale * float(quant) * x[x_offset + i];
         }
     }
+#if defined(DS4_INKLING2_IQ4_TRACE)
+    // Diagnostic-only buffer: lane sums followed by one sum per SIMD group.
+    const ulong trace_base = ((ulong)route * args.out_dim + row) *
+        (lanes + (lanes + args.simd_width - 1u) / args.simd_width);
+    trace[trace_base + lane] = as_type<uint>(sum);
+#endif
     const float simd_total = simd_sum(sum);
     const uint simd_group = lane / args.simd_width;
+#if defined(DS4_INKLING2_IQ4_TRACE)
+    if (lane % args.simd_width == 0u)
+        trace[trace_base + lanes + simd_group] = as_type<uint>(simd_total);
+#endif
     if (lane % args.simd_width == 0u) partial[simd_group] = simd_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane < args.simd_width) {
@@ -372,6 +385,9 @@ kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
         device const uint *route_counts [[buffer(3)]],
         device const float *x [[buffer(4)]],
         device float *out [[buffer(5)]],
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        device uint *trace [[buffer(6)]],
+#endif
         threadgroup float *weight_row [[threadgroup(0)]],
         threadgroup float *partial [[threadgroup(1)]],
         uint2 group [[threadgroup_position_in_grid]],
@@ -389,9 +405,11 @@ kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
     const ulong row_bytes = (ulong)args.blocks_per_row * 18u;
     device const char *row_weights = weights +
         (ulong)expert * args.expert_bytes + (ulong)row * row_bytes;
+#if !defined(DS4_INKLING2_IQ4_DIAG_INLINE)
     for (uint i = lane; i < args.in_dim; i += lanes)
         weight_row[i] = inkling2_iq4_nl_weight(row_weights, i);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
 
     const uint simd_width = 32u;
     const uint simd_groups = (lanes + simd_width - 1u) / simd_width;
@@ -401,15 +419,37 @@ kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
             (ulong)route : (ulong)(route / args.n_used);
         float sum = 0.0f;
         for (uint i = lane; i < args.in_dim; i += lanes)
+#if defined(DS4_INKLING2_IQ4_DIAG_INLINE)
+            sum += inkling2_iq4_nl_weight(row_weights, i) *
+                x[input_row * args.in_dim + i];
+#else
             sum += weight_row[i] * x[input_row * args.in_dim + i];
+#endif
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        const ulong trace_base = ((ulong)route * args.out_dim + row) *
+            (lanes + simd_groups);
+        trace[trace_base + lane] = as_type<uint>(sum);
+#endif
         const float group_sum = simd_sum(sum);
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        if (lane % simd_width == 0u)
+            trace[trace_base + lanes + lane / simd_width] =
+                as_type<uint>(group_sum);
+#endif
         if ((lane % simd_width) == 0u) partial[lane / simd_width] = group_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#if defined(DS4_INKLING2_IQ4_DIAG_SIMD)
+        if (lane < simd_width) {
+            const float value = simd_sum(lane < simd_groups ? partial[lane] : 0.0f);
+            if (lane == 0u) out[(ulong)route * args.out_dim + row] = value;
+        }
+#else
         if (lane == 0u) {
             float value = 0.0f;
             for (uint simd = 0u; simd < simd_groups; simd++) value += partial[simd];
             out[(ulong)route * args.out_dim + row] = value;
         }
+#endif
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
