@@ -7069,6 +7069,12 @@ int ds4_gpu_init(void) {
         if (drift_norm_unify)     macros[@"DS4_METAL_NORM_RSQRT_DISABLE"] = @"1";
         if (drift_kv_raw_f32)     macros[@"DS4_METAL_KV_RAW_F32"]         = @"1";
         if (drift_rope_exp2_log2) macros[@"DS4_METAL_ROPE_EXP2_LOG2"]     = @"1";
+        /* Keep grouped IQ4_NL GEMM's reduction tree aligned with the GEMV
+         * reference. In default math mode, disable FMA contraction locally
+         * around the IQ4 lane accumulator loop. */
+        macros[@"DS4_INKLING2_IQ4_TWO_SIMD_FINAL"] = @"1";
+        if (!drift_math_safe)
+            macros[@"DS4_INKLING2_IQ4_CONTRACT_OFF"] = @"1";
         fprintf(stderr,
                 "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math_safe=%s tensor_matmul=%s\n",
                 drift_hc_stable      ? "on"  : "off",

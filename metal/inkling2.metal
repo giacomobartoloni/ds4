@@ -316,6 +316,11 @@ kernel void kernel_inkling2_expert_gemv(
     const ulong row_bytes = (ulong)args.blocks_per_row * block_bytes;
     device const char *row_weights = weights + (ulong)(uint32_t)expert * args.expert_bytes +
         (ulong)row * row_bytes;
+#if defined(DS4_INKLING2_IQ4_TRACE)
+    const uint trace_groups = (lanes + args.simd_width - 1u) / args.simd_width;
+    const ulong trace_stride = (ulong)args.in_dim + lanes + trace_groups;
+    const ulong trace_base = ((ulong)route * args.out_dim + row) * trace_stride;
+#endif
     float sum = 0.0f;
     for (uint i = lane; i < args.in_dim; i += lanes) {
         const uint block_index = i >> 5u;
@@ -332,18 +337,18 @@ kernel void kernel_inkling2_expert_gemv(
                 (ulong)route * args.in_dim : (ulong)token * args.in_dim;
             sum += scale * float(quant) * x[x_offset + i];
         }
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        trace[trace_base + i] = as_type<uint>(sum);
+#endif
     }
 #if defined(DS4_INKLING2_IQ4_TRACE)
-    // Diagnostic-only buffer: lane sums followed by one sum per SIMD group.
-    const ulong trace_base = ((ulong)route * args.out_dim + row) *
-        (lanes + (lanes + args.simd_width - 1u) / args.simd_width);
-    trace[trace_base + lane] = as_type<uint>(sum);
+    trace[trace_base + args.in_dim + lane] = as_type<uint>(sum);
 #endif
     const float simd_total = simd_sum(sum);
     const uint simd_group = lane / args.simd_width;
 #if defined(DS4_INKLING2_IQ4_TRACE)
     if (lane % args.simd_width == 0u)
-        trace[trace_base + lanes + simd_group] = as_type<uint>(simd_total);
+        trace[trace_base + args.in_dim + lanes + simd_group] = as_type<uint>(simd_total);
 #endif
     if (lane % args.simd_width == 0u) partial[simd_group] = simd_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -417,28 +422,53 @@ kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
         const uint route = route_map[(ulong)expert * args.route_stride + rank];
         const ulong input_row = args.input_per_expert != 0u ?
             (ulong)route : (ulong)(route / args.n_used);
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        const ulong trace_stride = (ulong)args.in_dim + lanes + simd_groups;
+        const ulong trace_base = ((ulong)route * args.out_dim + row) * trace_stride;
+#endif
         float sum = 0.0f;
+#if defined(DS4_INKLING2_IQ4_CONTRACT_OFF)
+        {
+#pragma clang fp contract(off)
+#endif
         for (uint i = lane; i < args.in_dim; i += lanes)
+        {
 #if defined(DS4_INKLING2_IQ4_DIAG_INLINE)
+#if defined(DS4_INKLING2_IQ4_SEPARATE_PRODUCT)
+            const volatile float product = inkling2_iq4_nl_weight(row_weights, i) *
+                x[input_row * args.in_dim + i];
+            sum += product;
+#else
             sum += inkling2_iq4_nl_weight(row_weights, i) *
                 x[input_row * args.in_dim + i];
+#endif
+#else
+#if defined(DS4_INKLING2_IQ4_SEPARATE_PRODUCT)
+            const volatile float product = weight_row[i] * x[input_row * args.in_dim + i];
+            sum += product;
 #else
             sum += weight_row[i] * x[input_row * args.in_dim + i];
 #endif
+#endif
 #if defined(DS4_INKLING2_IQ4_TRACE)
-        const ulong trace_base = ((ulong)route * args.out_dim + row) *
-            (lanes + simd_groups);
-        trace[trace_base + lane] = as_type<uint>(sum);
+            trace[trace_base + i] = as_type<uint>(sum);
+#endif
+        }
+#if defined(DS4_INKLING2_IQ4_CONTRACT_OFF)
+        }
+#endif
+#if defined(DS4_INKLING2_IQ4_TRACE)
+        trace[trace_base + args.in_dim + lane] = as_type<uint>(sum);
 #endif
         const float group_sum = simd_sum(sum);
 #if defined(DS4_INKLING2_IQ4_TRACE)
         if (lane % simd_width == 0u)
-            trace[trace_base + lanes + lane / simd_width] =
+            trace[trace_base + args.in_dim + lanes + lane / simd_width] =
                 as_type<uint>(group_sum);
 #endif
         if ((lane % simd_width) == 0u) partial[lane / simd_width] = group_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-#if defined(DS4_INKLING2_IQ4_DIAG_SIMD)
+#if defined(DS4_INKLING2_IQ4_DIAG_SIMD) || defined(DS4_INKLING2_IQ4_TWO_SIMD_FINAL)
         if (lane < simd_width) {
             const float value = simd_sum(lane < simd_groups ? partial[lane] : 0.0f);
             if (lane == 0u) out[(ulong)route * args.out_dim + row] = value;

@@ -10,7 +10,7 @@
 #include <string.h>
 
 enum { LANES = 256, SIMD = 32, GROUPS = LANES / SIMD, MAX_ROUTES = 32,
-       TRACE_STRIDE = LANES + GROUPS };
+       MAX_TRACE_DIM = 2304, TRACE_STRIDE = MAX_TRACE_DIM + LANES + GROUPS };
 typedef struct {
     uint32_t in_dim, out_dim, n_experts, n_used, weight_type, blocks_per_row;
     uint32_t input_per_expert, n_tokens, simd_width, pad;
@@ -52,6 +52,11 @@ static id<MTLLibrary> library(id<MTLDevice> device, NSString *source,
     if (trace) macros[@"DS4_INKLING2_IQ4_TRACE"] = @1;
     if (inl) macros[@"DS4_INKLING2_IQ4_DIAG_INLINE"] = @1;
     if (simd) macros[@"DS4_INKLING2_IQ4_DIAG_SIMD"] = @1;
+#if defined(DS4_IQ4_TEST_SEPARATE_PRODUCT)
+    if (!safe) macros[@"DS4_INKLING2_IQ4_SEPARATE_PRODUCT"] = @1;
+#else
+    if (!safe) macros[@"DS4_INKLING2_IQ4_CONTRACT_OFF"] = @1;
+#endif
     options.preprocessorMacros = macros;
     NSError *error = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:source options:options error:&error];
@@ -130,31 +135,62 @@ static float fp32(uint32_t bits) {
     return f;
 }
 
+static uint32_t ordered_bits(uint32_t bits) {
+    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+
+static uint64_t ulp_distance(uint32_t a, uint32_t b) {
+    float x = fp32(a), y = fp32(b);
+    if (x == y) return 0;
+    uint32_t ox = ordered_bits(a), oy = ordered_bits(b);
+    return ox > oy ? (uint64_t)ox - oy : (uint64_t)oy - ox;
+}
+
 static unsigned compare(const char *label, const uint32_t *a, const uint32_t *b,
                         uint32_t routes, unsigned stride, unsigned offset, unsigned count) {
     unsigned bad = 0, nonfinite = 0;
     double max_abs = 0;
+    uint64_t max_ulp = 0;
     for (uint32_t r = 0; r < routes; r++) {
         for (unsigned j = 0; j < count; j++) {
             unsigned i = r * stride + offset + j;
             float x = fp32(a[i]), y = fp32(b[i]);
             if (!isfinite(x) || !isfinite(y)) nonfinite++;
-            else max_abs = fmax(max_abs, fabs((double)x - y));
+            else {
+                max_abs = fmax(max_abs, fabs((double)x - y));
+                uint64_t ulp = ulp_distance(a[i], b[i]);
+                if (ulp > max_ulp) max_ulp = ulp;
+            }
             if (a[i] != b[i]) {
-                if (!bad) printf("  first %s mismatch: route=%u index=%u A=%08x B=%08x\n",
-                                 label, r, j, a[i], b[i]);
+                if (!bad) {
+                    if (strcmp(label, "accumulator-step") == 0)
+                        printf("  first %s mismatch: route=%u feature=%u lane=%u iteration=%u A=%08x B=%08x ULP=%llu\n",
+                               label, r, j, j % LANES, j / LANES, a[i], b[i],
+                               (unsigned long long)ulp_distance(a[i], b[i]));
+                    else
+                        printf("  first %s mismatch: route=%u index=%u A=%08x B=%08x ULP=%llu\n",
+                               label, r, j, a[i], b[i],
+                               (unsigned long long)ulp_distance(a[i], b[i]));
+                    if (strcmp(label, "accumulator-step") == 0 && j >= LANES) {
+                        unsigned previous = i - LANES;
+                        printf("    prior accumulator: feature=%u A=%08x B=%08x\n",
+                               j - LANES, a[previous], b[previous]);
+                    }
+                }
                 bad++;
             }
         }
     }
-    printf("  %s: bit_mismatch=%u/%u max_abs=%.9g nonfinite=%u\n",
-           label, bad, routes * count, max_abs, nonfinite);
+    printf("  %s: bit_mismatch=%u/%u max_abs=%.9g max_ulp=%llu nonfinite=%u\n",
+           label, bad, routes * count, max_abs, (unsigned long long)max_ulp, nonfinite);
     return bad + nonfinite;
 }
 
-static unsigned compare_trace(const result *a, const result *b, uint32_t routes) {
-    unsigned bad = compare("lane", a->trace, b->trace, routes, TRACE_STRIDE, 0, LANES);
-    bad += compare("SIMD", a->trace, b->trace, routes, TRACE_STRIDE, LANES, GROUPS);
+static unsigned compare_trace(const result *a, const result *b, uint32_t routes, uint32_t dim) {
+    unsigned stride = dim + LANES + GROUPS;
+    unsigned bad = compare("accumulator-step", a->trace, b->trace, routes, stride, 0, dim);
+    bad += compare("lane-final", a->trace, b->trace, routes, stride, dim, LANES);
+    bad += compare("SIMD", a->trace, b->trace, routes, stride, dim + LANES, GROUPS);
     return bad + compare("output", a->out, b->out, routes, 1, 0, 1);
 }
 
@@ -166,7 +202,7 @@ static int replay(id<MTLDevice> device, NSString *source, NSData *w, NSData *x,
     id<MTLBuffer> weights = buffer(device, w.bytes, w.length);
     id<MTLBuffer> input = buffer(device, x.bytes, x.length);
     result a, aa, at, att, b, bt, btt;
-    unsigned invalid = 0, baseline_bad = 0;
+    unsigned invalid = 0, production_bad = 0;
     printf("shape=%u routes=%u math=%s\n", dim, routes, safe ? "safe" : "default");
     for (unsigned mode = 0; mode < 4; mode++) {
         @autoreleasepool {
@@ -181,7 +217,7 @@ static int replay(id<MTLDevice> device, NSString *source, NSData *w, NSData *x,
                 run(device, queue, traced, weights, input, dim, routes, NO, YES, &at);
                 run(device, queue, traced, weights, input, dim, routes, NO, YES, &att);
                 puts("GEMV A/A (traced):");
-                invalid += compare_trace(&at, &att, routes);
+                invalid += compare_trace(&at, &att, routes, dim);
                 puts("GEMV plain/traced (instrumentation check):");
                 invalid += compare("output", a.out, at.out, routes, 1, 0, 1);
             }
@@ -193,19 +229,19 @@ static int replay(id<MTLDevice> device, NSString *source, NSData *w, NSData *x,
             puts("  GEMM plain/traced (instrumentation check):");
             invalid += compare("output", b.out, bt.out, routes, 1, 0, 1);
             puts("  GEMM traced repeat:");
-            invalid += compare_trace(&bt, &btt, routes);
+            invalid += compare_trace(&bt, &btt, routes, dim);
             puts("  GEMV/GEMM plain:");
             unsigned diff = compare("output", a.out, b.out, routes, 1, 0, 1);
-            if (!mode) baseline_bad += diff;
+            if (simd) production_bad += diff;
             puts("  GEMV/GEMM traced:");
-            compare_trace(&at, &bt, routes);
+            compare_trace(&at, &bt, routes, dim);
         }
     }
     if (invalid) {
         puts("INVALID TRACE: nondeterminism, nonfinite values or instrumentation changed output.");
         return 1;
     }
-    return baseline_bad ? 2 : 0;
+    return production_bad ? 2 : 0;
 }
 
 static int synthetic(id<MTLDevice> device, NSString *source, uint32_t dim, BOOL safe) {
