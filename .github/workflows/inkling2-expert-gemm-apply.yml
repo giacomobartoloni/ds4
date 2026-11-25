@@ -7,7 +7,6 @@ permissions:
   contents: write
 jobs:
   apply-and-commit:
-    if: github.event.head_commit.message == 'chore(inkling): stage expert GEMM source application'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
