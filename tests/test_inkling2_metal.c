@@ -1775,6 +1775,9 @@ static int test_gpu_context_owns_independent_visit_state(void) {
     CHECK(context.input_token && context.embedding && context.activation &&
           context.logits && context.scratch);
     CHECK(context.batch.relative_bias_storage != NULL);
+    CHECK(ds4_gpu_tensor_bytes(context.batch.relative_storage) >=
+          (uint64_t)DS4_INKLING_GPU_MOE_MAX_TOKENS *
+              DS4_INKLING_KV_WIDTH * sizeof(float));
     CHECK(context.control.normalized && context.control.bottleneck &&
           context.control.gain && context.control.forget);
     CHECK(context.moe.logits && context.moe.ids && context.moe.weights &&

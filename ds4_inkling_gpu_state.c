@@ -7,6 +7,9 @@
 #define DS4_INKLING_GPU_VOCAB_PADDED 201024u
 #define DS4_INKLING_GPU_QUERY_WIDTH (24u * 128u)
 #define DS4_INKLING_GPU_RELATIVE_WIDTH (24u * 16u)
+#define DS4_INKLING_GPU_RELATIVE_SCRATCH_WIDTH \
+    (DS4_INKLING_GPU_RELATIVE_WIDTH > DS4_INKLING_KV_WIDTH ? \
+        DS4_INKLING_GPU_RELATIVE_WIDTH : DS4_INKLING_KV_WIDTH)
 #define DS4_INKLING_GPU_EXPERTS 128u
 #define DS4_INKLING_GPU_EXPERT_DIM 1152u
 #define DS4_INKLING_GPU_WEIGHT_ALIGNMENT 256u
@@ -57,7 +60,7 @@ static bool compute_work_storage_bytes(uint64_t *bytes) {
         16u * DS4_INKLING_GPU_HIDDEN,
         3u * DS4_INKLING_GPU_QUERY_WIDTH,
         2u * DS4_INKLING_KV_WIDTH,
-        DS4_INKLING_GPU_RELATIVE_WIDTH,
+        DS4_INKLING_GPU_RELATIVE_SCRATCH_WIDTH,
         24u * 1024u,
         4u * DS4_INKLING_GPU_HIDDEN + 64u,
         64u,
@@ -509,7 +512,7 @@ static bool allocate_compute_workspaces(ds4_inkling_gpu_context *context) {
         &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS * DS4_INKLING_KV_WIDTH);
     batch->relative_storage = take_float_view(context->scratch, scratch_bytes,
         &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
-            DS4_INKLING_GPU_RELATIVE_WIDTH);
+            DS4_INKLING_GPU_RELATIVE_SCRATCH_WIDTH);
     batch->relative_bias_storage = take_float_view(context->scratch,
         scratch_bytes, &cursor, DS4_INKLING_GPU_MOE_MAX_TOKENS *
             24u * 1024u);
