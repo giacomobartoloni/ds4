@@ -64,4 +64,20 @@ int ds4_inkling_control_metal_with_workspace(
         float                 epsilon,
         const struct ds4_inkling_gpu_control_workspace *workspace);
 
+/* Prefill variant with contiguous [token][hidden] current/message rows. */
+int ds4_inkling_control_metal_batch_with_workspace(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ctrl_down_offset,
+        uint64_t              ctrl_gain_offset,
+        uint64_t              ctrl_forget_offset,
+        uint32_t              hidden_dim,
+        uint32_t              rank,
+        uint32_t              n_tokens,
+        float                 epsilon,
+        const struct ds4_inkling_gpu_control_workspace *workspace);
+
 #endif /* DS4_INKLING_LOOP_H */

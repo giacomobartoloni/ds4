@@ -12,6 +12,7 @@
 #define TEST_HIDDEN 2304u
 #define TEST_VOCAB_PADDED 201024u
 #define TEST_VOCAB 200058u
+enum { TEST_PREFILL_BATCH = 32 };
 
 static ds4_tensor test_tensors[TEST_MAX_TENSORS];
 static uint32_t test_tensor_count;
@@ -314,7 +315,7 @@ typedef struct {
 static void request_cancel_after_first_prefill_group(
         void *ud, const char *event, int current, int total) {
     prefill_cancel_probe *probe = ud;
-    assert(total == DS4_INKLING_GPU_MOE_MAX_TOKENS + 2);
+    assert(total == TEST_PREFILL_BATCH + 2);
     if (strcmp(event, "prefill_chunk") != 0) return;
     probe->calls++;
     probe->last_current = current;
@@ -353,6 +354,7 @@ int main(void) {
     assert(ds4_gpu_init());
     g_ds4_shape = DS4_SHAPE_INKLING2;
     make_test_config();
+    assert(setenv("DS4_INKLING2_MAX_BATCH", "32", 1) == 0);
 
     uint8_t *model_map = mmap(NULL, (size_t)TEST_MODEL_BYTES,
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -422,7 +424,7 @@ int main(void) {
     assert(session->logits[TEST_VOCAB] == DS4_NEG_INF);
     assert(logits_argmax(session->logits, TEST_VOCAB) == 0);
 
-    int long_prompt_tokens[DS4_INKLING_GPU_MOE_MAX_TOKENS + 2] =
+    int long_prompt_tokens[TEST_PREFILL_BATCH + 2] =
         { 42, 17, 9, 12, 3, 5, 7, 11, 13, 19 };
     for (int i = 10; i < (int)(sizeof(long_prompt_tokens) /
                                sizeof(long_prompt_tokens[0])); i++)
@@ -432,8 +434,8 @@ int main(void) {
     const ds4_tokens long_prompt = { .v = long_prompt_tokens,
         .len = prompt_len, .cap = prompt_len };
     const ds4_tokens first_group = { .v = long_prompt_tokens,
-        .len = DS4_INKLING_GPU_MOE_MAX_TOKENS,
-        .cap = DS4_INKLING_GPU_MOE_MAX_TOKENS };
+        .len = TEST_PREFILL_BATCH,
+        .cap = TEST_PREFILL_BATCH };
     float *tokenwise_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
     float *prefix_logits = malloc((size_t)TEST_VOCAB * sizeof(float));
     assert(tokenwise_logits && prefix_logits);
@@ -480,7 +482,8 @@ int main(void) {
     ds4_session_set_cancel(session, prefill_cancel_requested, &cancel_probe);
     assert(ds4_session_sync(session, &long_prompt, error, sizeof(error)) ==
            DS4_SESSION_SYNC_INTERRUPTED);
-    assert(cancel_probe.calls == 1 && cancel_probe.last_current == DS4_INKLING_GPU_MOE_MAX_TOKENS);
+    assert(cancel_probe.calls == 1 &&
+           cancel_probe.last_current == TEST_PREFILL_BATCH);
     assert(cancel_probe.observed_raw_logits_stale);
     assert(cancel_probe.observed_logits_count == 0);
     assert(cancel_probe.observed_argmax == -1);
@@ -489,7 +492,7 @@ int main(void) {
     assert(cancel_probe.observed_token_logprob == 0);
     assert(cancel_probe.observed_payload_bytes == 0);
     assert(cancel_probe.observed_snapshot_save != 0);
-    assert(ds4_session_pos(session) == DS4_INKLING_GPU_MOE_MAX_TOKENS);
+    assert(ds4_session_pos(session) == TEST_PREFILL_BATCH);
     assert(ds4_session_checkpoint_valid(session));
     assert(memcmp(prefix_logits, session->logits,
                   (size_t)TEST_VOCAB * sizeof(float)) == 0);

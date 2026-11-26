@@ -64002,6 +64002,8 @@ typedef struct {
     uint32_t attn_history_count;
     ds4_gpu_tensor *current;
     ds4_gpu_tensor *output;
+    ds4_gpu_tensor *attention_result;
+    ds4_gpu_tensor *ffn_postconv_result;
 } inkling_gpu_row_state;
 
 /* Assemble the logical residual state list without reading any activation
@@ -64160,6 +64162,149 @@ static bool inkling_gpu_decoder_layer_norm_inputs(
     return true;
 }
 
+static bool inkling_gpu_decoder_layer_norm_inputs_batch(
+        ds4_session *session,
+        const ds4_inkling_visit *visit,
+        uint32_t block_count,
+        uint32_t n_tokens,
+        inkling_gpu_row_state *rows,
+        const char **failed_stage) {
+    if (failed_stage) *failed_stage = "batched attention input validation";
+    if (!session || !visit || !rows || n_tokens < 2u ||
+        n_tokens > INKLING_GPU_PREFILL_BATCH_TOKENS ||
+        visit->physical_layer >= DS4_INKLING_PHYSICAL_LAYERS ||
+        block_count > 4u) return false;
+
+    ds4_engine *engine = session->engine;
+    ds4_inkling_gpu_context *context = &session->inkling_gpu;
+    ds4_inkling_gpu_batch_workspace *batch = &context->batch;
+    const ds4_model *model = &engine->model;
+    const ds4_inkling_layer_weights *weights =
+        &engine->inkling_weights.layer[visit->physical_layer];
+    const ds4_inkling_gpu_layer_parameters *parameters =
+        &context->parameters.layer[visit->physical_layer];
+    const bool sliding = visit->is_sliding_window != 0;
+    const bool has_messages = visit->phase == DS4_INKLING_PHASE_CORE &&
+                              visit->pass > 0;
+    const uint32_t input_count = sliding ? 1u : 3u;
+    ds4_gpu_tensor *current_storage = NULL;
+
+    if (rows[0].current == batch->current[0])
+        current_storage = batch->current_storage;
+    else if (rows[0].current == batch->next[0])
+        current_storage = batch->next_storage;
+    else if (rows[0].current == batch->prelude[0])
+        current_storage = batch->prelude_storage;
+    if (!current_storage) {
+        if (failed_stage) *failed_stage = "batched current storage selection";
+        return false;
+    }
+    if (weights->attn_res_query && !parameters->attn_res_query) {
+        if (failed_stage) *failed_stage = "batched attention residual parameters";
+        return false;
+    }
+    if (has_messages && !parameters->loop_msg_query) {
+        if (failed_stage) *failed_stage = "batched loop message parameters";
+        return false;
+    }
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        ds4_gpu_tensor *expected_current =
+            current_storage == batch->current_storage ? batch->current[row] :
+            current_storage == batch->next_storage ? batch->next[row] :
+            batch->prelude[row];
+        if (rows[row].row_index != row ||
+            rows[row].current != expected_current ||
+            !batch->attn_norm[0][row] || !batch->attn_norm[1][row] ||
+            !batch->attn_norm[2][row]) {
+            if (failed_stage) *failed_stage = "batched attention row views";
+            return false;
+        }
+    }
+
+    for (uint32_t input = 0; input < input_count; input++) {
+        ds4_gpu_tensor *raw = current_storage;
+        if (weights->attn_res_query) {
+            ds4_gpu_tensor *raw_storage = has_messages ?
+                batch->ffn_input_storage : batch->attn_norm_storage[input];
+            const uint32_t query_count = sliding ? 1u : 3u;
+            if (failed_stage) *failed_stage = "batched attention residual mix";
+            INKLING_GPU_REQUIRE(ds4_gpu_inkling2_mix_prefill_tensor(
+                    raw_storage, batch->current_blocks_storage,
+                    current_storage, parameters->attn_res_query,
+                    block_count + 1u, 4u, INKLING_GPU_HIDDEN, query_count,
+                    n_tokens, sliding ? 0u : input, 1, 1, 1.0e-6f),
+                    "batched attention residual mix");
+            raw = raw_storage;
+        } else if (!has_messages) {
+            if (failed_stage) *failed_stage = "batched attention input capture";
+            INKLING_GPU_REQUIRE(ds4_gpu_inkling2_copy_strided_rows_tensor(
+                    batch->attn_norm_storage[input], current_storage,
+                    INKLING_GPU_HIDDEN, n_tokens, 1u, 0u, 1u, 0u),
+                    "batched attention input capture");
+        }
+
+        if (has_messages) {
+            const uint32_t first_controller = sliding ? 0u : input;
+            const uint32_t controller_limit = sliding ? 3u : input + 1u;
+            for (uint32_t controller = first_controller;
+                 controller < controller_limit; controller++) {
+                if (failed_stage) *failed_stage = "batched loop message mix";
+                INKLING_GPU_REQUIRE(ds4_gpu_inkling2_mix_prefill_tensor(
+                        batch->attention_output_storage,
+                        batch->previous_blocks_storage, NULL,
+                        parameters->loop_msg_query, 2u, 2u,
+                        INKLING_GPU_HIDDEN, 4u, n_tokens, controller,
+                        0, 0, 1.0e-6f), "batched loop message mix");
+                if (failed_stage) *failed_stage =
+                    "batched attention cross-pass controller";
+                INKLING_GPU_REQUIRE(ds4_inkling_control_metal_batch_with_workspace(
+                        batch->attn_norm_storage[controller], raw,
+                        batch->attention_output_storage, model->map,
+                        model->size,
+                        weights->loop_ctrl_down[controller]->abs_offset,
+                        weights->loop_ctrl_gain[controller]->abs_offset,
+                        weights->loop_ctrl_forget[controller]->abs_offset,
+                        INKLING_GPU_HIDDEN, 64u, n_tokens, 1.0e-6f,
+                        &context->control),
+                        "batched attention cross-pass controller");
+            }
+        }
+    }
+
+    if (sliding && !has_messages) {
+        for (uint32_t input = 1u; input < 3u; input++) {
+            if (failed_stage) *failed_stage = "sliding attention input fanout";
+            INKLING_GPU_REQUIRE(ds4_gpu_inkling2_copy_strided_rows_tensor(
+                    batch->attn_norm_storage[input],
+                    batch->attn_norm_storage[0], INKLING_GPU_HIDDEN,
+                    n_tokens, 1u, 0u, 1u, 0u),
+                    "sliding attention input fanout");
+        }
+    }
+
+    ds4_tensor *norm_weights[3] = {
+        sliding ? weights->attn_norm : weights->attn_q_inp_norm,
+        sliding ? weights->attn_norm : weights->attn_k_inp_norm,
+        sliding ? weights->attn_norm : weights->attn_v_inp_norm,
+    };
+    for (uint32_t input = 0; input < 3u; input++) {
+        if (failed_stage) *failed_stage = sliding ?
+            "batched sliding attention input norm" :
+            "batched full attention input norm";
+        INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_weight_rows_tensor(
+                batch->attn_norm_storage[input],
+                batch->attn_norm_storage[input], model->map, model->size,
+                norm_weights[input]->abs_offset, INKLING_GPU_HIDDEN,
+                n_tokens, g_ds4_inkling_model_config.rms_epsilon),
+                "batched attention input norm");
+    }
+
+    for (uint32_t row = 0; row < n_tokens; row++)
+        for (uint32_t input = 0; input < 3u; input++)
+            rows[row].attn_norm[input] = batch->attn_norm[input][row];
+    return true;
+}
+
 static bool inkling_gpu_decoder_layer_attention(
         ds4_session *session,
         const ds4_inkling_visit *visit,
@@ -64257,6 +64402,7 @@ static bool inkling_gpu_decoder_layer_attention(
             parameters->attn_rel_bias, workspace->relative_distances,
             1u, INKLING_GPU_QUERY_HEADS, INKLING_GPU_RELATIVE_DIM,
             g_ds4_inkling_model_config.relative_extent,
+            g_ds4_inkling_model_config.relative_extent,
             g_ds4_inkling_model_config.relative_extent),
             "relative-position bias");
     INKLING_GPU_REQUIRE(ds4_gpu_inkling2_attention_decode_tensor(
@@ -64283,6 +64429,136 @@ static bool inkling_gpu_decoder_layer_attention(
         value_history_count < history_capacity ? value_history_count + 1u : history_capacity;
     slot->conv_length[DS4_INKLING_CONV_ATTENTION_OUT] =
         attn_history_count < history_capacity ? attn_history_count + 1u : history_capacity;
+    return true;
+}
+
+static bool inkling_gpu_decoder_layer_attention_batch(
+        ds4_session *session,
+        const ds4_inkling_visit *visit,
+        uint32_t logical_layer,
+        uint32_t first_position,
+        uint32_t n_tokens,
+        inkling_gpu_row_state *rows,
+        const char **failed_stage) {
+    if (failed_stage) *failed_stage = "batched attention state validation";
+    if (!session || !visit || !rows || n_tokens == 0 ||
+        n_tokens > INKLING_GPU_PREFILL_BATCH_TOKENS ||
+        visit->physical_layer >= DS4_INKLING_PHYSICAL_LAYERS ||
+        visit->cache_slot >= DS4_INKLING_CACHE_SLOTS ||
+        logical_layer != visit->physical_layer ||
+        (uint64_t)first_position + n_tokens > (uint64_t)session->ctx_size)
+        return false;
+
+    ds4_inkling_gpu_context *context = &session->inkling_gpu;
+    ds4_inkling_gpu_layer_parameters *parameters =
+        &context->parameters.layer[visit->physical_layer];
+    ds4_inkling_gpu_slot *slot = &context->slots[visit->cache_slot];
+    ds4_inkling_gpu_layer_workspace *layer = &context->layer;
+    ds4_inkling_gpu_batch_workspace *batch = &context->batch;
+    const uint32_t history_capacity = DS4_INKLING_CONV_HISTORY;
+    const uint32_t old_count = slot->length;
+    const uint32_t key_history_count =
+        slot->conv_length[DS4_INKLING_CONV_KEY];
+    const uint32_t value_history_count =
+        slot->conv_length[DS4_INKLING_CONV_VALUE];
+    const uint32_t attn_history_count =
+        slot->conv_length[DS4_INKLING_CONV_ATTENTION_OUT];
+    const uint64_t oldest_position = slot->next_position - old_count;
+    const bool sliding = visit->is_sliding_window != 0;
+    const uint32_t relative_extent =
+        g_ds4_inkling_model_config.relative_extent;
+
+    if (slot->capacity == 0 || old_count > slot->capacity ||
+        slot->next_position != first_position || old_count > slot->next_position ||
+        key_history_count > history_capacity ||
+        value_history_count > history_capacity ||
+        attn_history_count > history_capacity ||
+        relative_extent == 0 || relative_extent > 1024u ||
+        !batch->relative_bias_storage) return false;
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        if (rows[row].row_index != row) return false;
+    }
+
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_qk_prepare_prefill_tensor(
+            batch->attention_gated_storage, batch->query_storage,
+            parameters->attn_q_clip, n_tokens, INKLING_GPU_QUERY_HEADS,
+            INKLING_GPU_HEAD_DIM, g_ds4_inkling_model_config.qk_clip,
+            g_ds4_inkling_model_config.log_scale_alpha,
+            (float)g_ds4_inkling_model_config.log_scale_floor,
+            first_position, !sliding), "batched query clipping and position scale");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_qk_prepare_prefill_tensor(
+            batch->relative_storage, batch->relative_storage,
+            parameters->attn_rel_clip, n_tokens, INKLING_GPU_QUERY_HEADS,
+            INKLING_GPU_RELATIVE_DIM,
+            g_ds4_inkling_model_config.relative_clip,
+            g_ds4_inkling_model_config.log_scale_alpha,
+            (float)g_ds4_inkling_model_config.log_scale_floor,
+            first_position, !sliding),
+            "batched relative-state clipping and position scale");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_relative_bias_tensor(
+            batch->relative_bias_storage, batch->relative_storage,
+            parameters->attn_rel_bias, layer->relative_distances,
+            n_tokens, INKLING_GPU_QUERY_HEADS, INKLING_GPU_RELATIVE_DIM,
+            relative_extent, relative_extent, 0u),
+            "batched relative-position bias");
+
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+            batch->relative_storage, slot->conv[DS4_INKLING_CONV_KEY],
+            batch->key_storage, parameters->attn_k_conv,
+            sliding ? NULL : batch->dynamic_k_storage,
+            n_tokens, INKLING_GPU_KV_WIDTH, INKLING_GPU_KV_HEADS,
+            DS4_INKLING_CONV_KERNEL, key_history_count),
+            "batched key short convolution");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_clip_l2_rows_tensor(
+            batch->key_storage, batch->relative_storage,
+            INKLING_GPU_HEAD_DIM, n_tokens * INKLING_GPU_KV_HEADS,
+            g_ds4_inkling_model_config.qk_clip), "batched key clipping");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+            batch->attention_output_storage, slot->conv[DS4_INKLING_CONV_VALUE],
+            batch->value_storage, parameters->attn_v_conv,
+            sliding ? NULL : batch->dynamic_v_storage,
+            n_tokens, INKLING_GPU_KV_WIDTH, INKLING_GPU_KV_HEADS,
+            DS4_INKLING_CONV_KERNEL, value_history_count),
+            "batched value short convolution");
+    INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_plain_rows_tensor(
+            batch->value_storage, batch->attention_output_storage,
+            INKLING_GPU_HEAD_DIM, n_tokens * INKLING_GPU_KV_HEADS,
+            g_ds4_inkling_model_config.rms_epsilon),
+            "batched value normalization");
+
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_attention_prefill_tensor(
+            batch->query_storage, batch->attention_gated_storage,
+            slot->key, slot->value, batch->key_storage, batch->value_storage,
+            batch->relative_bias_storage, batch->sink_logits_storage,
+            INKLING_GPU_QUERY_HEADS, INKLING_GPU_KV_HEADS,
+            INKLING_GPU_HEAD_DIM, slot->capacity, old_count, n_tokens,
+            oldest_position, first_position,
+            sliding ? DS4_INKLING_SLIDING_WINDOW : 0u, relative_extent),
+            "batched grouped-query attention");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_kv_append_rows_tensor(
+            slot->key, slot->value, batch->key_storage, batch->value_storage,
+            n_tokens, INKLING_GPU_KV_HEADS, INKLING_GPU_HEAD_DIM,
+            slot->capacity, first_position), "batched KV cache append");
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_attention_output_gate_tensor(
+            batch->attention_gated_storage, batch->query_storage,
+            batch->attention_gate_storage,
+            n_tokens * INKLING_GPU_QUERY_WIDTH), "batched attention output gate");
+
+    const uint64_t new_length = (uint64_t)old_count + n_tokens;
+    slot->length = new_length < slot->capacity ? (uint32_t)new_length :
+                                                  slot->capacity;
+    slot->next_position = (uint64_t)first_position + n_tokens;
+    slot->conv_length[DS4_INKLING_CONV_KEY] =
+        key_history_count + n_tokens < history_capacity ?
+            key_history_count + n_tokens : history_capacity;
+    slot->conv_length[DS4_INKLING_CONV_VALUE] =
+        value_history_count + n_tokens < history_capacity ?
+            value_history_count + n_tokens : history_capacity;
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        const uint32_t row_history = attn_history_count + row;
+        rows[row].attn_history_count = row_history < history_capacity ?
+            row_history : history_capacity;
+    }
     return true;
 }
 
@@ -64314,15 +64590,18 @@ static bool inkling_gpu_decoder_layer_ffn_prepare(
                               visit->pass > 0;
     ds4_gpu_tensor *layer_output = current == row->activation_a ?
         row->activation_b : row->activation_a;
-    ds4_gpu_tensor *attention_result = workspace->attention_context;
+    ds4_gpu_tensor *attention_result = row->attention_result ?
+        row->attention_result : workspace->attention_context;
     row->output = layer_output;
 
-    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
-            attention_result, slot->conv[DS4_INKLING_CONV_ATTENTION_OUT],
-            context->batch.attention_output[row->row_index],
-            parameters->attn_post_conv, NULL, 1u, INKLING_GPU_HIDDEN, 1u,
-            DS4_INKLING_CONV_KERNEL, row->attn_history_count),
-            "post-attention convolution");
+    if (!row->attention_result) {
+        INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+                attention_result, slot->conv[DS4_INKLING_CONV_ATTENTION_OUT],
+                context->batch.attention_output[row->row_index],
+                parameters->attn_post_conv, NULL, 1u, INKLING_GPU_HIDDEN, 1u,
+                DS4_INKLING_CONV_KERNEL, row->attn_history_count),
+                "post-attention convolution");
+    }
 
     ds4_gpu_tensor *attention_residual = NULL;
     if (logical_layer % DS4_INKLING_RESIDUAL_BLOCK == 0u) {
@@ -64369,6 +64648,132 @@ static bool inkling_gpu_decoder_layer_ffn_prepare(
     return true;
 }
 
+static bool inkling_gpu_decoder_layer_ffn_prepare_batch(
+        ds4_session *session,
+        const ds4_inkling_visit *visit,
+        uint32_t logical_layer,
+        uint32_t block_count,
+        uint32_t n_tokens,
+        inkling_gpu_row_state *rows,
+        const char **failed_stage) {
+    if (failed_stage) *failed_stage = "batched FFN input validation";
+    if (!session || !visit || !rows || n_tokens < 2u ||
+        n_tokens > INKLING_GPU_PREFILL_BATCH_TOKENS ||
+        visit->physical_layer >= DS4_INKLING_PHYSICAL_LAYERS ||
+        logical_layer != visit->physical_layer || block_count > 4u)
+        return false;
+
+    ds4_engine *engine = session->engine;
+    ds4_inkling_gpu_context *context = &session->inkling_gpu;
+    ds4_inkling_gpu_batch_workspace *batch = &context->batch;
+    const ds4_model *model = &engine->model;
+    const ds4_inkling_layer_weights *weights =
+        &engine->inkling_weights.layer[visit->physical_layer];
+    const ds4_inkling_gpu_layer_parameters *parameters =
+        &context->parameters.layer[visit->physical_layer];
+    const bool has_messages = visit->phase == DS4_INKLING_PHASE_CORE &&
+                              visit->pass > 0;
+    const bool captures_block =
+        logical_layer % DS4_INKLING_RESIDUAL_BLOCK == 0u;
+    const uint64_t row_elements = (uint64_t)n_tokens * INKLING_GPU_HIDDEN;
+    ds4_gpu_tensor *current_storage = NULL;
+    if (rows[0].current == batch->current[0])
+        current_storage = batch->current_storage;
+    else if (rows[0].current == batch->next[0])
+        current_storage = batch->next_storage;
+    else if (rows[0].current == batch->prelude[0])
+        current_storage = batch->prelude_storage;
+    if (!current_storage || (has_messages &&
+            (!parameters->loop_msg_query ||
+             !weights->loop_ctrl_down[DS4_INKLING_CTRL_FFN] ||
+             !weights->loop_ctrl_gain[DS4_INKLING_CTRL_FFN] ||
+             !weights->loop_ctrl_forget[DS4_INKLING_CTRL_FFN]))) {
+        if (failed_stage) *failed_stage = "batched FFN parameter selection";
+        return false;
+    }
+
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        ds4_gpu_tensor *expected_current =
+            current_storage == batch->current_storage ? batch->current[row] :
+            current_storage == batch->next_storage ? batch->next[row] :
+            batch->prelude[row];
+        if (rows[row].row_index != row || rows[row].current != expected_current ||
+            rows[row].attention_result != batch->ffn_input[row] ||
+            !rows[row].activation_a || !rows[row].activation_b ||
+            !batch->moe_input[row]) {
+            if (failed_stage) *failed_stage = "batched FFN row views";
+            return false;
+        }
+    }
+
+    uint32_t mixed_block_count = block_count;
+    if (captures_block) {
+        if (block_count >= 4u) {
+            if (failed_stage) *failed_stage = "residual block capacity";
+            return false;
+        }
+        if (failed_stage) *failed_stage = "batched residual block capture";
+        INKLING_GPU_REQUIRE(ds4_gpu_inkling2_copy_strided_rows_tensor(
+                batch->current_blocks_storage, current_storage,
+                INKLING_GPU_HIDDEN, n_tokens, 1u, 0u, 4u, block_count),
+                "batched residual block capture");
+        mixed_block_count++;
+    }
+
+    ds4_gpu_tensor *residual = batch->ffn_input_storage;
+    if (!captures_block) {
+        residual = batch->attn_norm_storage[0];
+        if (failed_stage) *failed_stage = "batched attention residual add";
+        INKLING_GPU_REQUIRE(ds4_gpu_add_tensor(residual, current_storage,
+                batch->ffn_input_storage, (uint32_t)row_elements),
+                "batched attention residual add");
+    }
+
+    if (failed_stage) *failed_stage = "batched FFN residual mix";
+    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_mix_prefill_tensor(
+            batch->moe_output_storage, batch->current_blocks_storage,
+            residual, parameters->ffn_res_query, mixed_block_count + 1u, 4u,
+            INKLING_GPU_HIDDEN, 1u, n_tokens, 0u, 1, 1, 1.0e-6f),
+            "batched FFN residual mix");
+
+    ds4_gpu_tensor *norm_input = batch->moe_output_storage;
+    if (has_messages) {
+        if (failed_stage) *failed_stage = "batched FFN loop message mix";
+        INKLING_GPU_REQUIRE(ds4_gpu_inkling2_mix_prefill_tensor(
+                batch->attention_output_storage,
+                batch->previous_blocks_storage, NULL,
+                parameters->loop_msg_query, 2u, 2u, INKLING_GPU_HIDDEN,
+                4u, n_tokens, DS4_INKLING_CTRL_FFN, 0, 0, 1.0e-6f),
+                "batched FFN loop message mix");
+        if (failed_stage) *failed_stage = "batched FFN cross-pass controller";
+        INKLING_GPU_REQUIRE(ds4_inkling_control_metal_batch_with_workspace(
+                batch->moe_input_storage, batch->moe_output_storage,
+                batch->attention_output_storage, model->map, model->size,
+                weights->loop_ctrl_down[DS4_INKLING_CTRL_FFN]->abs_offset,
+                weights->loop_ctrl_gain[DS4_INKLING_CTRL_FFN]->abs_offset,
+                weights->loop_ctrl_forget[DS4_INKLING_CTRL_FFN]->abs_offset,
+                INKLING_GPU_HIDDEN, 64u, n_tokens, 1.0e-6f,
+                &context->control), "batched FFN cross-pass controller");
+        norm_input = batch->moe_input_storage;
+    }
+
+    if (failed_stage) *failed_stage = "batched FFN input norm";
+    INKLING_GPU_REQUIRE(ds4_gpu_rms_norm_weight_rows_tensor(
+            batch->moe_input_storage, norm_input, model->map, model->size,
+            weights->ffn_norm->abs_offset, INKLING_GPU_HIDDEN, n_tokens,
+            g_ds4_inkling_model_config.rms_epsilon),
+            "batched FFN input norm");
+
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        rows[row].ffn_input = captures_block ? batch->ffn_input[row] :
+                                               batch->attn_norm[0][row];
+        rows[row].moe_input = batch->moe_input[row];
+        rows[row].output = rows[row].current == rows[row].activation_a ?
+            rows[row].activation_b : rows[row].activation_a;
+    }
+    return true;
+}
+
 static bool inkling_gpu_decoder_layer_finish(
         ds4_session *session,
         const ds4_inkling_visit *visit,
@@ -64384,21 +64789,69 @@ static bool inkling_gpu_decoder_layer_finish(
     ds4_inkling_gpu_slot *slot = &context->slots[visit->cache_slot];
     const uint32_t history_count =
         slot->conv_length[DS4_INKLING_CONV_FFN_OUT];
+    ds4_gpu_tensor *postconv_result = row->ffn_postconv_result ?
+        row->ffn_postconv_result : workspace->attention_output;
 
     if (!parameters->ffn_post_conv ||
         history_count > DS4_INKLING_CONV_HISTORY) return false;
-    INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
-            workspace->attention_output, slot->conv[DS4_INKLING_CONV_FFN_OUT],
-            row->moe_output, parameters->ffn_post_conv, NULL,
-            1u, INKLING_GPU_HIDDEN, 1u, DS4_INKLING_CONV_KERNEL,
-            history_count), "post-FFN convolution");
+    if (!row->ffn_postconv_result) {
+        INKLING_GPU_REQUIRE(ds4_gpu_inkling2_shortconv_tensor(
+                postconv_result, slot->conv[DS4_INKLING_CONV_FFN_OUT],
+                row->moe_output, parameters->ffn_post_conv, NULL,
+                1u, INKLING_GPU_HIDDEN, 1u, DS4_INKLING_CONV_KERNEL,
+                history_count), "post-FFN convolution");
+    }
     INKLING_GPU_REQUIRE(ds4_gpu_add_tensor(row->output,
-            row->ffn_input, workspace->attention_output,
+            row->ffn_input, postconv_result,
             INKLING_GPU_HIDDEN), "FFN residual add");
 
-    slot->conv_length[DS4_INKLING_CONV_FFN_OUT] =
-        history_count < DS4_INKLING_CONV_HISTORY ? history_count + 1u : history_count;
+    if (!row->ffn_postconv_result) {
+        slot->conv_length[DS4_INKLING_CONV_FFN_OUT] =
+            history_count < DS4_INKLING_CONV_HISTORY ?
+                history_count + 1u : history_count;
+    }
     row->current = row->output;
+    return true;
+}
+
+static bool inkling_gpu_decoder_layer_finish_batch(
+        uint32_t n_tokens,
+        inkling_gpu_row_state *rows,
+        ds4_inkling_gpu_batch_workspace *batch,
+        const char **failed_stage) {
+    if (failed_stage) *failed_stage = "batched post-MoE residual validation";
+    if (!rows || !batch || n_tokens < 2u ||
+        n_tokens > INKLING_GPU_PREFILL_BATCH_TOKENS) return false;
+    ds4_gpu_tensor *output_storage = NULL;
+    ds4_gpu_tensor *residual_storage = NULL;
+    if (rows[0].output == batch->current[0])
+        output_storage = batch->current_storage;
+    else if (rows[0].output == batch->next[0])
+        output_storage = batch->next_storage;
+    if (rows[0].ffn_input == batch->ffn_input[0])
+        residual_storage = batch->ffn_input_storage;
+    else if (rows[0].ffn_input == batch->attn_norm[0][0])
+        residual_storage = batch->attn_norm_storage[0];
+    if (!output_storage || !residual_storage) return false;
+
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        ds4_gpu_tensor *expected_output = output_storage == batch->current_storage
+            ? batch->current[row] : batch->next[row];
+        ds4_gpu_tensor *expected_residual =
+            residual_storage == batch->ffn_input_storage ?
+                batch->ffn_input[row] : batch->attn_norm[0][row];
+        if (rows[row].output != expected_output ||
+            rows[row].ffn_input != expected_residual ||
+            rows[row].ffn_postconv_result != batch->attention_output[row])
+            return false;
+    }
+
+    if (failed_stage) *failed_stage = "batched FFN residual add";
+    if (!ds4_gpu_add_tensor(output_storage, residual_storage,
+            batch->attention_output_storage,
+            n_tokens * INKLING_GPU_HIDDEN)) return false;
+    for (uint32_t row = 0; row < n_tokens; row++)
+        rows[row].current = rows[row].output;
     return true;
 }
 
@@ -64435,10 +64888,28 @@ static bool inkling_gpu_run_visit(
         &engine->inkling_weights.layer[visit->physical_layer];
     const ds4_inkling_gpu_layer_parameters *parameters =
         &context->parameters.layer[visit->physical_layer];
+    const char *disable_batch_ctrl_env =
+        getenv("DS4_INKLING2_DISABLE_BATCH_CTRL");
+    const bool disable_batch_ctrl = disable_batch_ctrl_env &&
+        disable_batch_ctrl_env[0] != '\0' &&
+        strcmp(disable_batch_ctrl_env, "0") != 0;
 
-    for (uint32_t row = 0; row < n_tokens; row++) {
-        if (!inkling_gpu_decoder_layer_norm_inputs(session, visit, block_count,
-                rows[row].current, &rows[row], failed_stage)) return false;
+    const char *force_scalar_input_prep =
+        getenv("DS4_INKLING2_INPUT_PREP_FORCE_SCALAR");
+    const bool use_scalar_input_prep = n_tokens == 1u ||
+        (force_scalar_input_prep && force_scalar_input_prep[0] != '\0' &&
+         strcmp(force_scalar_input_prep, "0") != 0) ||
+        disable_batch_ctrl;
+    if (use_scalar_input_prep) {
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            if (!inkling_gpu_decoder_layer_norm_inputs(session, visit,
+                    block_count, rows[row].current, &rows[row],
+                    failed_stage)) return false;
+        }
+    } else if (!inkling_gpu_decoder_layer_norm_inputs_batch(
+                   session, visit, block_count, n_tokens, rows,
+                   failed_stage)) {
+        return false;
     }
 
     if (failed_stage) *failed_stage = "batched attention projections";
@@ -64481,10 +64952,21 @@ static bool inkling_gpu_run_visit(
         return false;
 
     if (failed_stage) *failed_stage = "attention layer preparation";
-    for (uint32_t row = 0; row < n_tokens; row++) {
-        if (!inkling_gpu_decoder_layer_attention(session, visit, logical_layer,
-                base_position + row,
-                &rows[row], failed_stage)) return false;
+    const char *force_decode_attention =
+        getenv("DS4_INKLING2_ATTN_FORCE_DECODE");
+    const bool use_decode_attention = n_tokens == 1u ||
+        (force_decode_attention && force_decode_attention[0] != '\0' &&
+         strcmp(force_decode_attention, "0") != 0);
+    if (use_decode_attention) {
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            if (!inkling_gpu_decoder_layer_attention(session, visit,
+                    logical_layer, base_position + row, &rows[row],
+                    failed_stage)) return false;
+        }
+    } else if (!inkling_gpu_decoder_layer_attention_batch(session, visit,
+                   logical_layer, base_position, n_tokens, rows,
+                   failed_stage)) {
+        return false;
     }
 
     if (failed_stage) *failed_stage = "batched attention output projection";
@@ -64494,11 +64976,48 @@ static bool inkling_gpu_run_visit(
             INKLING_GPU_HIDDEN, batch->attention_gated_storage, n_tokens))
         return false;
 
+    if (n_tokens > 1u && !disable_batch_ctrl) {
+        if (failed_stage) *failed_stage = "batched post-attention convolution";
+        ds4_inkling_gpu_slot *slot = &context->slots[visit->cache_slot];
+        if (!ds4_gpu_inkling2_shortconv_tensor(
+                batch->ffn_input_storage,
+                slot->conv[DS4_INKLING_CONV_ATTENTION_OUT],
+                batch->attention_output_storage, parameters->attn_post_conv,
+                NULL, n_tokens, INKLING_GPU_HIDDEN, 1u,
+                DS4_INKLING_CONV_KERNEL, rows[0].attn_history_count))
+            return false;
+        const uint32_t initial_history = rows[0].attn_history_count;
+        slot->conv_length[DS4_INKLING_CONV_ATTENTION_OUT] =
+            initial_history + n_tokens < DS4_INKLING_CONV_HISTORY ?
+                initial_history + n_tokens : DS4_INKLING_CONV_HISTORY;
+        for (uint32_t row = 0; row < n_tokens; row++)
+            rows[row].attention_result = batch->ffn_input[row];
+    }
+
     if (failed_stage) *failed_stage = "FFN input preparation";
-    for (uint32_t row = 0; row < n_tokens; row++) {
-        if (!inkling_gpu_decoder_layer_ffn_prepare(session, visit,
-                logical_layer, block_count, rows[row].current, &rows[row],
-                failed_stage)) return false;
+    const char *force_scalar_ffn_prep =
+        getenv("DS4_INKLING2_FFN_PREP_FORCE_SCALAR");
+    const bool use_scalar_ffn_prep = n_tokens == 1u ||
+        (force_scalar_ffn_prep && force_scalar_ffn_prep[0] != '\0' &&
+         strcmp(force_scalar_ffn_prep, "0") != 0) || disable_batch_ctrl;
+    if (use_scalar_ffn_prep) {
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            if (!inkling_gpu_decoder_layer_ffn_prepare(session, visit,
+                    logical_layer, block_count, rows[row].current, &rows[row],
+                    failed_stage)) return false;
+        }
+    } else if (!inkling_gpu_decoder_layer_ffn_prepare_batch(
+                   session, visit, logical_layer, block_count, n_tokens,
+                   rows, failed_stage)) {
+        return false;
+    }
+
+    if (n_tokens > 1u && disable_batch_ctrl && !use_decode_attention) {
+        ds4_inkling_gpu_slot *slot = &context->slots[visit->cache_slot];
+        const uint32_t initial_history = rows[0].attn_history_count;
+        slot->conv_length[DS4_INKLING_CONV_ATTENTION_OUT] =
+            initial_history + n_tokens < DS4_INKLING_CONV_HISTORY ?
+                initial_history + n_tokens : DS4_INKLING_CONV_HISTORY;
     }
 
     if (failed_stage) *failed_stage = "batched SITU top-8 MoE";
@@ -64518,9 +65037,34 @@ static bool inkling_gpu_run_visit(
             g_ds4_inkling_model_config.situ_linear_beta,
             &context->moe)) return false;
 
-    for (uint32_t row = 0; row < n_tokens; row++) {
-        if (!inkling_gpu_decoder_layer_finish(session, visit, &rows[row],
-                                               failed_stage)) return false;
+    if (n_tokens > 1u && !disable_batch_ctrl) {
+        if (failed_stage) *failed_stage = "batched post-FFN convolution";
+        ds4_inkling_gpu_slot *slot = &context->slots[visit->cache_slot];
+        const uint32_t history_count =
+            slot->conv_length[DS4_INKLING_CONV_FFN_OUT];
+        if (!parameters->ffn_post_conv ||
+            history_count > DS4_INKLING_CONV_HISTORY ||
+            !ds4_gpu_inkling2_shortconv_tensor(
+                batch->attention_output_storage,
+                slot->conv[DS4_INKLING_CONV_FFN_OUT],
+                batch->moe_output_storage, parameters->ffn_post_conv, NULL,
+                n_tokens, INKLING_GPU_HIDDEN, 1u,
+                DS4_INKLING_CONV_KERNEL, history_count)) return false;
+        slot->conv_length[DS4_INKLING_CONV_FFN_OUT] =
+            history_count + n_tokens < DS4_INKLING_CONV_HISTORY ?
+                history_count + n_tokens : DS4_INKLING_CONV_HISTORY;
+        for (uint32_t row = 0; row < n_tokens; row++)
+            rows[row].ffn_postconv_result = batch->attention_output[row];
+    }
+
+    if (n_tokens > 1u && !disable_batch_ctrl) {
+        if (!inkling_gpu_decoder_layer_finish_batch(
+                n_tokens, rows, &context->batch, failed_stage)) return false;
+    } else {
+        for (uint32_t row = 0; row < n_tokens; row++) {
+            if (!inkling_gpu_decoder_layer_finish(session, visit, &rows[row],
+                                                   failed_stage)) return false;
+        }
     }
     return true;
 }
@@ -64656,13 +65200,17 @@ static bool inkling_gpu_eval_group(ds4_session *session, const int *tokens,
             block_count++;
     }
     if (ok) {
-        const uint64_t hidden_bytes =
-            (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+        ds4_inkling_gpu_batch_workspace *batch = &context->batch;
+        ds4_gpu_tensor *current_storage = NULL;
+        if (rows[0].current == batch->current[0])
+            current_storage = batch->current_storage;
+        else if (rows[0].current == batch->next[0])
+            current_storage = batch->next_storage;
         ok = block_count == 1u;
-        for (uint32_t row = 0; ok && row < n_tokens; row++) {
-            ok = ds4_gpu_tensor_copy(rows[row].prelude, 0,
-                rows[row].current, 0, hidden_bytes) != 0;
-        }
+        ok = ok && current_storage &&
+            ds4_gpu_inkling2_copy_strided_rows_tensor(
+                batch->prelude_storage, current_storage,
+                INKLING_GPU_HIDDEN, n_tokens, 1u, 0u, 1u, 0u);
         if (!ok) failed_stage = "prelude checkpoint";
     }
 
@@ -64687,16 +65235,21 @@ static bool inkling_gpu_eval_group(ds4_session *session, const int *tokens,
                 block_count++;
         }
         if (ok && pass + 1u < DS4_INKLING_LOOP_PASSES) {
-            const uint64_t hidden_bytes =
-                (uint64_t)INKLING_GPU_HIDDEN * sizeof(float);
+            ds4_inkling_gpu_batch_workspace *batch = &context->batch;
+            ds4_gpu_tensor *current_storage = NULL;
+            if (rows[0].current == batch->current[0])
+                current_storage = batch->current_storage;
+            else if (rows[0].current == batch->next[0])
+                current_storage = batch->next_storage;
             ok = block_count == 3u;
-            for (uint32_t row = 0; ok && row < n_tokens; row++) {
-                ok = ds4_gpu_tensor_copy(rows[row].previous_blocks, 0,
-                        rows[row].current_blocks, 2u * hidden_bytes,
-                        hidden_bytes) &&
-                    ds4_gpu_tensor_copy(rows[row].previous_blocks, hidden_bytes,
-                        rows[row].current, 0, hidden_bytes);
-            }
+            ok = ok && current_storage &&
+                ds4_gpu_inkling2_copy_strided_rows_tensor(
+                    batch->previous_blocks_storage,
+                    batch->current_blocks_storage, INKLING_GPU_HIDDEN,
+                    n_tokens, 4u, 2u, 2u, 0u) &&
+                ds4_gpu_inkling2_copy_strided_rows_tensor(
+                    batch->previous_blocks_storage, current_storage,
+                    INKLING_GPU_HIDDEN, n_tokens, 1u, 0u, 2u, 1u);
             if (!ok) failed_stage = "cross-pass bank snapshot";
         }
     }
@@ -64715,10 +65268,11 @@ static bool inkling_gpu_eval_group(ds4_session *session, const int *tokens,
     const uint32_t output_row = n_tokens - 1u;
     if (ok) {
         ok = visit_index == DS4_INKLING_VISITS && block_count == 4u &&
-            inkling_gpu_mix(context, rows[output_row].current,
-                rows[output_row].current_blocks, block_count,
-                context->parameters.output_res_query, 1u,
-                context->layer.mix_output_rows[0]);
+            ds4_gpu_inkling2_mix_prefill_tensor(
+                context->layer.mix_output_rows[0],
+                rows[output_row].current_blocks, rows[output_row].current,
+                context->parameters.output_res_query, block_count + 1u,
+                4u, INKLING_GPU_HIDDEN, 1u, 1u, 0u, 1, 1, 1.0e-6f);
         if (!ok) failed_stage = "final residual mix";
     }
     if (ok && want_logits)
@@ -64754,6 +65308,19 @@ static bool inkling_gpu_eval_token(ds4_session *session, uint32_t token,
                                   command_mode, error, error_capacity);
 }
 
+static uint32_t inkling_gpu_prefill_batch_limit(void) {
+    const char *value = getenv("DS4_INKLING2_MAX_BATCH");
+    if (!value || !value[0]) return INKLING_GPU_PREFILL_BATCH_TOKENS;
+
+    char *end = NULL;
+    errno = 0;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || errno != 0 || parsed == 0u ||
+        parsed > INKLING_GPU_PREFILL_BATCH_TOKENS)
+        return INKLING_GPU_PREFILL_BATCH_TOKENS;
+    return (uint32_t)parsed;
+}
+
 static int inkling_gpu_prefill(ds4_session *session,
                                const ds4_tokens *prompt, int start,
                                char *error, size_t error_capacity) {
@@ -64765,6 +65332,7 @@ static int inkling_gpu_prefill(ds4_session *session,
     const char *profile_env = getenv("DS4_INKLING_PREFILL_PROFILE");
     const bool profile = profile_env && profile_env[0] &&
                          strcmp(profile_env, "0") != 0;
+    const uint32_t batch_limit = inkling_gpu_prefill_batch_limit();
     const double started = profile ? now_sec() : 0.0;
     double queue_ms = 0.0, finish_ms = 0.0, read_ms = 0.0;
     uint32_t groups = 0, logits_groups = 0;
@@ -64799,8 +65367,9 @@ static int inkling_gpu_prefill(ds4_session *session,
         }
 
         session->checkpoint_valid = false;
-        int group_end = group_start + INKLING_GPU_PREFILL_BATCH_TOKENS;
-        if (group_end > prompt->len) group_end = prompt->len;
+        int group_end = prompt->len;
+        if (prompt->len - group_start > (int)batch_limit)
+            group_end = group_start + (int)batch_limit;
         if (!ds4_gpu_begin_commands()) {
             snprintf(error, error_capacity,
                      "Inkling 2 Mini Metal prefill could not begin a command batch");

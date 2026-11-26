@@ -102,6 +102,7 @@ typedef struct {
     ds4_gpu_tensor *key_storage;
     ds4_gpu_tensor *value_storage;
     ds4_gpu_tensor *relative_storage;
+    ds4_gpu_tensor *relative_bias_storage;
     ds4_gpu_tensor *dynamic_k_storage;
     ds4_gpu_tensor *dynamic_v_storage;
     ds4_gpu_tensor *sink_logits_storage;

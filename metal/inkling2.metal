@@ -67,6 +67,27 @@ struct ds4_metal_args_inkling2_mix {
     float epsilon;
 };
 
+struct ds4_metal_args_inkling2_mix_prefill {
+    uint32_t hidden_dim;
+    uint32_t state_count;
+    uint32_t state_stride;
+    uint32_t query_count;
+    uint32_t n_tokens;
+    uint32_t query_index;
+    uint32_t append_current;
+    uint32_t reverse_states;
+    float epsilon;
+};
+
+struct ds4_metal_args_inkling2_strided_copy {
+    uint32_t width;
+    uint32_t n_tokens;
+    uint32_t source_stride;
+    uint32_t source_slot;
+    uint32_t destination_stride;
+    uint32_t destination_slot;
+};
+
 struct ds4_metal_args_inkling2_control_norm {
     uint32_t hidden_dim;
     float epsilon;
@@ -76,6 +97,7 @@ struct ds4_metal_args_inkling2_control_norm {
 
 struct ds4_metal_args_inkling2_control_update {
     uint32_t hidden_dim;
+    uint32_t n_tokens;
 };
 
 struct ds4_metal_args_inkling2_qk {
@@ -112,6 +134,30 @@ struct ds4_metal_args_inkling2_attention {
     uint32_t has_sink;
     ulong oldest_position;
     ulong query_position;
+};
+
+struct ds4_metal_args_inkling2_attention_prefill {
+    uint32_t query_heads;
+    uint32_t kv_heads;
+    uint32_t head_dim;
+    uint32_t capacity;
+    uint32_t old_count;
+    uint32_t n_tokens;
+    uint32_t sliding_window;
+    uint32_t relative_extent;
+    uint32_t has_sink;
+    ulong oldest_position;
+    ulong first_position;
+};
+
+struct ds4_metal_args_inkling2_kv_append {
+    uint32_t n_tokens;
+    uint32_t kv_heads;
+    uint32_t head_dim;
+    uint32_t capacity;
+    uint32_t first_token;
+    uint32_t pad0;
+    ulong first_position;
 };
 
 struct ds4_metal_args_inkling2_shortconv {
@@ -383,7 +429,7 @@ kernel void kernel_inkling2_expert_route_map(
  * The dequantized IQ4 row is staged ONCE per group in threadgroup memory;
  * each route is then multiplied against the shared row and scattered back
  * to its original route-major position. No dequantized expert bank exists. */
-kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
+kernel void kernel_inkling2_expert_gemm_id_iq4_nl_scalar(
         constant ds4_metal_args_inkling2_expert_gemm &args [[buffer(0)]],
         device const char *weights [[buffer(1)]],
         device const uint *route_map [[buffer(2)]],
@@ -484,6 +530,101 @@ kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
     }
 }
 
+/* Tiled routed IQ4_NL GEMM. One SIMD-group computes up to a 32-route by
+ * 8-output tile using four 8x8 FP32 accumulators. It decodes each IQ4_NL
+ * weight tile once and reuses it across the active route matrices. */
+kernel void kernel_inkling2_expert_gemm_id_iq4_nl(
+        constant ds4_metal_args_inkling2_expert_gemm &args [[buffer(0)]],
+        device const char *weights [[buffer(1)]],
+        device const uint *route_map [[buffer(2)]],
+        device const uint *route_counts [[buffer(3)]],
+        device const float *x [[buffer(4)]],
+        device float *out [[buffer(5)]],
+        threadgroup float *activation_tile [[threadgroup(0)]],
+        threadgroup float *weight_tile [[threadgroup(1)]],
+        threadgroup float *output_tile [[threadgroup(2)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint2 thread_position [[thread_position_in_threadgroup]]) {
+    const uint lane = thread_position.x;
+    const uint output_base = group.x * 8u;
+    const uint expert = group.y;
+    if (output_base >= args.out_dim || expert >= args.n_experts) return;
+
+    const uint count = route_counts[expert];
+    if (count == 0u) return;
+
+    const ulong row_bytes = (ulong)args.blocks_per_row * 18u;
+    device const char *expert_weights =
+        weights + (ulong)expert * args.expert_bytes;
+
+    for (uint route_base = 0u; route_base < count; route_base += 32u) {
+        const uint routes_remaining = count - route_base;
+        const uint matrices = min(4u, (routes_remaining + 7u) / 8u);
+        simdgroup_float8x8 accumulator[4];
+        for (uint m = 0u; m < 4u; m++) {
+            accumulator[m] =
+                make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+        for (uint k_base = 0u; k_base < args.in_dim; k_base += 8u) {
+            for (uint i = lane; i < matrices * 64u; i += 32u) {
+                const uint matrix = i / 64u;
+                const uint element = i % 64u;
+                const uint route_rank = route_base + matrix * 8u + element / 8u;
+                const uint activation_k = k_base + element % 8u;
+                if (route_rank < count) {
+                    const uint route =
+                        route_map[(ulong)expert * args.route_stride + route_rank];
+                    const ulong input_row = args.input_per_expert != 0u ?
+                        (ulong)route : (ulong)(route / args.n_used);
+                    activation_tile[i] =
+                        x[input_row * args.in_dim + activation_k];
+                } else {
+                    activation_tile[i] = 0.0f;
+                }
+            }
+
+            for (uint i = lane; i < 64u; i += 32u) {
+                const uint output_row = output_base + i % 8u;
+                if (output_row < args.out_dim) {
+                    device const char *row_weights = expert_weights +
+                        (ulong)output_row * row_bytes;
+                    const uint weight_k = k_base + i / 8u;
+                    weight_tile[i] = inkling2_iq4_nl_weight(row_weights, weight_k);
+                } else {
+                    weight_tile[i] = 0.0f;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 b;
+            simdgroup_load(b, weight_tile, 8u, 0, false);
+            for (uint m = 0u; m < matrices; m++) {
+                simdgroup_float8x8 a;
+                simdgroup_load(a, activation_tile + m * 64u, 8u, 0, false);
+                simdgroup_multiply_accumulate(
+                    accumulator[m], a, b, accumulator[m]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        for (uint m = 0u; m < matrices; m++)
+            simdgroup_store(accumulator[m], output_tile + m * 64u,
+                            8u, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lane; i < matrices * 64u; i += 32u) {
+            const uint matrix = i / 64u;
+            const uint element = i % 64u;
+            const uint route_rank = route_base + matrix * 8u + element / 8u;
+            const uint output_row = output_base + element % 8u;
+            if (route_rank >= count || output_row >= args.out_dim) continue;
+            const uint route =
+                route_map[(ulong)expert * args.route_stride + route_rank];
+            out[(ulong)route * args.out_dim + output_row] = output_tile[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 static inline float inkling2_tanh_saturating(float value) {
     if (isinf(value)) return value >= 0.0f ? 1.0f : -1.0f;
     if (value >= 10.0f) return 1.0f;
@@ -566,6 +707,122 @@ kernel void kernel_inkling2_mix(
     }
 }
 
+/* Mix one selected query across token-major residual states. The optional
+ * current row is appended after reversing the saved residual blocks. */
+kernel void kernel_inkling2_mix_prefill(
+        constant ds4_metal_args_inkling2_mix_prefill &args [[buffer(0)]],
+        device const float *states [[buffer(1)]],
+        device const float *current [[buffer(2)]],
+        device const float *queries [[buffer(3)]],
+        device float *out [[buffer(4)]],
+        threadgroup float *partial [[threadgroup(0)]],
+        threadgroup float *inverse_norm [[threadgroup(1)]],
+        threadgroup float *scores [[threadgroup(2)]],
+        threadgroup float *mix_weights [[threadgroup(3)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]],
+        uint lanes [[threads_per_threadgroup]]) {
+    if (token >= args.n_tokens) return;
+    const uint source_state_count = args.state_count - args.append_current;
+    const ulong state_row_offset =
+        (ulong)token * args.state_stride * args.hidden_dim;
+    const ulong current_offset = (ulong)token * args.hidden_dim;
+    const ulong query_offset = (ulong)args.query_index * args.hidden_dim;
+    const float score_scale = rsqrt(float(args.hidden_dim));
+
+    for (uint state = 0; state < args.state_count; state++) {
+        const bool appended = args.append_current != 0u &&
+                              state + 1u == args.state_count;
+        const uint source_state = appended ? 0u :
+            (args.reverse_states != 0u
+                ? source_state_count - 1u - state : state);
+        const ulong state_offset = state_row_offset +
+            (ulong)source_state * args.hidden_dim;
+        float sum_sq = 0.0f;
+        for (uint col = lane; col < args.hidden_dim; col += lanes) {
+            const float value = appended ? current[current_offset + col] :
+                                           states[state_offset + col];
+            sum_sq += value * value;
+        }
+        partial[lane] = sum_sq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0u)
+            inverse_norm[state] = rsqrt(partial[0] / float(args.hidden_dim) +
+                                        args.epsilon);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float dot = 0.0f;
+        for (uint col = lane; col < args.hidden_dim; col += lanes) {
+            const float value = appended ? current[current_offset + col] :
+                                           states[state_offset + col];
+            dot += value * inverse_norm[state] * queries[query_offset + col];
+        }
+        partial[lane] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0u) scores[state] = partial[0] * score_scale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        float max_score = -INFINITY;
+        for (uint state = 0; state < args.state_count; state++)
+            max_score = max(max_score, scores[state]);
+        float denominator = 0.0f;
+        for (uint state = 0; state < args.state_count; state++) {
+            mix_weights[state] = exp(scores[state] - max_score);
+            denominator += mix_weights[state];
+        }
+        const float inverse_denominator = 1.0f / denominator;
+        for (uint state = 0; state < args.state_count; state++)
+            mix_weights[state] *= inverse_denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint col = lane; col < args.hidden_dim; col += lanes) {
+        float value = 0.0f;
+        for (uint state = 0; state < args.state_count; state++) {
+            const bool appended = args.append_current != 0u &&
+                                  state + 1u == args.state_count;
+            const uint source_state = appended ? 0u :
+                (args.reverse_states != 0u
+                    ? source_state_count - 1u - state : state);
+            const ulong state_offset = state_row_offset +
+                (ulong)source_state * args.hidden_dim;
+            const float state_value = appended ? current[current_offset + col] :
+                                                 states[state_offset + col];
+            value += mix_weights[state] * inverse_norm[state] * state_value;
+        }
+        out[(ulong)token * args.hidden_dim + col] = value;
+    }
+}
+
+/* Scatter contiguous token rows into a selected residual-bank slot. */
+kernel void kernel_inkling2_strided_copy(
+        constant ds4_metal_args_inkling2_strided_copy &args [[buffer(0)]],
+        device const float *source [[buffer(1)]],
+        device float *destination [[buffer(2)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint element_count = args.width * args.n_tokens;
+    if (index >= element_count) return;
+    const uint token = index / args.width;
+    const uint element = index % args.width;
+    const ulong source_offset =
+        ((ulong)token * args.source_stride + args.source_slot) * args.width +
+        element;
+    const ulong destination_offset =
+        ((ulong)token * args.destination_stride + args.destination_slot) *
+        args.width + element;
+    destination[destination_offset] = source[source_offset];
+}
+
 /* Normalize current and message independently into consecutive rows. */
 kernel void kernel_inkling2_control_prepare(
         constant ds4_metal_args_inkling2_control_norm &args [[buffer(0)]],
@@ -576,8 +833,12 @@ kernel void kernel_inkling2_control_prepare(
         uint row [[threadgroup_position_in_grid]],
         uint lane [[thread_index_in_threadgroup]],
         uint lanes [[threads_per_threadgroup]]) {
-    if (row >= 2u) return;
-    device const float *input = row == 0u ? current : message;
+    const uint n_tokens = args.pad0 == 0u ? 1u : args.pad0;
+    if (row >= 2u * n_tokens) return;
+    const uint token = row / 2u;
+    const uint input_kind = row % 2u;
+    device const float *input = (input_kind == 0u ? current : message) +
+        (ulong)token * args.hidden_dim;
     float sum_sq = 0.0f;
     for (uint col = lane; col < args.hidden_dim; col += lanes) {
         const float value = input[col];
@@ -590,7 +851,8 @@ kernel void kernel_inkling2_control_prepare(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float inverse_norm = rsqrt(partial[0] / float(args.hidden_dim) + args.epsilon);
-    const ulong offset = (ulong)row * args.hidden_dim;
+    const ulong offset = (ulong)token * 2u * args.hidden_dim +
+                         (ulong)input_kind * args.hidden_dim;
     for (uint col = lane; col < args.hidden_dim; col += lanes)
         out[offset + col] = input[col] * inverse_norm;
 }
@@ -604,7 +866,8 @@ kernel void kernel_inkling2_control_update(
         device const float *forget [[buffer(4)]],
         device float *out [[buffer(5)]],
         uint index [[thread_position_in_grid]]) {
-    if (index >= args.hidden_dim) return;
+    const uint n_tokens = args.n_tokens == 0u ? 1u : args.n_tokens;
+    if ((ulong)index >= (ulong)args.hidden_dim * n_tokens) return;
     const float gain_gate = inkling2_tanh_saturating(gain[index]);
     const float forget_gate = inkling2_tanh_saturating(forget[index]);
     out[index] = current[index] - forget_gate * current[index] +
@@ -663,9 +926,11 @@ kernel void kernel_inkling2_qk_prepare(
         uint lanes [[threads_per_threadgroup]]) {
     if (row >= args.rows) return;
     const uint64_t offset = (uint64_t)row * args.width;
+    const uint scale_row = args.pad0 == 0u ? row : row % args.pad0;
+    const uint64_t scale_offset = (uint64_t)scale_row * args.width;
     float sum = 0.0f;
     for (uint col = lane; col < args.width; col += lanes) {
-        const float value = x[offset + col] * learned_scale[offset + col];
+        const float value = x[offset + col] * learned_scale[scale_offset + col];
         sum += value * value;
     }
     partial[lane] = sum;
@@ -679,13 +944,15 @@ kernel void kernel_inkling2_qk_prepare(
     float log_scale = 1.0f;
     if (args.apply_log_scale != 0u) {
         const ulong position = args.scalar_position_enabled != 0u
-            ? args.scalar_position : positions[row];
+            ? args.scalar_position +
+                (args.pad0 == 0u ? 0u : row / args.pad0)
+            : positions[row];
         const float ratio = max((float(position) + 1.0f) /
                                 args.log_scale_floor, 1.0f);
         log_scale += args.log_scale_alpha * log(ratio);
     }
     for (uint col = lane; col < args.width; col += lanes) {
-        out[offset + col] = x[offset + col] * learned_scale[offset + col] *
+        out[offset + col] = x[offset + col] * learned_scale[scale_offset + col] *
                             clip * log_scale;
     }
 }
@@ -704,7 +971,9 @@ kernel void kernel_inkling2_relative_bias(
     const uint key = index % args.keys;
     const uint head = (index / args.keys) % args.heads;
     const uint row = index / ((uint64_t)args.keys * args.heads);
-    const long distance = relative_distances[(uint64_t)row * args.keys + key];
+    const uint64_t distance_index = args.pad0 == 0u
+        ? key : (uint64_t)row * args.pad0 + key;
+    const long distance = relative_distances[distance_index];
     float sum = 0.0f;
     if (distance >= 0 && (ulong)distance < args.relative_extent) {
         const uint64_t state_offset =
@@ -797,6 +1066,137 @@ kernel void kernel_inkling2_attention_decode(
         out[(uint64_t)head * args.head_dim + lane] = denominator > 0.0f
             ? accumulated_value[lane] / denominator : 0.0f;
     }
+}
+
+/* Causal prefill attention reads the previous context from the ring and the
+ * current chunk from contiguous FP32 K/V rows. This keeps early queries from
+ * observing cache slots overwritten by later tokens in the same chunk. */
+kernel void kernel_inkling2_attention_prefill(
+        constant ds4_metal_args_inkling2_attention_prefill &args [[buffer(0)]],
+        device const float *query [[buffer(1)]],
+        device const half *key_cache [[buffer(2)]],
+        device const half *value_cache [[buffer(3)]],
+        device const float *new_key [[buffer(4)]],
+        device const float *new_value [[buffer(5)]],
+        device const float *relative_bias [[buffer(6)]],
+        device const float *sink_logits [[buffer(7)]],
+        device float *out [[buffer(8)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint2 thread_position [[thread_position_in_threadgroup]],
+        uint2 threads_per_threadgroup [[threads_per_threadgroup]]) {
+    const uint lane = thread_position.x;
+    const uint lanes = threads_per_threadgroup.x;
+    const uint head = group.x;
+    const uint token = group.y;
+    if (head >= args.query_heads || token >= args.n_tokens) return;
+
+    threadgroup float partial[128];
+    threadgroup float accumulated_value[128];
+    threadgroup float current_logit;
+    threadgroup float maximum;
+    threadgroup float denominator;
+    threadgroup float old_scale;
+    threadgroup float new_scale;
+
+    const uint heads_per_kv = args.query_heads / args.kv_heads;
+    const uint kv_head = head / heads_per_kv;
+    const ulong query_position = args.first_position + token;
+    const ulong batch_end = args.first_position + args.n_tokens;
+    ulong key_start = args.oldest_position;
+    const ulong key_end = min(batch_end, query_position + 1ul);
+    if (args.sliding_window != 0u) {
+        const ulong window_start = query_position + 1ul > args.sliding_window
+            ? query_position + 1ul - args.sliding_window : 0ul;
+        key_start = max(key_start, window_start);
+    }
+    key_start = min(key_start, key_end);
+    const float scale = rsqrt((float)args.head_dim);
+    const ulong query_row = (ulong)token * args.query_heads + head;
+    const float sink = args.has_sink != 0u
+        ? sink_logits[query_row] : -FLT_MAX;
+    const device float *q = query + query_row * args.head_dim;
+    accumulated_value[lane] = 0.0f;
+    if (lane == 0u) {
+        maximum = sink;
+        denominator = args.has_sink != 0u ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (ulong position = key_start; position < key_end; position++) {
+        const bool from_batch = position >= args.first_position;
+        const uint ring = (uint)(position % args.capacity);
+        const ulong old_row =
+            ((ulong)ring * args.kv_heads + kv_head) * args.head_dim;
+        const ulong batch_row =
+            ((position - args.first_position) * args.kv_heads + kv_head) *
+            args.head_dim;
+        float dot_value = 0.0f;
+        for (uint dim = lane; dim < args.head_dim; dim += lanes) {
+            const float key_value = from_batch
+                ? float(half(new_key[batch_row + dim]))
+                : float(key_cache[old_row + dim]);
+            dot_value += q[dim] * key_value;
+        }
+        partial[lane] = dot_value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) partial[lane] += partial[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const ulong distance = query_position - position;
+        const float bias = args.relative_extent != 0u &&
+                           distance < args.relative_extent
+            ? relative_bias[query_row * args.relative_extent + distance] : 0.0f;
+        if (lane == 0u) {
+            current_logit = partial[0] * scale + bias;
+            const float next_maximum = max(maximum, current_logit);
+            old_scale = denominator == 0.0f
+                ? 0.0f : exp(maximum - next_maximum);
+            new_scale = exp(current_logit - next_maximum);
+            denominator = denominator * old_scale + new_scale;
+            maximum = next_maximum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float value = lane < args.head_dim
+            ? (from_batch
+                ? float(half(new_value[batch_row + lane]))
+                : float(value_cache[old_row + lane]))
+            : 0.0f;
+        accumulated_value[lane] = accumulated_value[lane] * old_scale +
+                                  new_scale * value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane < args.head_dim) {
+        out[query_row * args.head_dim + lane] = denominator > 0.0f
+            ? accumulated_value[lane] / denominator : 0.0f;
+    }
+}
+
+/* Convert and append a batch into the FP16 ring after all causal queries have
+ * consumed the old cache. For batches longer than the ring, each ring slot is
+ * written exactly once by retaining only the newest rows. */
+kernel void kernel_inkling2_kv_append_rows(
+        constant ds4_metal_args_inkling2_kv_append &args [[buffer(0)]],
+        device const float *new_key [[buffer(1)]],
+        device const float *new_value [[buffer(2)]],
+        device half *key_cache [[buffer(3)]],
+        device half *value_cache [[buffer(4)]],
+        uint index [[thread_position_in_grid]]) {
+    const uint kv_width = args.kv_heads * args.head_dim;
+    const uint append_tokens = args.n_tokens - args.first_token;
+    const uint append_elements = append_tokens * kv_width;
+    if (index >= append_elements) return;
+
+    const uint token = index / kv_width;
+    const uint element = index % kv_width;
+    const uint source_token = args.first_token + token;
+    const uint ring = (uint)((args.first_position + source_token) % args.capacity);
+    const ulong cache_offset = (ulong)ring * kv_width + element;
+    const ulong source_offset = (ulong)source_token * kv_width + element;
+    key_cache[cache_offset] = half(new_key[source_offset]);
+    value_cache[cache_offset] = half(new_value[source_offset]);
 }
 
 /* The attention gate is a sigmoid projection of the layer input, applied

@@ -1130,6 +1130,55 @@ cleanup:
     return ok;
 }
 
+static int test_expert_route_map_512(void) {
+    enum { TOKENS = 512, EXPERTS = 128, USED = 8, ROUTES = TOKENS * USED };
+    const uint64_t route_map_bytes =
+        (uint64_t)EXPERTS * ROUTES * sizeof(uint32_t);
+    int ok = 1;
+    int32_t ids[ROUTES];
+    uint32_t counts[EXPERTS];
+    uint32_t *routes = malloc((size_t)route_map_bytes);
+    ds4_gpu_tensor *tid = NULL;
+
+    for (uint32_t token = 0; token < TOKENS; token++) {
+        for (uint32_t slot = 0; slot < USED; slot++) {
+            ids[token * USED + slot] =
+                (int32_t)((token * 7u + slot * 13u) % EXPERTS);
+        }
+    }
+    tid = upload(ids, sizeof(ids));
+    CHECK(routes && tid);
+    CHECK(ds4_gpu_tensor_bytes(g_operator_context.moe.route_map) >=
+          route_map_bytes);
+    CHECK(ds4_gpu_inkling2_expert_route_map_rows_tensor(
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tid, TOKENS, EXPERTS, USED));
+    CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_counts, 0,
+                              counts, sizeof(counts)));
+    CHECK(ds4_gpu_tensor_read(g_operator_context.moe.route_map, 0,
+                              routes, route_map_bytes));
+
+    uint32_t total = 0;
+    for (uint32_t expert = 0; expert < EXPERTS; expert++) {
+        CHECK(counts[expert] <= ROUTES);
+        uint32_t previous = 0;
+        for (uint32_t rank = 0; rank < counts[expert]; rank++) {
+            const uint32_t route = routes[expert * ROUTES + rank];
+            CHECK(route < ROUTES);
+            CHECK(ids[route] == (int32_t)expert);
+            CHECK(rank == 0u || route > previous);
+            previous = route;
+            total++;
+        }
+    }
+    CHECK(total == ROUTES);
+
+cleanup:
+    free(routes);
+    ds4_gpu_tensor_free(tid);
+    return ok;
+}
+
 static int report_expert_iq4_parity(const char *label,
                                     const float *gemv,
                                     const float *gemm,
@@ -1162,7 +1211,7 @@ static int report_expert_iq4_parity(const char *label,
  * Only experts 0..7 have routes, so the remaining weight pages stay zero while
  * the buffer still describes the complete 128-expert tensor layout. */
 static int test_expert_grouped_iq4_full_shape(void) {
-    enum { TOKENS = 32, EXPERTS = 128, USED = 8,
+    enum { TOKENS = 512, EXPERTS = 128, USED = 8,
            HIDDEN = 2304, FFN = 1152, ROUTES = TOKENS * USED };
     const uint32_t gate_out_dim = 2u * FFN;
     const uint32_t gate_row_bytes = HIDDEN / 32u * 18u;
@@ -1180,7 +1229,9 @@ static int test_expert_grouped_iq4_full_shape(void) {
     const long page = sysconf(_SC_PAGESIZE);
     uint64_t allocation = 0;
     int ok = 0, model_map_set = 0;
-    void *input = NULL, *gate_a = NULL, *gate_b = NULL;
+    int scalar_env_modified = 0;
+    char *saved_scalar_env = NULL;
+    void *input = NULL, *gate_a = NULL, *gate_b = NULL, *gate_scalar = NULL;
     void *down_a = NULL, *down_b = NULL, *stale = NULL;
     uint32_t *stale_route_map = NULL, *stale_route_counts = NULL;
     ds4_gpu_tensor *tid = NULL, *tx = NULL, *gate_ref = NULL;
@@ -1213,6 +1264,7 @@ static int test_expert_grouped_iq4_full_shape(void) {
     input = malloc((size_t)input_bytes);
     gate_a = malloc((size_t)output_bytes);
     gate_b = malloc((size_t)output_bytes);
+    gate_scalar = malloc((size_t)output_bytes);
     down_a = malloc((size_t)output_bytes);
     down_b = malloc((size_t)output_bytes);
     stale = malloc((size_t)output_bytes);
@@ -1228,7 +1280,7 @@ static int test_expert_grouped_iq4_full_shape(void) {
     }
     stale_route_map = malloc((size_t)route_map_bytes);
     stale_route_counts = malloc((size_t)route_counts_bytes);
-    if (!input || !gate_a || !gate_b || !down_a || !down_b || !stale ||
+    if (!input || !gate_a || !gate_b || !gate_scalar || !down_a || !down_b || !stale ||
         !stale_route_map || !stale_route_counts) {
         fprintf(stderr, "Inkling2 full-shape GEMM host allocation failed\n");
         goto cleanup;
@@ -1238,7 +1290,10 @@ static int test_expert_grouped_iq4_full_shape(void) {
     for (uint32_t token = 0; token < TOKENS; token++) {
         for (uint32_t col = 0; col < HIDDEN; col++) {
             const int32_t q = (int32_t)((token * 31u + col * 17u) % 251u) - 125;
-            ((float *)input)[(uint64_t)token * HIDDEN + col] = (float)q / 2048.0f;
+            const float jitter = 0.00048828125f *
+                sinf((float)(token + 1u) * (float)(col + 3u) * 0.017f);
+            ((float *)input)[(uint64_t)token * HIDDEN + col] =
+                (float)q / 2048.0f + jitter;
         }
         for (uint32_t slot = 0; slot < USED; slot++)
             ids[token * USED + slot] = (int32_t)slot;
@@ -1285,6 +1340,15 @@ static int test_expert_grouped_iq4_full_shape(void) {
     CHECK(ds4_gpu_inkling2_expert_gemv_rows_tensor(
         gate_ref, g_full_shape_iq4_map, allocation, gate_offset, 20u,
         HIDDEN, gate_out_dim, EXPERTS, USED, TOKENS, 0, tid, tx));
+    const char *prior_scalar_env = getenv("DS4_INKLING2_MOE_FORCE_SCALAR");
+    if (prior_scalar_env) {
+        const size_t prior_scalar_len = strlen(prior_scalar_env) + 1u;
+        saved_scalar_env = malloc(prior_scalar_len);
+        CHECK(saved_scalar_env != NULL);
+        memcpy(saved_scalar_env, prior_scalar_env, prior_scalar_len);
+    }
+    scalar_env_modified = 1;
+    CHECK(unsetenv("DS4_INKLING2_MOE_FORCE_SCALAR") == 0);
     CHECK(ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
         gate_gemm, g_full_shape_iq4_map, allocation, gate_offset,
         HIDDEN, gate_out_dim, EXPERTS, USED, TOKENS, 0,
@@ -1307,6 +1371,31 @@ static int test_expert_grouped_iq4_full_shape(void) {
     CHECK(ds4_gpu_tensor_read(gate_gemm, 0, gate_b, output_bytes));
     CHECK(ds4_gpu_tensor_read(down_ref, 0, down_a, output_bytes));
     CHECK(ds4_gpu_tensor_read(down_gemm, 0, down_b, output_bytes));
+
+    CHECK(setenv("DS4_INKLING2_MOE_FORCE_SCALAR", "1", 1) == 0);
+    CHECK(ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
+        gate_gemm, g_full_shape_iq4_map, allocation, gate_offset,
+        HIDDEN, gate_out_dim, EXPERTS, USED, TOKENS, 0,
+        g_operator_context.moe.route_map,
+        g_operator_context.moe.route_counts, tx));
+    CHECK(ds4_gpu_tensor_read(gate_gemm, 0, gate_scalar, output_bytes));
+    CHECK(unsetenv("DS4_INKLING2_MOE_FORCE_SCALAR") == 0);
+    double max_matrix_delta = 0.0;
+    uint64_t nonfinite_matrix_delta = 0;
+    for (uint64_t i = 0; i < output_count; i++) {
+        if (!isfinite(((float *)gate_b)[i]) || !isfinite(((float *)gate_scalar)[i])) {
+            nonfinite_matrix_delta++;
+            continue;
+        }
+        const double delta = fabs((double)((float *)gate_b)[i] -
+                                  (double)((float *)gate_scalar)[i]);
+        if (delta > max_matrix_delta) max_matrix_delta = delta;
+    }
+    fprintf(stderr,
+            "Inkling2 full-shape IQ4_NL tiled/scalar: max_abs=%.9g nonfinite=%llu\n",
+            max_matrix_delta, (unsigned long long)nonfinite_matrix_delta);
+    CHECK(nonfinite_matrix_delta == 0);
+    CHECK(max_matrix_delta > 1e-7);
     CHECK(report_expert_iq4_parity("gate/up", gate_a, gate_b,
                                   (size_t)output_count));
     CHECK(report_expert_iq4_parity("down", down_a, down_b,
@@ -1314,6 +1403,10 @@ static int test_expert_grouped_iq4_full_shape(void) {
     ok = 1;
 
 cleanup:
+    if (scalar_env_modified) {
+        if (saved_scalar_env) setenv("DS4_INKLING2_MOE_FORCE_SCALAR", saved_scalar_env, 1);
+        else unsetenv("DS4_INKLING2_MOE_FORCE_SCALAR");
+    }
     if (model_map_set &&
         !ds4_gpu_set_model_map(g_synthetic_moe_map, g_synthetic_moe_size)) {
         fprintf(stderr, "Inkling2 full-shape GEMM model map restore failed\n");
@@ -1329,11 +1422,13 @@ cleanup:
     free(input);
     free(gate_a);
     free(gate_b);
+    free(gate_scalar);
     free(down_a);
     free(down_b);
     free(stale);
     free(stale_route_map);
     free(stale_route_counts);
+    free(saved_scalar_env);
     return ok;
 }
 
@@ -1410,6 +1505,98 @@ static int test_loop_mix_and_control_metal(void) {
         }
     }
 
+    enum { MIX_ROWS = 3 };
+    float batch_states[MIX_ROWS * STATES * HIDDEN];
+    float batch_current[MIX_ROWS * HIDDEN];
+    float reference_states[MIX_ROWS * STATES * HIDDEN];
+    float expected_batch_mix[QUERIES * MIX_ROWS * HIDDEN];
+    float actual_batch_mix[QUERIES * MIX_ROWS * HIDDEN];
+    ds4_gpu_tensor *tbatch_states = NULL;
+    ds4_gpu_tensor *tbatch_current_for_mix = NULL;
+    ds4_gpu_tensor *tbatch_mix = NULL;
+    float max_batch_mix_error = 0.0f;
+    for (uint32_t scenario = 0; mix_ok && scenario < 2u; scenario++) {
+        const uint32_t state_count = scenario == 0u ? STATES : STATES;
+        const uint32_t source_states = scenario == 0u ? STATES : STATES - 1u;
+        for (uint32_t row = 0; row < MIX_ROWS; row++) {
+            for (uint32_t state = 0; state < source_states; state++) {
+                for (uint32_t i = 0; i < HIDDEN; i++) {
+                    const uint64_t index =
+                        ((uint64_t)row * source_states + state) * HIDDEN + i;
+                    batch_states[index] =
+                        sinf((float)(state + row + 1u) *
+                             (float)(i + 1u) * 0.071f) +
+                        (float)(row + state) * 0.03f;
+                }
+            }
+            for (uint32_t i = 0; i < HIDDEN; i++)
+                batch_current[(uint64_t)row * HIDDEN + i] =
+                    cosf((float)(row + 2u) * (float)(i + 1u) * 0.053f);
+
+            for (uint32_t state = 0; state < state_count; state++) {
+                const uint32_t source_state = scenario == 0u ? state :
+                    (state + 1u == state_count ? 0u : source_states - state - 1u);
+                const float *source = scenario == 0u ?
+                    batch_states + ((uint64_t)row * source_states + source_state) * HIDDEN :
+                    (state + 1u == state_count ?
+                        batch_current + (uint64_t)row * HIDDEN :
+                        batch_states + ((uint64_t)row * source_states + source_state) * HIDDEN);
+                memcpy(reference_states +
+                        ((uint64_t)row * state_count + state) * HIDDEN,
+                       source, (size_t)HIDDEN * sizeof(float));
+            }
+            float reference_row[QUERIES * HIDDEN];
+            if (!ds4_inkling_mix_ref(reference_row,
+                    reference_states + (uint64_t)row * state_count * HIDDEN,
+                    queries, state_count, HIDDEN, QUERIES, 1e-6f)) {
+                mix_ok = 0;
+                break;
+            }
+            for (uint32_t query = 0; query < QUERIES; query++)
+                memcpy(expected_batch_mix +
+                        ((uint64_t)query * MIX_ROWS + row) * HIDDEN,
+                       reference_row + (uint64_t)query * HIDDEN,
+                       (size_t)HIDDEN * sizeof(float));
+        }
+        if (!mix_ok) break;
+        ds4_gpu_tensor_free(tbatch_states);
+        ds4_gpu_tensor_free(tbatch_current_for_mix);
+        ds4_gpu_tensor_free(tbatch_mix);
+        const uint64_t state_bytes =
+            (uint64_t)MIX_ROWS * source_states * HIDDEN * sizeof(float);
+        tbatch_states = upload(batch_states, state_bytes);
+        tbatch_current_for_mix = scenario == 0u ? NULL :
+            upload(batch_current, sizeof(batch_current));
+        tbatch_mix = ds4_gpu_tensor_alloc(sizeof(actual_batch_mix));
+        mix_ok = tbatch_states && tbatch_mix &&
+            (scenario == 0u || tbatch_current_for_mix);
+        for (uint32_t query = 0; mix_ok && query < QUERIES; query++) {
+            ds4_gpu_tensor *query_output = ds4_gpu_tensor_view(tbatch_mix,
+                (uint64_t)query * MIX_ROWS * HIDDEN * sizeof(float),
+                (uint64_t)MIX_ROWS * HIDDEN * sizeof(float));
+            mix_ok = query_output && ds4_gpu_inkling2_mix_prefill_tensor(
+                query_output, tbatch_states, tbatch_current_for_mix,
+                tqueries, state_count, source_states, HIDDEN, QUERIES,
+                MIX_ROWS, query,
+                scenario != 0u, scenario != 0u, 1e-6f);
+            ds4_gpu_tensor_free(query_output);
+        }
+        mix_ok = mix_ok && ds4_gpu_tensor_read(tbatch_mix, 0,
+            actual_batch_mix, sizeof(actual_batch_mix));
+        for (uint32_t i = 0; mix_ok && i < QUERIES * MIX_ROWS * HIDDEN; i++) {
+            if (!near_record(actual_batch_mix[i], expected_batch_mix[i],
+                             4e-5f, &max_batch_mix_error)) {
+                fprintf(stderr,
+                        "Inkling2 prefill mix mismatch scenario=%u i=%u\n",
+                        scenario, i);
+                mix_ok = 0;
+            }
+        }
+    }
+    ds4_gpu_tensor_free(tbatch_states);
+    ds4_gpu_tensor_free(tbatch_current_for_mix);
+    ds4_gpu_tensor_free(tbatch_mix);
+
     float current[HIDDEN], message[HIDDEN], expected_control[HIDDEN];
     float actual_control[HIDDEN];
     for (uint32_t i = 0; i < HIDDEN; i++) {
@@ -1440,9 +1627,74 @@ static int test_loop_mix_and_control_metal(void) {
         }
     }
 
+    enum { CONTROL_ROWS = 3 };
+    float control_batch_current[CONTROL_ROWS * HIDDEN];
+    float control_batch_message[CONTROL_ROWS * HIDDEN];
+    float expected_batch_control[CONTROL_ROWS * HIDDEN];
+    float actual_batch_control[CONTROL_ROWS * HIDDEN];
+    for (uint32_t row = 0; row < CONTROL_ROWS; row++) {
+        for (uint32_t i = 0; i < HIDDEN; i++) {
+            const uint64_t index = (uint64_t)row * HIDDEN + i;
+            control_batch_current[index] =
+                sinf((float)(i + row * 3u) * 0.17f) * 0.8f;
+            control_batch_message[index] =
+                cosf((float)(i + row * 5u) * 0.11f) * 0.6f;
+        }
+        if (!ds4_inkling_control_ref(
+                expected_batch_control + (uint64_t)row * HIDDEN,
+                control_batch_current + (uint64_t)row * HIDDEN,
+                control_batch_message + (uint64_t)row * HIDDEN,
+                down, gain, forget, HIDDEN, RANK, 1e-6f)) control_ok = 0;
+    }
+    ds4_gpu_tensor *tbatch_current = upload(
+        control_batch_current, sizeof(control_batch_current));
+    ds4_gpu_tensor *tbatch_message = upload(
+        control_batch_message, sizeof(control_batch_message));
+    ds4_gpu_tensor *tbatch_control =
+        ds4_gpu_tensor_alloc(sizeof(actual_batch_control));
+    ds4_inkling_gpu_control_workspace batch_workspace = {0};
+    batch_workspace.normalized = ds4_gpu_tensor_alloc(
+        (uint64_t)CONTROL_ROWS * 2u * HIDDEN * sizeof(float));
+    batch_workspace.bottleneck = ds4_gpu_tensor_alloc(
+        (uint64_t)CONTROL_ROWS * RANK * sizeof(float));
+    batch_workspace.gain = ds4_gpu_tensor_alloc(
+        (uint64_t)CONTROL_ROWS * HIDDEN * sizeof(float));
+    batch_workspace.forget = ds4_gpu_tensor_alloc(
+        (uint64_t)CONTROL_ROWS * HIDDEN * sizeof(float));
+    float max_batch_control_error = 0.0f;
+    int batch_control_ok = control_ok && tbatch_current && tbatch_message &&
+        tbatch_control && batch_workspace.normalized &&
+        batch_workspace.bottleneck && batch_workspace.gain &&
+        batch_workspace.forget &&
+        ds4_inkling_control_metal_batch_with_workspace(
+            tbatch_control, tbatch_current, tbatch_message,
+            g_synthetic_loop_map, model_size, down_offset, gain_offset,
+            forget_offset, HIDDEN, RANK, CONTROL_ROWS, 1e-6f,
+            &batch_workspace) &&
+        ds4_gpu_tensor_read(tbatch_control, 0, actual_batch_control,
+                            sizeof(actual_batch_control));
+    for (uint32_t i = 0; batch_control_ok &&
+                         i < CONTROL_ROWS * HIDDEN; i++) {
+        if (!near_record(actual_batch_control[i], expected_batch_control[i],
+                         5e-5f, &max_batch_control_error)) {
+            fprintf(stderr,
+                    "Inkling2 batched loop control mismatch i=%u got=%g expected=%g\n",
+                    i, actual_batch_control[i], expected_batch_control[i]);
+            batch_control_ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tbatch_current);
+    ds4_gpu_tensor_free(tbatch_message);
+    ds4_gpu_tensor_free(tbatch_control);
+    ds4_gpu_tensor_free(batch_workspace.normalized);
+    ds4_gpu_tensor_free(batch_workspace.bottleneck);
+    ds4_gpu_tensor_free(batch_workspace.gain);
+    ds4_gpu_tensor_free(batch_workspace.forget);
+    control_ok = control_ok && batch_control_ok;
+
     if (mix_ok && control_ok) {
-        printf("Inkling2 loop mix/control max absolute error: %.9g / %.9g\n",
-               max_mix_error, max_control_error);
+        printf("Inkling2 loop mix/control max absolute error: %.9g / %.9g (batch %.9g)\n",
+               max_mix_error, max_control_error, max_batch_control_error);
     }
 
     ds4_gpu_tensor_free(tstates);
@@ -1481,7 +1733,8 @@ static int test_gpu_context_owns_independent_visit_state(void) {
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 2048u, &bytes_2048));
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 8192u, &bytes_8192));
     CHECK(bytes_8192 > bytes_2048);
-    CHECK(bytes_8192 < 450u * 1024u * 1024u);
+    CHECK(bytes_8192 > 690u * 1024u * 1024u &&
+          bytes_8192 < 720u * 1024u * 1024u);
     CHECK(ds4_inkling_gpu_context_required_bytes(&plan, 65536u,
                                                 &bytes_65536));
     CHECK(bytes_65536 > bytes_8192);
@@ -1521,6 +1774,7 @@ static int test_gpu_context_owns_independent_visit_state(void) {
           context.current_blocks != context.previous_blocks);
     CHECK(context.input_token && context.embedding && context.activation &&
           context.logits && context.scratch);
+    CHECK(context.batch.relative_bias_storage != NULL);
     CHECK(context.control.normalized && context.control.bottleneck &&
           context.control.gain && context.control.forget);
     CHECK(context.moe.logits && context.moe.ids && context.moe.weights &&
@@ -1582,6 +1836,51 @@ static int test_qk_and_relative_bias(void) {
             ok = 0;
         }
     }
+
+    const float prefill_input[] = {
+        3.0f, 4.0f, 1.0f, -2.0f,
+        2.0f, 1.0f, -3.0f, 4.0f,
+        5.0f, 2.0f, -2.0f, -2.0f,
+    };
+    const float prefill_scale[] = { 1.0f, 0.5f, 2.0f, 1.5f };
+    const float expanded_prefill_scale[] = {
+        1.0f, 0.5f, 2.0f, 1.5f,
+        1.0f, 0.5f, 2.0f, 1.5f,
+        1.0f, 0.5f, 2.0f, 1.5f,
+    };
+    const uint64_t prefill_positions[] = { 5u, 5u, 6u, 6u, 7u, 7u };
+    const uint64_t prefill_first_position = 5u;
+    float prefill_expected[12], prefill_actual[12];
+    if (!ds4_inkling_prepare_qk(prefill_expected, prefill_input,
+            expanded_prefill_scale, prefill_positions,
+            6u, 2u, 3.0f, 0.5f, 8.0f, 1)) return 0;
+    ds4_gpu_tensor *tpi = upload(prefill_input, sizeof(prefill_input));
+    ds4_gpu_tensor *tps = upload(prefill_scale, sizeof(prefill_scale));
+    ds4_gpu_tensor *tpo = ds4_gpu_tensor_alloc(sizeof(prefill_actual));
+    ok = tpi && tps && tpo &&
+        ds4_gpu_inkling2_qk_prepare_prefill_tensor(
+            tpo, tpi, tps, 3u, 2u, 2u, 3.0f, 0.5f, 8.0f,
+            prefill_first_position, 1) &&
+        ds4_gpu_tensor_read(tpo, 0, prefill_actual, sizeof(prefill_actual));
+    for (uint32_t i = 0; ok && i < 12u; i++) {
+        if (!near_record(prefill_actual[i], prefill_expected[i], 2e-5f,
+                         &g_m4_qk_relative_max_error)) {
+            fprintf(stderr,
+                    "Inkling2 prefill QK prepare mismatch i=%u got=%g expected=%g\n",
+                    i, prefill_actual[i], prefill_expected[i]);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tpi);
+    ds4_gpu_tensor_free(tps);
+    ds4_gpu_tensor_free(tpo);
+    if (!ok) {
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(ts);
+        ds4_gpu_tensor_free(tp);
+        ds4_gpu_tensor_free(to);
+        return 0;
+    }
     ds4_gpu_tensor_free(tx);
     ds4_gpu_tensor_free(ts);
     ds4_gpu_tensor_free(tp);
@@ -1599,7 +1898,8 @@ static int test_qk_and_relative_bias(void) {
     ds4_gpu_tensor *td = upload(distances, sizeof(distances));
     ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(sizeof(actual_bias));
     ok = tr && tt && td && tb &&
-        ds4_gpu_inkling2_relative_bias_tensor(tb, tr, tt, td, 1, 2, 2, 3, 2) &&
+        ds4_gpu_inkling2_relative_bias_tensor(tb, tr, tt, td,
+            1, 2, 2, 3, 2, 2) &&
         ds4_gpu_tensor_read(tb, 0, actual_bias, sizeof(actual_bias));
     for (uint32_t i = 0; ok && i < 4; i++) {
         if (!near_record(actual_bias[i], expected_bias[i], 2e-6f,
@@ -1608,6 +1908,38 @@ static int test_qk_and_relative_bias(void) {
             ok = 0;
         }
     }
+
+    const float batch_states[] = {
+        1.0f, 2.0f, -1.0f, 0.5f,
+        2.0f, -1.0f, 0.25f, 3.0f,
+    };
+    const float batch_projection[] = { 1.0f, 2.0f, 3.0f, -2.0f, 1.0f, 0.0f };
+    const int64_t shared_distances[] = { 0, 2 };
+    const int64_t expanded_distances[] = { 0, 2, 0, 2 };
+    float expected_batch_bias[8], actual_batch_bias[8];
+    ok = ok && ds4_inkling_relative_bias(expected_batch_bias, batch_states,
+        batch_projection, expanded_distances, 2, 2, 2, 3, 2);
+    ds4_gpu_tensor *tbrs = upload(batch_states, sizeof(batch_states));
+    ds4_gpu_tensor *tbrp = upload(batch_projection, sizeof(batch_projection));
+    ds4_gpu_tensor *tbrd = upload(shared_distances, sizeof(shared_distances));
+    ds4_gpu_tensor *tbbo = ds4_gpu_tensor_alloc(sizeof(actual_batch_bias));
+    ok = ok && tbrs && tbrp && tbrd && tbbo &&
+        ds4_gpu_inkling2_relative_bias_tensor(tbbo, tbrs, tbrp, tbrd,
+            2u, 2u, 2u, 3u, 2u, 0u) &&
+        ds4_gpu_tensor_read(tbbo, 0, actual_batch_bias,
+                            sizeof(actual_batch_bias));
+    for (uint32_t i = 0; ok && i < 8u; i++) {
+        if (!near_record(actual_batch_bias[i], expected_batch_bias[i], 2e-6f,
+                         &g_m4_qk_relative_max_error)) {
+            fprintf(stderr,
+                    "Inkling2 shared-distance relative bias mismatch i=%u\n", i);
+            ok = 0;
+        }
+    }
+    ds4_gpu_tensor_free(tbrs);
+    ds4_gpu_tensor_free(tbrp);
+    ds4_gpu_tensor_free(tbrd);
+    ds4_gpu_tensor_free(tbbo);
     ds4_gpu_tensor_free(tr);
     ds4_gpu_tensor_free(tt);
     ds4_gpu_tensor_free(td);
@@ -1638,6 +1970,207 @@ static int test_attention_output_gate(void) {
     ds4_gpu_tensor_free(ta);
     ds4_gpu_tensor_free(tg);
     ds4_gpu_tensor_free(to);
+    return ok;
+}
+
+static int test_attention_prefill_matches_decode(void) {
+    enum { CAPACITY = 8, MAX_TOKENS = 4, QH = 4, KVH = 2,
+           DIM = 4, EXTENT = 4, KV_WIDTH = KVH * DIM,
+           QUERY_WIDTH = QH * DIM };
+    static const float half_values[8] = {
+        0.25f, 0.5f, 1.0f, -0.25f, -0.5f, -1.0f, 1.5f, 2.0f,
+    };
+    static const uint16_t half_bits[8] = {
+        0x3400u, 0x3800u, 0x3c00u, 0xb400u,
+        0xb800u, 0xbc00u, 0x3e00u, 0x4000u,
+    };
+    const uint64_t cache_elements = (uint64_t)CAPACITY * KV_WIDTH;
+    const uint64_t cache_bytes = cache_elements * sizeof(uint16_t);
+    const uint64_t query_row_bytes = (uint64_t)QUERY_WIDTH * sizeof(float);
+    const uint64_t key_row_bytes = (uint64_t)KV_WIDTH * sizeof(float);
+    const uint64_t bias_row_bytes = (uint64_t)QH * EXTENT * sizeof(float);
+    const uint64_t sink_row_bytes = (uint64_t)QH * sizeof(float);
+    const uint64_t output_bytes =
+        (uint64_t)MAX_TOKENS * QUERY_WIDTH * sizeof(float);
+    uint16_t old_keys[CAPACITY * KV_WIDTH] = { 0 };
+    uint16_t old_values[CAPACITY * KV_WIDTH] = { 0 };
+    uint16_t reference_keys[CAPACITY * KV_WIDTH] = { 0 };
+    uint16_t reference_values[CAPACITY * KV_WIDTH] = { 0 };
+    float query[MAX_TOKENS * QUERY_WIDTH];
+    float new_keys[MAX_TOKENS * KV_WIDTH];
+    float new_values[MAX_TOKENS * KV_WIDTH];
+    float relative_bias[MAX_TOKENS * QH * EXTENT];
+    float sinks[MAX_TOKENS * QH];
+    float expected[MAX_TOKENS * QUERY_WIDTH];
+    float actual[MAX_TOKENS * QUERY_WIDTH];
+    ds4_gpu_tensor *tq = NULL, *tk = NULL, *tv = NULL;
+    ds4_gpu_tensor *tnk = NULL, *tnv = NULL, *trb = NULL, *tsink = NULL;
+    ds4_gpu_tensor *tactual = NULL, *tqr = NULL, *trbr = NULL;
+    ds4_gpu_tensor *tsinkr = NULL, *treference = NULL;
+    ds4_gpu_tensor *treference_keys = NULL, *treference_values = NULL;
+    int ok = 1;
+
+    for (uint32_t scenario = 0; scenario < 2u; scenario++) {
+        const uint32_t old_count = scenario == 0u ? 3u : 6u;
+        const uint32_t n_tokens = scenario == 0u ? 3u : 4u;
+        const uint32_t sliding_window = scenario == 0u ? 0u : 4u;
+        const uint64_t first_position = old_count;
+        memset(old_keys, 0, sizeof(old_keys));
+        memset(old_values, 0, sizeof(old_values));
+        memset(reference_keys, 0, sizeof(reference_keys));
+        memset(reference_values, 0, sizeof(reference_values));
+
+        for (uint32_t position = 0; position < old_count; position++) {
+            for (uint32_t head = 0; head < KVH; head++) {
+                for (uint32_t dim = 0; dim < DIM; dim++) {
+                    const uint32_t index =
+                        (position * 7u + head * 3u + dim) % 8u;
+                    const uint64_t offset =
+                        (uint64_t)position * KV_WIDTH + head * DIM + dim;
+                    old_keys[offset] = reference_keys[offset] = half_bits[index];
+                    const uint32_t value_index =
+                        (position * 5u + head * 7u + dim * 3u + 1u) % 8u;
+                    old_values[offset] = reference_values[offset] =
+                        half_bits[value_index];
+                }
+            }
+        }
+
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            for (uint32_t head = 0; head < QH; head++) {
+                for (uint32_t dim = 0; dim < DIM; dim++) {
+                    const uint32_t query_index =
+                        (token * 5u + head * 3u + dim + 1u) % 8u;
+                    query[(uint64_t)token * QUERY_WIDTH + head * DIM + dim] =
+                        half_values[query_index] * 0.25f;
+                }
+                sinks[(uint64_t)token * QH + head] =
+                    half_values[(token + head * 2u) % 8u] * 0.125f;
+                for (uint32_t distance = 0; distance < EXTENT; distance++) {
+                    const uint32_t bias_index =
+                        (token * 3u + head + distance * 5u) % 8u;
+                    relative_bias[((uint64_t)token * QH + head) * EXTENT +
+                                  distance] = half_values[bias_index] * 0.0625f;
+                }
+            }
+            for (uint32_t head = 0; head < KVH; head++) {
+                for (uint32_t dim = 0; dim < DIM; dim++) {
+                    const uint32_t key_index =
+                        (token * 7u + head * 3u + dim * 5u + 2u) % 8u;
+                    const uint32_t value_index =
+                        (token * 3u + head * 5u + dim * 7u + 4u) % 8u;
+                    const uint64_t batch_offset =
+                        (uint64_t)token * KV_WIDTH + head * DIM + dim;
+                    const uint64_t cache_offset =
+                        ((first_position + token) % CAPACITY) * KV_WIDTH +
+                        head * DIM + dim;
+                    new_keys[batch_offset] = half_values[key_index];
+                    new_values[batch_offset] = half_values[value_index];
+                    reference_keys[cache_offset] = half_bits[key_index];
+                    reference_values[cache_offset] = half_bits[value_index];
+                }
+            }
+        }
+
+        tq = upload(query, (uint64_t)n_tokens * query_row_bytes);
+        tk = upload(old_keys, cache_bytes);
+        tv = upload(old_values, cache_bytes);
+        treference_keys = upload(reference_keys, cache_bytes);
+        treference_values = upload(reference_values, cache_bytes);
+        tnk = upload(new_keys, (uint64_t)n_tokens * key_row_bytes);
+        tnv = upload(new_values, (uint64_t)n_tokens * key_row_bytes);
+        trb = upload(relative_bias,
+                     (uint64_t)n_tokens * bias_row_bytes);
+        tsink = upload(sinks, (uint64_t)n_tokens * sink_row_bytes);
+        tactual = ds4_gpu_tensor_alloc(output_bytes);
+        tqr = ds4_gpu_tensor_alloc(query_row_bytes);
+        trbr = ds4_gpu_tensor_alloc(bias_row_bytes);
+        tsinkr = ds4_gpu_tensor_alloc(sink_row_bytes);
+        treference = ds4_gpu_tensor_alloc(query_row_bytes);
+        CHECK(tq && tk && tv && treference_keys && treference_values &&
+              tnk && tnv && trb && tsink && tactual && tqr && trbr &&
+              tsinkr && treference);
+        CHECK(ds4_gpu_inkling2_attention_prefill_tensor(
+            tactual, tq, tk, tv, tnk, tnv, trb, tsink,
+            QH, KVH, DIM, CAPACITY, old_count, n_tokens,
+            first_position - old_count, first_position,
+            sliding_window, EXTENT));
+        CHECK(ds4_gpu_tensor_read(tactual, 0, actual,
+                                  (uint64_t)n_tokens * query_row_bytes));
+        CHECK(ds4_gpu_inkling2_kv_append_rows_tensor(
+            tk, tv, tnk, tnv, n_tokens, KVH, DIM, CAPACITY,
+            first_position));
+        uint16_t appended_keys[CAPACITY * KV_WIDTH];
+        uint16_t appended_values[CAPACITY * KV_WIDTH];
+        CHECK(ds4_gpu_tensor_read(tk, 0, appended_keys, cache_bytes));
+        CHECK(ds4_gpu_tensor_read(tv, 0, appended_values, cache_bytes));
+        for (uint64_t i = 0; i < cache_elements; i++) {
+            CHECK(appended_keys[i] == reference_keys[i]);
+            CHECK(appended_values[i] == reference_values[i]);
+        }
+
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            CHECK(ds4_gpu_tensor_write(tqr, 0,
+                query + (uint64_t)token * QUERY_WIDTH, query_row_bytes));
+            CHECK(ds4_gpu_tensor_write(trbr, 0,
+                relative_bias + (uint64_t)token * QH * EXTENT,
+                bias_row_bytes));
+            CHECK(ds4_gpu_tensor_write(tsinkr, 0,
+                sinks + (uint64_t)token * QH, sink_row_bytes));
+            const uint32_t total = old_count + token + 1u;
+            const uint32_t count = total < CAPACITY ? total : CAPACITY;
+            const uint64_t oldest = first_position + token + 1u - count;
+            CHECK(ds4_gpu_inkling2_attention_decode_tensor(
+                treference, tqr, treference_keys, treference_values,
+                trbr, tsinkr, QH, KVH, DIM, CAPACITY, count,
+                oldest, first_position + token, sliding_window, EXTENT));
+            CHECK(ds4_gpu_tensor_read(treference, 0,
+                expected + (uint64_t)token * QUERY_WIDTH, query_row_bytes));
+            for (uint32_t i = 0; i < QUERY_WIDTH; i++) {
+                const float got = actual[(uint64_t)token * QUERY_WIDTH + i];
+                const float ref = expected[(uint64_t)token * QUERY_WIDTH + i];
+                if (!near_record(got, ref, 2e-6f,
+                                 &g_m4_attention_max_error)) {
+                    fprintf(stderr,
+                        "Inkling2 batched attention mismatch scenario=%u token=%u i=%u got=%g expected=%g\n",
+                        scenario, token, i, got, ref);
+                    ok = 0;
+                    goto cleanup;
+                }
+            }
+        }
+
+        ds4_gpu_tensor_free(tq); tq = NULL;
+        ds4_gpu_tensor_free(tk); tk = NULL;
+        ds4_gpu_tensor_free(tv); tv = NULL;
+        ds4_gpu_tensor_free(treference_keys); treference_keys = NULL;
+        ds4_gpu_tensor_free(treference_values); treference_values = NULL;
+        ds4_gpu_tensor_free(tnk); tnk = NULL;
+        ds4_gpu_tensor_free(tnv); tnv = NULL;
+        ds4_gpu_tensor_free(trb); trb = NULL;
+        ds4_gpu_tensor_free(tsink); tsink = NULL;
+        ds4_gpu_tensor_free(tactual); tactual = NULL;
+        ds4_gpu_tensor_free(tqr); tqr = NULL;
+        ds4_gpu_tensor_free(trbr); trbr = NULL;
+        ds4_gpu_tensor_free(tsinkr); tsinkr = NULL;
+        ds4_gpu_tensor_free(treference); treference = NULL;
+    }
+
+cleanup:
+    ds4_gpu_tensor_free(tq);
+    ds4_gpu_tensor_free(tk);
+    ds4_gpu_tensor_free(tv);
+    ds4_gpu_tensor_free(treference_keys);
+    ds4_gpu_tensor_free(treference_values);
+    ds4_gpu_tensor_free(tnk);
+    ds4_gpu_tensor_free(tnv);
+    ds4_gpu_tensor_free(trb);
+    ds4_gpu_tensor_free(tsink);
+    ds4_gpu_tensor_free(tactual);
+    ds4_gpu_tensor_free(tqr);
+    ds4_gpu_tensor_free(trbr);
+    ds4_gpu_tensor_free(tsinkr);
+    ds4_gpu_tensor_free(treference);
     return ok;
 }
 
@@ -1906,9 +2439,11 @@ int main(void) {
     CHECK(test_expert_accumulation());
     CHECK(test_situ_moe_metal());
     CHECK(test_expert_grouped_iq4());
+    CHECK(test_expert_route_map_512());
     CHECK(test_expert_grouped_iq4_full_shape());
     CHECK(test_qk_and_relative_bias());
     CHECK(test_attention_output_gate());
+    CHECK(test_attention_prefill_matches_decode());
     CHECK(test_attention_and_shortconv());
     CHECK(test_loop_mix_and_control_metal());
     CHECK(test_gpu_context_owns_independent_visit_state());

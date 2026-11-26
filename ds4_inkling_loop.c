@@ -199,6 +199,77 @@ int ds4_inkling_control_metal_with_workspace(
     return ok;
 }
 
+int ds4_inkling_control_metal_batch_with_workspace(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              ctrl_down_offset,
+        uint64_t              ctrl_gain_offset,
+        uint64_t              ctrl_forget_offset,
+        uint32_t              hidden_dim,
+        uint32_t              rank,
+        uint32_t              n_tokens,
+        float                 epsilon,
+        const ds4_inkling_gpu_control_workspace *workspace) {
+    if (!out || !current || !message || !model_map || hidden_dim == 0 ||
+        hidden_dim > DS4_INKLING_MAX_HIDDEN || rank == 0 ||
+        rank > DS4_INKLING_MAX_CTRL_RANK || n_tokens == 0 ||
+        n_tokens > DS4_INKLING_GPU_MOE_MAX_TOKENS ||
+        !ds4_inkling_valid_epsilon(epsilon) || !workspace ||
+        !workspace->normalized || !workspace->bottleneck ||
+        !workspace->gain || !workspace->forget) return 0;
+
+    const uint64_t elements = (uint64_t)hidden_dim * n_tokens;
+    if (elements > UINT64_MAX / sizeof(float) ||
+        elements * sizeof(float) > UINT64_MAX / 2u) return 0;
+    const uint64_t hidden_bytes = (uint64_t)hidden_dim * sizeof(float);
+    const uint64_t row_bytes = elements * sizeof(float);
+    const uint64_t normalized_bytes = row_bytes * 2u;
+    const uint64_t bottleneck_bytes =
+        (uint64_t)rank * n_tokens * sizeof(float);
+    int ok = ds4_gpu_tensor_bytes(workspace->normalized) >= normalized_bytes &&
+             ds4_gpu_tensor_bytes(workspace->bottleneck) >= bottleneck_bytes &&
+             ds4_gpu_tensor_bytes(workspace->gain) >= row_bytes &&
+             ds4_gpu_tensor_bytes(workspace->forget) >= row_bytes;
+    const char *failed_stage = ok ? NULL : "scratch allocation";
+    if (ok && !ds4_gpu_inkling2_control_prepare_rows_tensor(
+                  workspace->normalized, current, message, hidden_dim,
+                  n_tokens, epsilon)) {
+        ok = 0;
+        failed_stage = "batched input normalization";
+    }
+    if (ok && !ds4_gpu_matmul_f32_tensor(
+                  workspace->bottleneck, model_map, model_size, ctrl_down_offset,
+                  2u * hidden_dim, rank, workspace->normalized, n_tokens)) {
+        ok = 0;
+        failed_stage = "batched controller down projection";
+    }
+    if (ok && !ds4_gpu_matmul_f32_tensor(
+                  workspace->gain, model_map, model_size, ctrl_gain_offset,
+                  rank, hidden_dim, workspace->bottleneck, n_tokens)) {
+        ok = 0;
+        failed_stage = "batched controller gain projection";
+    }
+    if (ok && !ds4_gpu_matmul_f32_tensor(
+                  workspace->forget, model_map, model_size, ctrl_forget_offset,
+                  rank, hidden_dim, workspace->bottleneck, n_tokens)) {
+        ok = 0;
+        failed_stage = "batched controller forget projection";
+    }
+    if (ok && !ds4_gpu_inkling2_control_update_rows_tensor(
+                  out, current, message, workspace->gain, workspace->forget,
+                  hidden_dim, n_tokens)) {
+        ok = 0;
+        failed_stage = "batched controller gated update";
+    }
+    if (!ok) fprintf(stderr,
+        "ds4: Inkling2 batched loop controller failed at %s\n", failed_stage);
+    (void)hidden_bytes;
+    return ok;
+}
+
 int ds4_inkling_control_metal(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *current,

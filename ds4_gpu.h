@@ -1269,7 +1269,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
 #ifdef __APPLE__
 /* Inkling 2 controller and routing operators. Tensors are contiguous f32
  * except `selected`, which contains int32 expert IDs in token-major order. */
-enum { DS4_INKLING_GPU_MOE_MAX_TOKENS = 32u };
+enum { DS4_INKLING_GPU_MOE_MAX_TOKENS = 512u };
 
 int ds4_gpu_inkling2_gate_update_tensor(
         ds4_gpu_tensor       *out,
@@ -1418,12 +1418,50 @@ int ds4_gpu_inkling2_mix_tensor(
         uint32_t              query_count,
         float                 epsilon);
 
+/* Prefill mix for token-major states and one selected learned query. When
+ * append_current is set, current is the final state and earlier block states
+ * can be reversed to match the decode residual-bank order. */
+int ds4_gpu_inkling2_mix_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *states,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *queries,
+        uint32_t              state_count,
+        uint32_t              state_stride,
+        uint32_t              hidden_dim,
+        uint32_t              query_count,
+        uint32_t              n_tokens,
+        uint32_t              query_index,
+        int                   append_current,
+        int                   reverse_states,
+        float                 epsilon);
+
+/* Copy contiguous token rows into or out of a slot in a strided row bank. */
+int ds4_gpu_inkling2_copy_strided_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        uint32_t              width,
+        uint32_t              n_tokens,
+        uint32_t              source_stride,
+        uint32_t              source_slot,
+        uint32_t              destination_stride,
+        uint32_t              destination_slot);
+
 /* Normalize current/message into [2][hidden_dim] for a loop controller. */
 int ds4_gpu_inkling2_control_prepare_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *current,
         const ds4_gpu_tensor *message,
         uint32_t              hidden_dim,
+        float                 epsilon);
+
+/* Batched form for contiguous [token][hidden_dim] current/message rows. */
+int ds4_gpu_inkling2_control_prepare_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        uint32_t              hidden_dim,
+        uint32_t              n_tokens,
         float                 epsilon);
 
 /* Apply tanh to projected gain/forget values and mix the controller message. */
@@ -1434,6 +1472,15 @@ int ds4_gpu_inkling2_control_update_tensor(
         const ds4_gpu_tensor *gain,
         const ds4_gpu_tensor *forget,
         uint32_t              hidden_dim);
+
+int ds4_gpu_inkling2_control_update_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *current,
+        const ds4_gpu_tensor *message,
+        const ds4_gpu_tensor *gain,
+        const ds4_gpu_tensor *forget,
+        uint32_t              hidden_dim,
+        uint32_t              n_tokens);
 
 /* M4 decode operators. KV rows use interleaved FP16 [token][kv_head][dim]. */
 int ds4_gpu_inkling2_qk_prepare_tensor(
@@ -1462,6 +1509,21 @@ int ds4_gpu_inkling2_qk_prepare_decode_tensor(
         uint64_t                position,
         int                     apply_log_scale);
 
+/* Prefill form reuses one learned scale row per head and derives each token's
+ * position from first_position. Input rows are contiguous [token, head, dim]. */
+int ds4_gpu_inkling2_qk_prepare_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *learned_scale,
+        uint32_t                n_tokens,
+        uint32_t                heads,
+        uint32_t                head_dim,
+        float                   threshold,
+        float                   log_scale_alpha,
+        float                   log_scale_floor,
+        uint64_t                first_position,
+        int                     apply_log_scale);
+
 int ds4_gpu_inkling2_relative_bias_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *relative_states,
@@ -1471,7 +1533,8 @@ int ds4_gpu_inkling2_relative_bias_tensor(
         uint32_t                heads,
         uint32_t                relative_dim,
         uint32_t                relative_extent,
-        uint32_t                keys);
+        uint32_t                keys,
+        uint32_t                distance_stride);
 
 int ds4_gpu_inkling2_attention_decode_tensor(
         ds4_gpu_tensor       *out,
@@ -1489,6 +1552,42 @@ int ds4_gpu_inkling2_attention_decode_tensor(
         uint64_t                query_position,
         uint32_t                sliding_window,
         uint32_t                relative_extent);
+
+/* Causal prefill attention reads old keys from the ring cache and keys from
+ * the current batch directly, so appending the batch cannot evict context
+ * needed by its earliest queries. New K/V rows are rounded through FP16. */
+int ds4_gpu_inkling2_attention_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *key_cache_fp16,
+        const ds4_gpu_tensor *value_cache_fp16,
+        const ds4_gpu_tensor *new_key_f32,
+        const ds4_gpu_tensor *new_value_f32,
+        const ds4_gpu_tensor *relative_bias,
+        const ds4_gpu_tensor *sink_logits,
+        uint32_t                query_heads,
+        uint32_t                kv_heads,
+        uint32_t                head_dim,
+        uint32_t                capacity,
+        uint32_t                old_count,
+        uint32_t                n_tokens,
+        uint64_t                oldest_position,
+        uint64_t                first_position,
+        uint32_t                sliding_window,
+        uint32_t                relative_extent);
+
+/* Append a contiguous FP32 K/V batch to the ring cache, retaining only the
+ * newest `capacity` rows when the batch crosses the ring more than once. */
+int ds4_gpu_inkling2_kv_append_rows_tensor(
+        ds4_gpu_tensor       *key_cache_fp16,
+        ds4_gpu_tensor       *value_cache_fp16,
+        const ds4_gpu_tensor *new_key_f32,
+        const ds4_gpu_tensor *new_value_f32,
+        uint32_t                n_tokens,
+        uint32_t                kv_heads,
+        uint32_t                head_dim,
+        uint32_t                capacity,
+        uint64_t                first_position);
 
 int ds4_gpu_inkling2_attention_output_gate_tensor(
         ds4_gpu_tensor       *out,

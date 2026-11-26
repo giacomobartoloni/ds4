@@ -74,7 +74,7 @@ static id<MTLBuffer> buffer(id<MTLDevice> device, const void *data, NSUInteger s
 static void run(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> lib,
                 id<MTLBuffer> weights, id<MTLBuffer> input, uint32_t dim,
                 uint32_t routes, BOOL grouped, BOOL tracing, result *r) {
-    NSString *name = grouped ? @"kernel_inkling2_expert_gemm_id_iq4_nl" :
+    NSString *name = grouped ? @"kernel_inkling2_expert_gemm_id_iq4_nl_scalar" :
                                @"kernel_inkling2_expert_gemv";
     NSError *error = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:name];
