@@ -23144,7 +23144,10 @@ static int ds4_gpu_matmul_f32_impl(
         const bool router_batch = in_dim == 5120u && out_dim == 384u &&
             plan_tok >= 32u && !g_quality_mode &&
             !getenv("DS4_METAL_DISABLE_V41_ROUTER_BATCH");
-        if (router_batch && plan_tok >= 256u && !getenv("DS4_METAL_DISABLE_V41_ROUTER_MM")) {
+        const bool inkling_mm = n_tok >= 16u &&
+            ((in_dim == 4608u && out_dim == 64u) || (in_dim == 64u && out_dim == 2304u) ||
+             (in_dim == 2304u && out_dim == 128u));
+        if (inkling_mm || (router_batch && plan_tok >= 256u && !getenv("DS4_METAL_DISABLE_V41_ROUTER_MM"))) {
             const bool bc_out = (n_tok % 32u) != 0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f32_f32_full", false, bc_out);
@@ -23957,7 +23960,7 @@ int ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
     return 1;
 }
 
-int ds4_gpu_inkling2_expert_gemv_rows_tensor(
+static int ds4_gpu_inkling2_expert_project_rows(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -23970,7 +23973,8 @@ int ds4_gpu_inkling2_expert_gemv_rows_tensor(
         uint32_t              n_tokens,
         int                   input_per_expert,
         const ds4_gpu_tensor *expert_ids,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        bool                  mapped) {
     if ((!g_initialized && !ds4_gpu_init()) || !model_map || !out || !expert_ids || !x ||
         in_dim == 0 || (in_dim % 32u) != 0 || out_dim == 0 ||
         n_experts == 0 || n_experts > 128u || n_used == 0 || n_used > 8u ||
@@ -23978,6 +23982,8 @@ int ds4_gpu_inkling2_expert_gemv_rows_tensor(
         n_used > n_experts ||
         (input_per_expert != 0 && input_per_expert != 1) ||
         (weight_type != 8u && weight_type != 20u)) return 0;
+    if (mapped && (n_experts != 128u || n_used != 8u || n_tokens < 16u ||
+        in_dim > 2304u || out_dim != 2304u)) return 0;
     const uint64_t route_count = (uint64_t)n_tokens * n_used;
     const uint64_t group_count = route_count * out_dim;
     if (group_count > UINT32_MAX) return 0;
@@ -23994,7 +24000,7 @@ int ds4_gpu_inkling2_expert_gemv_rows_tensor(
     if (output_elements > UINT64_MAX / sizeof(float) ||
         weight_offset > model_size || weight_bytes > model_size - weight_offset ||
         !ds4_gpu_inkling2_tensor_fits(out, output_elements * sizeof(float),
-                                      "selected expert GEMV output") ||
+                                      "selected expert output") ||
         !ds4_gpu_inkling2_tensor_fits(expert_ids,
                                       route_count * sizeof(int32_t),
                                       "selected expert IDs") ||
@@ -24005,6 +24011,24 @@ int ds4_gpu_inkling2_expert_gemv_rows_tensor(
         uint64_t inner_offset = 0;
         id<MTLBuffer> weight_buffer = ds4_gpu_wrap_model_range(
             model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (mapped) {
+            const uint32_t input_slots = input_per_expert ? n_used : 1u;
+            ds4_gpu_mul_mm_id_map_args map = ds4_gpu_make_mul_mm_id_map_args(
+                in_dim, n_experts, input_slots, n_used, n_tokens);
+            ds4_gpu_mul_mm_id_args mm = ds4_gpu_make_mul_mm_id_args(
+                in_dim, out_dim, n_experts, row_bytes, expert_bytes, input_slots, n_used, n_tokens);
+            const char *kernel = weight_type == 20u ? "kernel_mul_mm_id_iq4_nl_f32" :
+                                                     "kernel_mul_mm_id_q8_0_f32";
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            return ds4_gpu_encode_mul_mm_id(cb,
+                ds4_gpu_get_pipeline(ds4_gpu_mul_mm_id_map0_name(n_used)),
+                ds4_gpu_get_mul_mm_id_pipeline(kernel, false), &map, &mm,
+                weight_buffer, inner_offset, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x),
+                ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out),
+                ds4_gpu_tensor_buffer(expert_ids), ds4_gpu_tensor_offset(expert_ids)) &&
+                ds4_gpu_finish_command_buffer(cb, owned, "Inkling2 expert prefill matmul");
+        }
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_pipeline("kernel_inkling2_expert_gemv");
         if (!weight_buffer || !pipeline) return 0;
@@ -24044,6 +24068,44 @@ int ds4_gpu_inkling2_expert_gemv_rows_tensor(
                                           "Inkling2 selected expert GEMV")) return 0;
     }
     return 1;
+}
+
+int ds4_gpu_inkling2_expert_mul_mm_id_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              n_tokens,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x) {
+    return ds4_gpu_inkling2_expert_project_rows(out, model_map, model_size, weight_offset,
+        weight_type, in_dim, out_dim, n_experts, n_used, n_tokens, input_per_expert,
+        expert_ids, x, true);
+}
+
+int ds4_gpu_inkling2_expert_gemv_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              n_tokens,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x) {
+    return ds4_gpu_inkling2_expert_project_rows(out, model_map, model_size, weight_offset,
+        weight_type, in_dim, out_dim, n_experts, n_used, n_tokens, input_per_expert,
+        expert_ids, x, false);
 }
 
 int ds4_gpu_inkling2_expert_gemv_tensor(

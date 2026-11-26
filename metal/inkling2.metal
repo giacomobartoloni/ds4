@@ -1081,6 +1081,7 @@ kernel void kernel_inkling2_attention_prefill(
         device const float *relative_bias [[buffer(6)]],
         device const float *sink_logits [[buffer(7)]],
         device float *out [[buffer(8)]],
+        uint simd_width [[threads_per_simdgroup]],
         uint2 group [[threadgroup_position_in_grid]],
         uint2 thread_position [[thread_position_in_threadgroup]],
         uint2 threads_per_threadgroup [[threads_per_threadgroup]]) {
@@ -1139,9 +1140,16 @@ kernel void kernel_inkling2_attention_prefill(
         }
         partial[lane] = dot_value;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+        for (uint stride = lanes >> 1u; stride >= simd_width; stride >>= 1u) {
             if (lane < stride) partial[lane] += partial[lane + stride];
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // The remaining butterfly fits within one SIMD group. Lane zero
+        // observes the same descending-stride sum as the shared-memory tree.
+        float dot = partial[lane];
+        for (uint stride = simd_width >> 1u; stride > 0u; stride >>= 1u) {
+            dot += simd_shuffle_down(dot, ushort(stride));
         }
 
         const ulong distance = query_position - position;
@@ -1149,7 +1157,7 @@ kernel void kernel_inkling2_attention_prefill(
                            distance < args.relative_extent
             ? relative_bias[query_row * args.relative_extent + distance] : 0.0f;
         if (lane == 0u) {
-            current_logit = partial[0] * scale + bias;
+            current_logit = dot * scale + bias;
             const float next_maximum = max(maximum, current_logit);
             old_scale = denominator == 0.0f
                 ? 0.0f : exp(maximum - next_maximum);

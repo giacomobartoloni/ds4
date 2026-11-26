@@ -9167,7 +9167,22 @@ typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, hal
 typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_addr_f16_rhs;
 
 // Host-visible batched MoE matmul variants for the DS4 quant formats.
-template [[host_name("kernel_mul_mm_id_q8_0_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    float, float4x4, float, float2x4>;
+struct block_iq4_nl {
+    half d;
+    uchar qs[16];
+};
+static_assert(sizeof(block_iq4_nl) == 18, "IQ4_NL block size");
+static constant short kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+void dequantize_iq4_nl(device const block_iq4_nl *xb, short il, thread half4x4 &reg) {
+    for (short i = 0; i < 16; ++i) {
+        const uchar code = il == 0 ? xb->qs[i] & 15u : xb->qs[i] >> 4u;
+        reg[i/4][i%4] = half(float(xb->d) * float(kvalues_iq4nl[code]));
+    }
+}
+template [[host_name("kernel_mul_mm_id_iq4_nl_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq4_nl,    2,     dequantize_iq4_nl,    float, float4x4, float, float2x4, true>;
+template [[host_name("kernel_mul_mm_id_q8_0_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    float, float4x4, float, float2x4, true>;
 template [[host_name("kernel_mul_mm_id_q2_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    float, float4x4, float, float2x4>;

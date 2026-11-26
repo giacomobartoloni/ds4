@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 int ds4_inkling_moe_situ_metal_with_workspace(
         ds4_gpu_tensor       *out,
@@ -110,8 +111,13 @@ int ds4_inkling_moe_situ_metal_batch_with_workspace(
         failed_stage = "router selection";
     }
     /* The tiled kernel handles expert route lists in 32-route chunks. */
-    const int grouped = n_tokens >= 16u && n_experts == 128u &&
-        n_used == 8u && hidden_dim == 2304u && expert_dim == 1152u &&
+    const int batch_shape = n_tokens >= 16u && n_experts == 128u &&
+        n_used == 8u && hidden_dim == 2304u && expert_dim == 1152u;
+    const char *rollback = getenv("DS4_METAL_INKLING2_DISABLE_MUL_MM_ID");
+    const char *force_scalar = getenv("DS4_INKLING2_MOE_FORCE_SCALAR");
+    const int mapped = batch_shape && !(rollback && strcmp(rollback, "1") == 0) &&
+        !(force_scalar && strcmp(force_scalar, "1") == 0);
+    const int grouped = batch_shape && !mapped &&
         expert_weight_type == DS4_INKLING_GGML_TYPE_IQ4_NL &&
         workspace->route_map && workspace->route_counts &&
         ds4_gpu_tensor_bytes(workspace->route_map) >=
@@ -130,7 +136,8 @@ int ds4_inkling_moe_situ_metal_batch_with_workspace(
               workspace->gate_up, model_map, model_size, gate_up_offset,
               hidden_dim, 2u * expert_dim, n_experts, n_used, n_tokens, 0,
               workspace->route_map, workspace->route_counts, input) :
-          ds4_gpu_inkling2_expert_gemv_rows_tensor(
+          (mapped ? ds4_gpu_inkling2_expert_mul_mm_id_rows_tensor :
+                    ds4_gpu_inkling2_expert_gemv_rows_tensor)(
               workspace->gate_up, model_map, model_size, gate_up_offset,
               expert_weight_type, hidden_dim, 2u * expert_dim,
               n_experts, n_used, n_tokens, 0, workspace->ids, input))) {
@@ -149,7 +156,8 @@ int ds4_inkling_moe_situ_metal_batch_with_workspace(
               expert_dim, hidden_dim, n_experts, n_used, n_tokens, 1,
               workspace->route_map, workspace->route_counts,
               workspace->activation) :
-          ds4_gpu_inkling2_expert_gemv_rows_tensor(
+          (mapped ? ds4_gpu_inkling2_expert_mul_mm_id_rows_tensor :
+                    ds4_gpu_inkling2_expert_gemv_rows_tensor)(
               workspace->expert_outputs, model_map, model_size, down_offset,
               expert_weight_type, expert_dim, hidden_dim,
               n_experts, n_used, n_tokens, 1, workspace->ids,

@@ -1371,9 +1371,24 @@ int ds4_gpu_inkling2_expert_gemm_id_rows_tensor(
         const ds4_gpu_tensor *route_counts,
         const ds4_gpu_tensor *x);
 
-/* Batched form of selected expert GEMV. IDs and outputs use
+/* Batched selected expert projections. IDs and outputs use
  * [n_tokens][n_used] row-major order; `x` is [n_tokens][in_dim] when
  * input_per_expert is false and [n_tokens][n_used][in_dim] otherwise. */
+int ds4_gpu_inkling2_expert_mul_mm_id_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        uint32_t              n_experts,
+        uint32_t              n_used,
+        uint32_t              n_tokens,
+        int                   input_per_expert,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_inkling2_expert_gemv_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
